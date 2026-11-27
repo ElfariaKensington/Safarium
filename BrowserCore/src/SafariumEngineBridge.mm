@@ -5606,9 +5606,22 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
   }
 }
 
+/// SAFARIUM_QUIT_DEBUG=1: timestamps for each quit phase on stderr (where the time goes when quitting is slow).
+static void SXQuitLog(const char *step) {
+  static const bool on = getenv("SAFARIUM_QUIT_DEBUG") != nullptr;
+  if (!on) return;
+  fprintf(stderr, "[Quit] %.3f %s\n", CFAbsoluteTimeGetCurrent(), step);
+  fflush(stderr);
+}
+
 - (void)shutdown {
   if (!self.initialized) {
     return;
+  }
+  SXQuitLog("shutdown begin");
+  // Persist cookies now: if a wedged browser makes us skip CefShutdown below, nothing recent is lost.
+  if (CefRefPtr<CefCookieManager> cookies = CefCookieManager::GetGlobalManager(nullptr)) {
+    cookies->FlushStore(nullptr);
   }
 
   [self.pumpTimer invalidate];
@@ -5634,20 +5647,29 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
   }
 
   // Shut down extension popups, popout windows, and hidden admin loader browsers.
+  SXQuitLog("tabs closing requested");
   [[SXExtensionManager sharedManager] shutdown];
+  SXQuitLog("extension manager shut down");
 
   // Release any off-the-record CefRequestContext before CefShutdown so CEF never hits
   // a live-object DCHECK on exit.
   _incognitoRequestContext = nullptr;
 
-  // Pump the CEF message loop + NSRunLoop until EVERY tracked CefBrowser has completed
-  // OnBeforeClose (up to 2.5s ceiling; exits immediately once liveBrowserCount reaches 0).
-  for (int i = 0; i < 250 && (self.mutableTabs.count > 0 || [self liveBrowserCount] > 0); ++i) {
+  // Pump the CEF message loop + NSRunLoop until EVERY tracked CefBrowser has completed OnBeforeClose (exits as
+  // soon as liveBrowserCount reaches 0). The ceiling was 2.5 s: a busy page (e.g. Reddit) can take longer than
+  // that to acknowledge a forced close, and the app sat in this loop for the whole ceiling on every quit. 1 s is
+  // ample for normal pages; past it CefShutdown is skipped below exactly as before.
+  for (int i = 0; i < 100 && (self.mutableTabs.count > 0 || [self liveBrowserCount] > 0); ++i) {
     CefDoMessageLoopWork();
     [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
                              beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
   }
 
+  SXQuitLog([[NSString stringWithFormat:@"browsers closed wait done (live=%ld tabs=%lu)", (long)[self liveBrowserCount],
+                                         (unsigned long)self.mutableTabs.count] UTF8String]);
+  for (SXBrowserTab *t in [self.mutableTabs copy]) {
+    SXQuitLog([[NSString stringWithFormat:@"  still open: %@", t.currentURL.absoluteString ?: @"(nil)"] UTF8String]);
+  }
   // Drain a few extra iterations so deferred UI-thread browser teardown tasks complete cleanly.
   for (int i = 0; i < 5; ++i) {
     CefDoMessageLoopWork();
@@ -5662,7 +5684,9 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
   // Only invoke CefShutdown() when every CefBrowser has cleanly reached OnBeforeClose;
   // calling CefShutdown() with a wedged browser still alive triggers a fatal CEF SIGTRAP.
   if ([self liveBrowserCount] <= 0) {
+    SXQuitLog("CefShutdown begin");
     CefShutdown();
+    SXQuitLog("CefShutdown end");
     _app = nullptr;
     if (_cefLoaded) {
       cef_unload_library();

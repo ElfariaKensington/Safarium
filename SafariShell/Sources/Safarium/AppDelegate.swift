@@ -252,6 +252,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if ProcessInfo.processInfo.environment["SAFARIUM_QUIT_DEBUG"] != nil {
+            FileHandle.standardError.write(String(format: "[Quit] %.3f applicationWillTerminate\n", CFAbsoluteTimeGetCurrent()).data(using: .utf8)!)
+        }
         if let settingsObserver {
             NotificationCenter.default.removeObserver(settingsObserver)
             self.settingsObserver = nil
@@ -264,6 +267,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let primary = windowControllers.first(where: { !$0.isPrivate }) {
             primary.persistCurrentSession()
         }
+        // Take every window off screen first: the engine shutdown below waits for page processes to close (up to a
+        // second for a busy page), and quitting used to leave the windows up for that whole time.
+        for window in NSApp.windows where window.isVisible {
+            window.orderOut(nil)
+        }
+        CATransaction.flush()
         engine?.shutdown()
     }
 
