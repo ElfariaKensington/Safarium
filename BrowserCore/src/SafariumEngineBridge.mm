@@ -1076,6 +1076,7 @@ static void SXApplyPreferencesDictionaryToContext(
   CefRefPtr<CefBrowser> _browser;
   CefRefPtr<CefBrowser> _authPopupBrowser;
   CefRefPtr<CefClient> _authPopupClient;
+  NSWindow *_authPopupWindow;
   CFAbsoluteTime _lastAppleSignInIntentTime;
   BOOL _browserCreationRequested;
   BOOL _isClosed;
@@ -2696,6 +2697,7 @@ class SXPageSourceVisitor : public CefStringVisitor {
 }
 
 - (void)closeAuthPopup {
+  [self dismissAuthPopupWindow];
   CefRefPtr<CefBrowser> popup = _authPopupBrowser;
   _authPopupBrowser = nullptr;
   _authPopupClient = nullptr;
@@ -4324,8 +4326,61 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
       cefView.frame = b;
       cefView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     }
+    [self presentAuthPopupWindow];
     browser->GetHost()->NotifyScreenInfoChanged();
+    browser->GetHost()->SetFocus(true);
   }
+}
+
+/// Sign in with Apple (and other window.open sign-in popups routed here) is shown as a real popup window holding
+/// the provider's own page. The popup stays a true child of the page (window.opener works, so the result reaches
+/// the site); it used to be hidden in a container and driven behind a look-alike Apple sheet.
+- (void)presentAuthPopupWindow {
+  if (_authPopupWindow) {
+    [_authPopupWindow makeKeyAndOrderFront:nil];
+    return;
+  }
+  NSWindow *parent = self.hostView.window;
+  NSSize size = NSMakeSize(500, 680);
+  NSRect pf = parent ? parent.frame : (NSScreen.mainScreen ?: NSScreen.screens.firstObject).visibleFrame;
+  NSRect frame = NSMakeRect(NSMidX(pf) - size.width / 2, NSMidY(pf) - size.height / 2, size.width, size.height);
+  NSWindow *win = [[NSWindow alloc] initWithContentRect:frame
+                                              styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                                         NSWindowStyleMaskResizable)
+                                                backing:NSBackingStoreBuffered
+                                                  defer:NO];
+  win.releasedWhenClosed = NO;
+  win.title = self.activeAuthPopupURL.host ?: @"Sign In";
+  win.minSize = NSMakeSize(360, 420);
+  [self.authPopupContainerView removeFromSuperview];
+  self.authPopupContainerView.frame = ((NSView *)win.contentView).bounds;
+  self.authPopupContainerView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [win.contentView addSubview:self.authPopupContainerView];
+  for (NSView *sub in self.authPopupContainerView.subviews) {
+    sub.frame = self.authPopupContainerView.bounds;
+  }
+  win.delegate = (id<NSWindowDelegate>)self;
+  _authPopupWindow = win;
+  [win makeKeyAndOrderFront:nil];
+}
+
+/// Closing the sign-in window by hand closes the popup page (the opener sees window.closed).
+- (void)windowWillClose:(NSNotification *)note {
+  if (note.object != _authPopupWindow) return;
+  _authPopupWindow.delegate = nil;
+  _authPopupWindow = nil;
+  [self.authPopupContainerView removeFromSuperview];
+  if (_authPopupBrowser) [self closeAuthPopup];
+}
+
+- (void)dismissAuthPopupWindow {
+  NSWindow *win = _authPopupWindow;
+  if (!win) return;
+  _authPopupWindow = nil;
+  win.delegate = nil;
+  [self.authPopupContainerView removeFromSuperview];
+  [win orderOut:nil];
+  [win close];
 }
 
 - (void)handleAuthPopupURLChanged:(NSURL *)url {
@@ -4343,6 +4398,7 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
   _authPopupBrowser = nullptr;
   _authPopupClient = nullptr;
   self.activeAuthPopupURL = nil;
+  [self dismissAuthPopupWindow];
   if (!_isClosed && [self.delegate respondsToSelector:@selector(browserTabDidCloseAuthPopup:)]) {
     [self.delegate browserTabDidCloseAuthPopup:self];
   }

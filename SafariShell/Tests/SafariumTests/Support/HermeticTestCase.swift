@@ -25,7 +25,6 @@ class HermeticTestCase: XCTestCase {
     static func installSandbox() {
         _ = sandboxRoot
         // The vault key normally lives in the real login Keychain; tests must never touch it.
-        if SafariumVaultCrypto.keyOverride == nil { SafariumVaultCrypto.keyOverride = SymmetricKey(data: Data(repeating: 0x5A, count: 32)) }
     }
 
     override class func setUp() {

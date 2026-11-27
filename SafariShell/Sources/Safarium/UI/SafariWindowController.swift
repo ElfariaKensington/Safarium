@@ -170,7 +170,6 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
     private let findBarView = PageFindBarView()
     private let customizeToolbarSheet = CustomizeToolbarSheetView()
     private let downloadController = DownloadAnimationController()
-    private var passwordsPasskeyManager: ApplePasswordsPasskeyManager?
 
     private let toolbarFrostView = ToolbarGlassView()
     private var toolbarFrostHeightConstraint: NSLayoutConstraint?
@@ -603,15 +602,6 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         ])
 
         elasticScrollEngine.attach(targetView: webContentHost, spinnerView: pullToRefreshView)
-        let authMgr = ApplePasswordsPasskeyManager(
-            window: self.window,
-            webContentHost: webContentHost,
-            sheetContainerView: contentStageView
-        )
-        authMgr.onToolbarPresentationOverrideChanged = { [weak self] in
-            self?.refreshToolbarUI()
-        }
-        self.passwordsPasskeyManager = authMgr
 
         // 4c. Native Start Page (`safarium://start`) full-bleed behind the 52pt frosted toolbar so its color & wallpaper match seamlessly
         startPageView.isHidden = true
@@ -1836,8 +1826,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             }
 
             if event.keyCode == 53, primaryMods.isEmpty { // Escape
-                let hasOverlay = (self.passwordsPasskeyManager?.hasActiveBiometricSheet == true)
-                    || self.customizeToolbarSheet.isPresented
+                let hasOverlay = self.customizeToolbarSheet.isPresented
                     || !self.findBarView.isHidden
                     || self.pageMenuPopover.isShown
                     || self.addressBarPopover.isShown
@@ -2920,7 +2909,6 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
 
         let tab = tabs[index]
         nativeVideoOverlay.setActiveTab(id: tab.tabID)
-        passwordsPasskeyManager?.dismissAllPopovers()
         websiteSettingsPopover.close()
         privacyPopover.close()
         privacySummaryWorkItem?.cancel()
@@ -3960,9 +3948,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
     }
 
     func handleEscapeOrStop() {
-        if passwordsPasskeyManager?.hasActiveBiometricSheet == true {
-            passwordsPasskeyManager?.cancelActiveBiometricSheet()
-        } else if extensionsCoordinator.isDragSessionActive {
+        if extensionsCoordinator.isDragSessionActive {
             extensionsCoordinator.cancelDrag()
         } else if customizeToolbarSheet.isPresented {
             customizeToolbarSheet.dismiss(animated: true)
@@ -5014,17 +5000,15 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
     // MARK: - Adaptive Theme & Toolbar Refresh
 
     private func refreshToolbarUI(animatedTabBar: Bool? = nil) {
-        let activeOverride = passwordsPasskeyManager?.activeOriginatingTabPresentation
         let items = tabs.enumerated().map { idx, tab -> TabPresentationItem in
             let isAct = (idx == activeTabIndex)
-            let ov = isAct ? activeOverride : nil
             return TabPresentationItem(
                 id: tab.tabID,
-                title: ov?.title ?? tab.title,
-                url: ov?.url ?? tab.currentURL,
-                favicon: ov?.favicon ?? tab.favicon,
-                isLoading: ov != nil ? false : tab.isLoading,
-                progress: ov != nil ? 1.0 : tab.estimatedProgress,
+                title: tab.title,
+                url: tab.currentURL,
+                favicon: tab.favicon,
+                isLoading: tab.isLoading,
+                progress: tab.estimatedProgress,
                 isActive: isAct,
                 isPinned: pinnedTabIDs.contains(tab.tabID)
             )
@@ -5791,9 +5775,6 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             reloadingErrorTabIDs.remove(tab.tabID)
         }
 
-        if tab === activeTab && !tab.isNativeInternalPage {
-            passwordsPasskeyManager?.handleTabURLChanged(url: url, tab: tab)
-        }
         refreshToolbarUI()
         if let url, url.isWebURL, let rawHost = url.host, !rawHost.isEmpty {
             let cleanHost = PrivacyDomainClassifier.sanitizeHostForStorage(rawHost)
@@ -6037,9 +6018,6 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
 
     func tabEngine(_ tab: BrowserTabEngine, didUpdateProgress progress: Double) {
         guard tab === activeTab else { return }
-        if passwordsPasskeyManager?.activeOriginatingTabPresentation != nil {
-            return
-        }
         tabAddressBar.updateActiveProgress(
             progress,
             isLoading: tab.isLoading,
@@ -6052,9 +6030,6 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         if !isPrivate, let favicon, let url = tab.currentURL {
             FaviconCache.shared.store(favicon, forURL: url)
         }
-        if tab === activeTab && !tab.isNativeInternalPage {
-            passwordsPasskeyManager?.handleTabFaviconUpdated(favicon, tab: tab)
-        }
         refreshToolbarUI()
     }
 
@@ -6066,9 +6041,6 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         if navigationTransitionCoordinator.activeKind == .coldTabSwitch,
            navigationTransitionCoordinator.activeTabID == tab.tabID {
             navigationTransitionCoordinator.completeTransitionIfNeeded(tabID: tab.tabID, fromBFCache: true)
-        }
-        if passwordsPasskeyManager?.activeOriginatingTabPresentation != nil {
-            return
         }
         // The sampler reads the strip right under the toolbar. With a fixed bar docked there that strip *is* the bar as
         // rendered (translucent bars like apple.com's nav show the page through them), which matches it far better
@@ -6100,9 +6072,6 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         if deferredRevealWebToolbarSyncTabID == tab.tabID {
             deferredRevealWebToolbarSyncTabID = nil
         }
-        if passwordsPasskeyManager?.activeOriginatingTabPresentation != nil {
-            return
-        }
         if let color, BrowserSettings.shared.showWebsiteColorInToolbar {
             let sample = TopEdgeColorSample(color: color)
             chromeController.apply(sample: sample, animated: true)
@@ -6129,26 +6098,6 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
 
     func tabEngine(_ tab: BrowserTabEngine, didUpdateNativeVideo id: String, srcURL: String, rect: NSRect, visible: Bool, autoplay: Bool) {
         // Video player controls are now embedded directly in the DOM at static position.
-    }
-
-    func tabEngine(_ tab: BrowserTabEngine, didReceiveAuthEventJSON jsonString: String) {
-        guard tab === activeTab, !tab.isNativeInternalPage else { return }
-        passwordsPasskeyManager?.handleAuthEventJSON(jsonString, tab: tab)
-    }
-
-    func tabEngine(_ tab: BrowserTabEngine, didOpenAuthPopupWithURL url: URL) {
-        guard tab === activeTab, !tab.isNativeInternalPage else { return }
-        passwordsPasskeyManager?.handleAuthPopupOpened(url: url, tab: tab)
-    }
-
-    func tabEngine(_ tab: BrowserTabEngine, didUpdateAuthPopupURL url: URL) {
-        guard tab === activeTab, !tab.isNativeInternalPage else { return }
-        passwordsPasskeyManager?.handleAuthPopupURLChanged(url: url, tab: tab)
-    }
-
-    func tabEngineDidCloseAuthPopup(_ tab: BrowserTabEngine) {
-        guard tab === activeTab else { return }
-        passwordsPasskeyManager?.handleAuthPopupClosed(tab: tab)
     }
 
     func tabEngine(_ tab: BrowserTabEngine, didRequestNewTabWithURL url: URL) {
