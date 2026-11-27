@@ -661,4 +661,34 @@ final class ElasticScrollEngineTests: HermeticTestCase {
         XCTAssertFalse(engine.handleMomentumEvent(momentum: .ended, deltaY: 0))
         XCTAssertEqual(engine.motionState, .idle)
     }
+
+    func testRepeatedStaleUpdateMetricsDoesNotClobberPredictiveFlingOvershoot() {
+        let engine = makeEngine(scrollY: 100)
+        // Simulate pre-event syncElasticMetrics() reporting unchanged stale scrollY=100
+        // across consecutive 120Hz upward momentum frames while approaching y=0.
+        engine.updateVelocityEstimate(deltaY: 40, timestamp: 1.000, isBegin: true)
+        engine.updateVelocityEstimate(deltaY: 40, timestamp: 1.008, isBegin: false)
+        _ = engine.handleMomentumEvent(momentum: .began, deltaY: 40)
+        XCTAssertEqual(engine.estimatedScrollY, 60, accuracy: 0.01)
+
+        engine.updateMetrics(scrollY: 100, contentHeight: 3000, viewportHeight: 800,
+                             canInnerScrollUp: false, canInnerScrollDown: false,
+                             isReloadableWebPage: true, isPageLoading: false)
+        XCTAssertEqual(engine.estimatedScrollY, 60, accuracy: 0.01, "stale scrollY must not reset predictive estimate")
+
+        engine.updateVelocityEstimate(deltaY: 40, timestamp: 1.016, isBegin: false)
+        _ = engine.handleMomentumEvent(momentum: .changed, deltaY: 40)
+        XCTAssertEqual(engine.estimatedScrollY, 20, accuracy: 0.01)
+
+        engine.updateMetrics(scrollY: 100, contentHeight: 3000, viewportHeight: 800,
+                             canInnerScrollUp: false, canInnerScrollDown: false,
+                             isReloadableWebPage: true, isPageLoading: false)
+        engine.updateVelocityEstimate(deltaY: 40, timestamp: 1.024, isBegin: false)
+        _ = engine.handleMomentumEvent(momentum: .changed, deltaY: 40)
+        if case .criticallyDamped = engine.motionState {
+            // Expected: fling overshoot launched immediately at boundary crossing.
+        } else {
+            XCTFail("expected criticallyDamped fling overshoot on boundary crossing, got \(engine.motionState)")
+        }
+    }
 }

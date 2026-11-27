@@ -248,7 +248,9 @@ final class ElasticScrollEngine: NSObject {
         isReloadableWebPage: Bool,
         isPageLoading: Bool
     ) {
-        metrics.scrollY = max(0.0, scrollY)
+        let clampedScrollY = max(0.0, scrollY)
+        let scrollYChanged = abs(clampedScrollY - metrics.scrollY) > 0.01
+        metrics.scrollY = clampedScrollY
         metrics.contentHeight = max(0.0, contentHeight)
         metrics.viewportHeight = max(1.0, viewportHeight)
         metrics.canInnerScrollUp = canInnerScrollUp
@@ -256,8 +258,11 @@ final class ElasticScrollEngine: NSObject {
         metrics.isReloadableWebPage = isReloadableWebPage
         metrics.isPageLoading = isPageLoading
 
-        // Re-sync predictive scroll position with renderer ground truth.
-        estimatedScrollY = metrics.scrollY
+        // Only re-sync predictive scroll position when renderer telemetry actually updated,
+        // so repeated pre-event syncs with unchanged stale scrollY never clobber 120Hz prediction.
+        if scrollYChanged || abs(estimatedScrollY - clampedScrollY) > 240.0 {
+            estimatedScrollY = clampedScrollY
+        }
     }
 
     func setReloadableWebPage(_ reloadable: Bool) {
