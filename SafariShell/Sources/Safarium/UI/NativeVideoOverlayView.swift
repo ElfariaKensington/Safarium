@@ -168,9 +168,11 @@ private final class LiquidGlassCircleButton: NSView {
             gv.style = .clear
             gv.appearance = NSAppearance(named: .darkAqua)
             gv.tintColor = NSColor(white: 0.18, alpha: 0.24)
+            #if compiler(>=6.4)
             if #available(macOS 27.0, *) {
                 gv.effectIsInteractive = true
             }
+            #endif
             gv.translatesAutoresizingMaskIntoConstraints = true
             addSubview(gv)
             self.glassView = gv
@@ -311,9 +313,11 @@ private final class LiquidGlassVolumeSliderPopover: NSView {
             gv.style = .clear
             gv.appearance = NSAppearance(named: .darkAqua)
             gv.tintColor = NSColor(white: 0.16, alpha: 0.34)
+            #if compiler(>=6.4)
             if #available(macOS 27.0, *) {
                 gv.effectIsInteractive = true
             }
+            #endif
             addSubview(gv)
             self.glassView = gv
         } else {
@@ -449,9 +453,11 @@ final class LiquidGlassBottomPill: NSView {
             gv.style = .clear
             gv.appearance = NSAppearance(named: .darkAqua)
             gv.tintColor = NSColor(white: 0.16, alpha: 0.24)
+            #if compiler(>=6.4)
             if #available(macOS 27.0, *) {
                 gv.effectIsInteractive = true
             }
+            #endif
             addSubview(gv)
             self.glassView = gv
         } else {

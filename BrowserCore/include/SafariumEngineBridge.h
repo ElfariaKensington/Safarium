@@ -413,6 +413,14 @@ SX_EXPORT
 /// Exports the current webpage directly to a PDF file at `filePath`.
 - (void)exportToPDFAtPath:(NSString *)filePath
                completion:(nullable void (^)(BOOL success))completion;
+/// Retrieves the live serialized HTML source of the main frame without re-fetching from the network
+/// and without triggering Chromium's download manager. Completion runs on the main thread.
+- (void)getPageSourceWithCompletion:(void (^)(NSString * _Nullable htmlSource))completion;
+/// Presents a native macOS NSSavePanel (sheet on `window`, or modal if nil) allowing the user to save
+/// the current webpage as Page Source (.html) or PDF (.pdf) directly to disk without triggering
+/// Chromium download events or download bar animations.
+- (void)savePageWithPanelForWindow:(nullable NSWindow *)window
+                        completion:(nullable void (^)(BOOL saved, NSURL * _Nullable savedURL))completion;
 /// Mutes or unmutes audio playback for this tab.
 - (void)setAudioMuted:(BOOL)muted;
 - (BOOL)isAudioMuted;

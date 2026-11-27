@@ -33,7 +33,7 @@ final class StartPageView: NSView {
     private let favoritesHeaderLabel = NSTextField(labelWithString: "Favorites")
     private let showAllButton = NSButton()
     private let favoritesGrid = FavoritesReorderGridView()
-    private var recentHeaderLabel: NSTextField?
+    var recentHeaderLabel: NSTextField?
     let recentRowStack = NSStackView()
     var privacyHeaderLabel: NSTextField?
     var privacyCardView: NSView?
@@ -138,12 +138,19 @@ final class StartPageView: NSView {
     }
 
     @objc private func handlePrivacyReportOrSettingsChanged() {
-        guard !isPrivateMode else { return }
-        if isHidden {
-            needsPrivacyRefresh = true
+        let apply = { [weak self] in
+            guard let self, !self.isPrivateMode else { return }
+            if self.isHiddenOrHasHiddenAncestor {
+                self.needsPrivacyRefresh = true
+            } else {
+                self.needsPrivacyRefresh = false
+                self.refreshPrivacyReport()
+            }
+        }
+        if Thread.isMainThread {
+            apply()
         } else {
-            needsPrivacyRefresh = false
-            refreshPrivacyReport()
+            DispatchQueue.main.async(execute: apply)
         }
     }
 
@@ -225,7 +232,7 @@ final class StartPageView: NSView {
         privateBannerCard.isHidden = !isPrivateMode
         favoritesHeaderRow.isHidden = !showFavoritesSection
         favoritesGrid.isHidden = !showFavoritesSection
-        let showRecent = showRecentlyViewedSection
+        let showRecent = showRecentlyViewedSection && (!isPrivateMode || !recentEntries.isEmpty)
         recentHeaderLabel?.isHidden = !showRecent
         recentRowStack.isHidden = !showRecent
         let showPrivacy = !isPrivateMode && showPrivacyReportSection
@@ -598,6 +605,7 @@ final class StartPageView: NSView {
             }
             recentRowStack.addArrangedSubview(card)
         }
+        applySectionVisibility()
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -616,15 +624,24 @@ final class StartPageView: NSView {
         privacyStatusLabel?.stringValue = trackingOn
             ? "Safarium prevents trackers from profiling you."
             : "Cross-site tracking prevention is turned off."
+        privacyPeriodLabel?.stringValue = summary.windowDays == 1
+            ? "Last 24 hours"
+            : "Last \(summary.windowDays) days"
 
         privacyTrackersValueLabel?.stringValue = "\(summary.uniqueTrackersPrevented)"
         privacyPercentValueLabel?.stringValue = "\(summary.websitesContactingTrackersPercent)%"
 
         if let top = summary.mostContactedTracker {
-            let noun = top.websiteCount == 1 ? "website" : "websites"
-            privacyMostNarrativeLabel?.stringValue = "\(top.entityDomain) was prevented from profiling you across \(top.websiteCount) \(noun)"
+            if top.websiteCount > 0 {
+                let noun = top.websiteCount == 1 ? "website" : "websites"
+                privacyMostNarrativeLabel?.stringValue = "\(top.entityDomain) was prevented from profiling you across \(top.websiteCount) \(noun)"
+            } else {
+                let reqNoun = top.totalBlockedRequests == 1 ? "request" : "requests"
+                privacyMostNarrativeLabel?.stringValue = "\(top.entityDomain) was prevented from profiling you (\(top.totalBlockedRequests) blocked \(reqNoun))"
+            }
         } else {
-            privacyMostNarrativeLabel?.stringValue = "No trackers prevented in the last 30 days"
+            let windowText = summary.windowDays == 1 ? "24 hours" : "\(summary.windowDays) days"
+            privacyMostNarrativeLabel?.stringValue = "No trackers prevented in the last \(windowText)"
         }
     }
 
@@ -868,7 +885,9 @@ final class StartPageView: NSView {
         popover.behavior = .transient
         let vc = NSViewController()
         let popW: CGFloat = 278
-        let popH: CGFloat = isPrivateMode ? 224 : 250
+        let showRecentToggle = !isPrivateMode || !recentEntries.isEmpty
+        let showPrivacyToggle = !isPrivateMode
+        let popH: CGFloat = 198 + (showRecentToggle ? 26 : 0) + (showPrivacyToggle ? 26 : 0)
         let container = FlippedStartDocView(frame: NSRect(x: 0, y: 0, width: popW, height: popH))
 
         var y: CGFloat = 14
@@ -915,9 +934,11 @@ final class StartPageView: NSView {
         addSectionHeader("Sections", at: y)
         y += 22
         addCheckRow(title: "Favorites", symbol: "star", checked: showFavoritesSection, tag: 101, action: #selector(toggleSectionCheckbox(_:)), at: y)
-        y += 26
-        addCheckRow(title: "Recently Viewed", symbol: "rectangle.stack", checked: showRecentlyViewedSection, tag: 102, action: #selector(toggleSectionCheckbox(_:)), at: y)
-        if !isPrivateMode {
+        if showRecentToggle {
+            y += 26
+            addCheckRow(title: "Recently Viewed", symbol: "rectangle.stack", checked: showRecentlyViewedSection, tag: 102, action: #selector(toggleSectionCheckbox(_:)), at: y)
+        }
+        if showPrivacyToggle {
             y += 26
             addCheckRow(title: "Privacy Report", symbol: "shield.lefthalf.filled", checked: showPrivacyReportSection, tag: 104, action: #selector(toggleSectionCheckbox(_:)), at: y)
         }

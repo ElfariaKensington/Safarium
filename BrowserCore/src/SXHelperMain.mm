@@ -469,6 +469,11 @@ class SXTelemetryV8Handler : public CefV8Handler {
       frame_->SendProcessMessage(PID_BROWSER, msg);
       return true;
     }
+    if (name == "reportNavTraverse") {
+      CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("sx.nav_traverse");
+      frame_->SendProcessMessage(PID_BROWSER, msg);
+      return true;
+    }
     if (name == "reportOverscroll" || name == "triggerPullRefresh") {
       return true;
     }
@@ -2495,7 +2500,7 @@ class SXHelperApp : public CefApp,
     CefRefPtr<CefV8Value> installer;
     CefRefPtr<CefV8Exception> exception;
     const char* kInstallerJS = R"JS(
-      (function(reportMetrics, _unusedOverscroll, _unusedPullRefresh, cwsAction, spaceScroll, reportFixedHeader, reportPageBg, reportNativeVideo, reportAuthEvent, mediaProxyPort, mediaProxyToken, reportNavReady, initialTopInset) {
+      (function(reportMetrics, _unusedOverscroll, _unusedPullRefresh, cwsAction, spaceScroll, reportFixedHeader, reportPageBg, reportNativeVideo, reportAuthEvent, mediaProxyPort, mediaProxyToken, reportNavReady, initialTopInset, reportNavTraverse) {
         const onScrollPhase = function() {};
         const settle = function() {};
 
@@ -4939,6 +4944,14 @@ class SXHelperApp : public CefApp,
           // then (like Safari), so this must not fire early. A page that never paints anything contentful is
           // released shortly after load, and everything after 2.5 s.
           let freshPipelineStarted = false;
+          let freshLoadTimer = 0;
+          let freshCeilingTimer = 0;
+          let freshObs = null;
+          function cancelFreshReadyTimers() {
+            if (freshObs) { try { freshObs.disconnect(); } catch (_) {} freshObs = null; }
+            if (freshLoadTimer) { clearTimeout(freshLoadTimer); freshLoadTimer = 0; }
+            if (freshCeilingTimer) { clearTimeout(freshCeilingTimer); freshCeilingTimer = 0; }
+          }
           function startFreshReadyPipeline() {
             if (reportedReady || freshPipelineStarted || document.prerendering) return;
             freshPipelineStarted = true;
@@ -4946,27 +4959,30 @@ class SXHelperApp : public CefApp,
               requestAnimationFrame(function() { emitNavReadyOnce(true); });
               return;
             }
-            let obs = null;
             const done = function() {
-              if (obs) { try { obs.disconnect(); } catch (_) {} obs = null; }
+              cancelFreshReadyTimers();
               emitNavReadyOnce(false);
             };
             try {
               if (performance.getEntriesByName('first-contentful-paint').length > 0) { done(); return; }
-              obs = new PerformanceObserver(function(list) {
+              freshObs = new PerformanceObserver(function(list) {
                 const entries = list.getEntries();
                 for (let i = 0; i < entries.length; i++) {
                   if (entries[i].name === 'first-contentful-paint') { done(); return; }
                 }
               });
-              obs.observe({ type: 'paint', buffered: true });
+              freshObs.observe({ type: 'paint', buffered: true });
             } catch (_) {}
             if (document.readyState === 'complete') {
-              setTimeout(done, 250);
+              freshLoadTimer = setTimeout(done, 250);
             } else {
-              window.addEventListener('load', function() { setTimeout(done, 250); }, { once: true, passive: true });
+              window.addEventListener('load', function() {
+                if (!reportedReady && !freshLoadTimer) {
+                  freshLoadTimer = setTimeout(done, 250);
+                }
+              }, { once: true, passive: true });
             }
-            setTimeout(done, 2500);
+            freshCeilingTimer = setTimeout(done, 2500);
           }
 
           if (document.prerendering) {
@@ -4990,11 +5006,44 @@ class SXHelperApp : public CefApp,
             }
           }, { passive: true });
 
+          let lastBFCachePageshowAt = -1e9;
+          let lastTraverseSentAt = -1e9;
+          function notifyTraverseOnce() {
+            if (typeof reportNavTraverse !== 'function') return;
+            const now = performance.now();
+            if (now - lastTraverseSentAt < 120) return;
+            lastTraverseSentAt = now;
+            try { reportNavTraverse(); } catch (_) {}
+          }
+          try {
+            if (window.navigation && typeof window.navigation.addEventListener === 'function') {
+              window.navigation.addEventListener('navigate', function(ev) {
+                if (!ev || ev.defaultPrevented || ev.hashChange) return;
+                if (ev.navigationType === 'traverse') {
+                  notifyTraverseOnce();
+                }
+              }, { passive: true });
+            }
+          } catch (_) {}
+          window.addEventListener('pagehide', function(ev) {
+            if (ev && ev.persisted) {
+              notifyTraverseOnce();
+            }
+          }, { passive: true });
+
           window.addEventListener('pageshow', function(ev) {
             if (ev && ev.persisted) {
+              cancelFreshReadyTimers();
+              lastBFCachePageshowAt = performance.now();
               reportedReady = false;
               try { if (typeof sxTopInset.forgetReported === 'function') sxTopInset.forgetReported(); } catch (_) {}
-              requestAnimationFrame(function() { emitNavReadyOnce(true); });
+              // Wait two animation frames so the thawed BFCache document has painted and
+              // submitted its composited IOSurface to Viz before lifting the freeze overlay.
+              requestAnimationFrame(function() {
+                requestAnimationFrame(function() {
+                  emitNavReadyOnce(true);
+                });
+              });
             } else {
               startFreshReadyPipeline();
             }
@@ -5006,6 +5055,8 @@ class SXHelperApp : public CefApp,
           // Safarium covers it until this reports that a fresh frame is on screen.
           document.addEventListener('visibilitychange', function() {
             if (document.visibilityState !== 'visible' || document.prerendering) return;
+            // BFCache pageshow fires right alongside visibilitychange and already schedules a double-rAF ready.
+            if (performance.now() - lastBFCachePageshowAt < 250) return;
             requestAnimationFrame(function() {
               requestAnimationFrame(function() {
                 reportedReady = false;
@@ -5195,6 +5246,7 @@ class SXHelperApp : public CefApp,
         if (pit != privacy_configs_.end()) topInset = pit->second.top_inset;
         args.push_back(CefV8Value::CreateInt(topInset));
       }
+      args.push_back(CefV8Value::CreateFunction("reportNavTraverse", handler));
       CefRefPtr<CefV8Value> ret = installer->ExecuteFunction(nullptr, args);
       if (ret && ret->IsArray() && ret->GetArrayLength() >= 3) {
         SXFrameHooks hooks;
@@ -6455,14 +6507,11 @@ class SXHelperApp : public CefApp,
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  // Parse live privacy switches synchronously before V8 contexts can ever initialize.
+  // Parse live privacy switches synchronously (pure C++ — zero ObjC/CF/GCD calls)
+  // before V8 contexts can ever initialize.
   SXInitLaunchPrivacyConfig(argc, argv);
 
-  // Check in with LaunchServices BEFORE engaging the Seatbelt sandbox so macOS Activity Monitor
-  // displays Safari-style per-tab & helper names (e.g. "https://www.reddit.com", "Safarium Networking").
-  SXInitLaunchServicesForSubprocess(argc, argv);
-
-  // Initialize macOS Chromium sandbox only when not launched with --no-sandbox.
+  // Initialize macOS Chromium sandbox BEFORE loading CEF framework (required by CEF macOS sandbox).
   bool noSandbox = false;
   for (int i = 1; i < argc; ++i) {
     if (argv[i] && strcmp(argv[i], "--no-sandbox") == 0) {
@@ -6472,11 +6521,15 @@ int main(int argc, char* argv[]) {
   }
   CefScopedSandboxContext sandbox_context;
   if (!noSandbox) {
-    sandbox_context.Initialize(argc, argv);
+    if (!sandbox_context.Initialize(argc, argv)) {
+      return 1;
+    }
   }
 
-  // Load Chromium Embedded Framework dynamically from the app bundle
-  // (or SAFARIUM_CEF_FRAMEWORK_BINARY fallback in unbundled dev runs).
+  // Load Chromium Embedded Framework dynamically while the process is still single-threaded.
+  // Calling LaunchServices/CoreFoundation BEFORE cef_load_library spawns a background GCD
+  // utility thread (`com.apple.root.utility-qos.overcommit`) that races with Chromium's
+  // PartitionAlloc malloc-zone installation during dlopen and triggers SIGTRAP in _CFRelease.
   CefScopedLibraryLoader library_loader;
   if (!library_loader.LoadInHelper()) {
     const char* overridePath = std::getenv("SAFARIUM_CEF_FRAMEWORK_BINARY");
@@ -6484,6 +6537,10 @@ int main(int argc, char* argv[]) {
       return 1;
     }
   }
+
+  // Check in with LaunchServices AFTER CEF (and PartitionAlloc) is fully loaded, and BEFORE
+  // CefExecuteProcess engages Chromium's Seatbelt sandbox profile.
+  SXInitLaunchServicesForSubprocess(argc, argv);
 
   CefMainArgs main_args(argc, argv);
   CefRefPtr<SXHelperApp> app(new SXHelperApp());

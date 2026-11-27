@@ -283,6 +283,8 @@ class SXBrowserClient : public CefClient,
   std::atomic<bool> is_incognito_{false};
   std::atomic<bool> devtools_open_{false};
   std::string force_save_dialog_url_;
+  std::unordered_map<uint32_t, std::string> pending_save_dialog_downloads_;
+  std::unordered_set<uint32_t> started_download_ids_;
   std::unordered_map<int, std::pair<std::string, std::string>> ext_menu_commands_;
   std::mutex css_cache_mutex_;
   std::string cached_css_path_;

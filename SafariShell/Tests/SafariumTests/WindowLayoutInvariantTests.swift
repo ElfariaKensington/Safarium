@@ -141,12 +141,14 @@ final class WindowLayoutInvariantTests: T8WindowTestCase {
         win(wc).contentView?.layoutSubtreeIfNeeded()
         let rail = t8Mirror(wc, "verticalTabRailWidthConstraint") as? NSLayoutConstraint
         XCTAssertNotNil(rail)
-        // The rail collapses to width 0 (required); its scroll view's -1pt trailing inset must therefore not be required,
+        // The rail collapses to width 0 (required); its scroll view's trailing constraint must therefore not be required,
         // otherwise AppKit logs an unsatisfiable-constraint break on every launch.
         let railView = t8Mirror(wc, "verticalTabRailView") as? NSView
-        let insets = railView?.constraints.filter { $0.firstAttribute == .trailing && $0.constant == -1 } ?? []
-        XCTAssertFalse(insets.isEmpty)
-        XCTAssertTrue(insets.allSatisfy { $0.priority < .required })
+        let scrollTrailing = railView?.constraints.filter {
+            $0.firstItem is NSScrollView && $0.firstAttribute == .trailing && ($0.constant == 0 || $0.constant == -1)
+        } ?? []
+        XCTAssertFalse(scrollTrailing.isEmpty)
+        XCTAssertTrue(scrollTrailing.allSatisfy { $0.priority < .required })
 
     }
 

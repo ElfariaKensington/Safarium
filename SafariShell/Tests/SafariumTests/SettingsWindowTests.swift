@@ -46,7 +46,7 @@ final class SettingsWindowTests: HermeticTestCase {
     func testEveryPaneHasUniqueStableToolbarIdentifier() {
         let ids = Pane.allCases.map { $0.toolbarID.rawValue }
         XCTAssertEqual(Set(ids).count, Pane.allCases.count)
-        XCTAssertEqual(Pane.allCases.count, 11)
+        XCTAssertEqual(Pane.allCases.count, 10)
         for pane in Pane.allCases {
             XCTAssertEqual(pane.toolbarID.rawValue, "com.safarium.settings.\(pane.rawValue)")
         }
@@ -63,7 +63,7 @@ final class SettingsWindowTests: HermeticTestCase {
     func testPanePreferredHeightsMatchTable() {
         let expected: [Pane: CGFloat] = [
             .general: 468, .tabs: 444, .autoFill: 206, .search: 318, .security: 256, .privacy: 384,
-            .websites: 456, .profiles: 296, .extensions: 468, .advanced: 436, .developer: 238
+            .websites: 456, .extensions: 520, .advanced: 436, .developer: 238
         ]
         for pane in Pane.allCases {
             XCTAssertEqual(pane.preferredContentHeight, expected[pane], "height for \(pane)")
@@ -89,7 +89,7 @@ final class SettingsWindowTests: HermeticTestCase {
             XCTAssertTrue(category.options.indices.contains(category.defaultOptionIndex), "\(category)")
             XCTAssertGreaterThan(category.badgeColor.alphaComponent, 0.99)
         }
-        XCTAssertEqual(SafariSettingsWindowController.WebsiteCategory.allCases.count, 11)
+        XCTAssertEqual(SafariSettingsWindowController.WebsiteCategory.allCases.count, 10)
     }
 
     func testWebsiteCategoryRawValuesAreUnique() {
@@ -105,8 +105,6 @@ final class SettingsWindowTests: HermeticTestCase {
         XCTAssertEqual(Cat.autoPlay.defaultOptionIndex, 1)
         XCTAssertEqual(Cat.popups.options, ["Block and Notify", "Block", "Allow"])
         XCTAssertEqual(Cat.popups.defaultOptionIndex, 0)
-        XCTAssertEqual(Cat.extensionAccess.options, ["Allow", "Ask", "Deny"])
-        XCTAssertEqual(Cat.extensionAccess.defaultOptionIndex, 0)
         for permission in [Cat.camera, .microphone, .screenSharing, .location, .downloads, .notifications] {
             XCTAssertEqual(permission.options, ["Ask", "Deny", "Allow"], "\(permission)")
             XCTAssertEqual(permission.defaultOptionIndex, 0, "\(permission)")
@@ -313,15 +311,6 @@ final class SettingsWindowTests: HermeticTestCase {
         XCTAssertEqual(BrowserSettings.shared.configuredHosts(for: "Auto-Play"), ["stay.example"])
     }
 
-    func testOpenWebsiteSettingsFromExtensionsSwitchesCategoryAndClearsStaleHost() {
-        controller.selectedWebsiteCategory = .autoPlay
-        controller.selectedWebsiteHost = "stale.example"
-        _ = controller.perform(NSSelectorFromString("openWebsitesSettings"))
-        XCTAssertEqual(controller.selectedWebsiteCategory, .extensionAccess)
-        XCTAssertNil(controller.selectedWebsiteHost, "a host selected in another category must not survive")
-        XCTAssertEqual(controller.window?.title, "Websites")
-    }
-
     func testOpenWebsitesWithoutPerHostRuleInheritGlobalDefaultPolicy() throws {
         BrowserSettings.shared.setWebsiteDefaultPolicy(category: "Content Blockers", index: 1) // Off
         BrowserSettings.shared.setWebsitePolicy(category: "Content Blockers", host: "override.example", index: 0) // On
@@ -340,21 +329,6 @@ final class SettingsWindowTests: HermeticTestCase {
         XCTAssertEqual(popups[0].indexOfSelectedItem, 1, "open website without per-host override must inherit global Off default")
         XCTAssertEqual(popups[1].indexOfSelectedItem, 0, "open website with per-host override must keep On")
         XCTAssertEqual(popups.last?.indexOfSelectedItem, 1, "global default popup reflects Off")
-    }
-
-    // MARK: - Profiles
-
-    func testEnableProfilesSeedsDefaultNamesWhenNoneStored() {
-        _ = controller.perform(NSSelectorFromString("enableProfilesClicked"))
-        XCTAssertTrue(UserDefaults.standard.bool(forKey: "Safarium.Pref.ProfilesEnabled"))
-        XCTAssertEqual(UserDefaults.standard.stringArray(forKey: "Safarium.Pref.ProfileNames"), ["Personal", "Work"])
-        XCTAssertEqual(controller.window?.title, "Profiles")
-    }
-
-    func testEnableProfilesKeepsExistingNames() {
-        UserDefaults.standard.set(["Solo"], forKey: "Safarium.Pref.ProfileNames")
-        _ = controller.perform(NSSelectorFromString("enableProfilesClicked"))
-        XCTAssertEqual(UserDefaults.standard.stringArray(forKey: "Safarium.Pref.ProfileNames"), ["Solo"])
     }
 
     // MARK: - Extension manifest metadata

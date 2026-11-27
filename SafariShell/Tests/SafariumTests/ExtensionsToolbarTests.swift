@@ -624,4 +624,49 @@ final class ExtensionsToolbarTests: HermeticTestCase {
         UserDefaults.standard.set(["text": "wide"], forKey: key)
         XCTAssertEqual(ExtensionPopoverController.cachedPopupSize(for: "text"), NSSize(width: 380, height: 520))
     }
+
+    func testBadgeUpdateReusesExistingToolbarButtonsInPlaceWithoutViewChurn() {
+        let cap = ExtensionsToolbarCapsuleView(zone: .leftOfAddressBar)
+        let extA = BrowserExtensionItem(
+            id: "ext-a",
+            name: "uBlock",
+            version: "1.0",
+            icon: nil,
+            badgeText: "4",
+            badgeColor: .systemRed,
+            popupURL: nil,
+            enabled: true
+        )
+        let extB = BrowserExtensionItem(
+            id: "ext-b",
+            name: "Bitwarden",
+            version: "1.0",
+            icon: nil,
+            badgeText: nil,
+            badgeColor: nil,
+            popupURL: nil,
+            enabled: true
+        )
+        cap.update(extensions: [extA, extB])
+        let btnABefore = cap.anchorButton(forExtensionID: "ext-a")
+        let btnBBefore = cap.anchorButton(forExtensionID: "ext-b")
+        XCTAssertNotNil(btnABefore)
+        XCTAssertNotNil(btnBBefore)
+
+        let extAUpdated = BrowserExtensionItem(
+            id: "ext-a",
+            name: "uBlock",
+            version: "1.0",
+            icon: nil,
+            badgeText: "16",
+            badgeColor: .systemRed,
+            popupURL: nil,
+            enabled: true
+        )
+        cap.update(extensions: [extAUpdated, extB])
+        let btnAAfter = cap.anchorButton(forExtensionID: "ext-a")
+        let btnBAfter = cap.anchorButton(forExtensionID: "ext-b")
+        XCTAssertTrue(btnABefore === btnAAfter, "Badge update must reuse the existing button instance without teardown")
+        XCTAssertTrue(btnBBefore === btnBAfter, "Sibling extension button must be reused in place")
+    }
 }

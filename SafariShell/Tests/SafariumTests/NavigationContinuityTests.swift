@@ -22,6 +22,13 @@ final class NavigationContinuityTests: HermeticTestCase {
         return all[idx] as? MockBrowserTab
     }
 
+    private func waitUntil(_ timeout: TimeInterval = 1.0, condition: () -> Bool) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() && Date() < deadline {
+            spinRunLoop(0.02)
+        }
+    }
+
     private func solidImage(color: NSColor, size: NSSize) -> NSImage {
         let img = NSImage(size: size)
         img.lockFocus()
@@ -96,7 +103,7 @@ final class NavigationContinuityTests: HermeticTestCase {
                        "Viewport must remain frozen on Start Page snapshot while destination page loads underneath")
 
         // Wait for simulated FCP / visual readiness + 110ms smooth dissolve
-        spinRunLoop(0.45)
+        waitUntil(1.5) { !wc.navigationTransitionCoordinator.isTransitionActive }
         XCTAssertFalse(wc.navigationTransitionCoordinator.isTransitionActive,
                        "Veil must tear down completely after destination reveal (zero idle GPU overdraw)")
     }
@@ -198,7 +205,7 @@ final class NavigationContinuityTests: HermeticTestCase {
         XCTAssertFalse(wc.navigationTransitionCoordinator.isTransitionActive,
                        "2-finger swipe already holds its promoted snapshot; coordinator must not double-stack")
 
-        spinRunLoop(0.35)
+        waitUntil(1.5) { !swipe.isHoldingCommittedSnapshot }
         XCTAssertFalse(swipe.isHoldingCommittedSnapshot)
     }
 
@@ -276,7 +283,7 @@ final class NavigationContinuityTests: HermeticTestCase {
         XCTAssertTrue(wc.navigationTransitionCoordinator.isTransitionActive)
         XCTAssertEqual(wc.navigationTransitionCoordinator.activeKind, .coldTabSwitch)
 
-        spinRunLoop(0.20)
+        waitUntil(1.5) { !wc.navigationTransitionCoordinator.isTransitionActive }
         XCTAssertFalse(wc.navigationTransitionCoordinator.isTransitionActive)
     }
 

@@ -6,7 +6,7 @@ import AppKit
 /// asserts structural layout invariants (no NaN/negative frames, no subview escaping min-size layouts, text not empty).
 @MainActor
 final class VisualSnapshotTests: HermeticTestCase {
-    static let outDir = "/private/tmp/claude-501/-Users-elfaria-SafariX/9c5f1d60-0c86-4a5d-9a2e-23146ae56677/scratchpad/shots"
+    static let outDir = NSTemporaryDirectory() + "SafariumTestShots"
 
     override func setUp() {
         super.setUp()

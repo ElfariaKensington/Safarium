@@ -38,7 +38,6 @@ final class BrowserSettingsTests: HermeticTestCase {
         XCTAssertEqual(BrowserSettings.Key.showFullAddress, "Safarium.Pref.ShowFullAddress")
         XCTAssertEqual(BrowserSettings.Key.minFontSize, "Safarium.Pref.MinFontSize")
         XCTAssertEqual(BrowserSettings.Key.customStyleSheetPath, "Safarium.Pref.CustomStyleSheetPath")
-        XCTAssertEqual(BrowserSettings.Key.clearedShortcuts, "Safarium.Extensions.ClearedShortcuts")
         XCTAssertEqual(BrowserSettings.Key.savedSessionTabs, "Safarium.Session.SavedTabs.v1")
         XCTAssertEqual(BrowserSettings.Key.savedSessionActiveIndex, "Safarium.Session.ActiveIndex.v1")
     }
@@ -473,7 +472,6 @@ final class BrowserSettingsTests: HermeticTestCase {
         XCTAssertEqual(s.tabLayout, "compact")
         XCTAssertTrue(s.showWebsiteColorInToolbar)
         XCTAssertFalse(s.alwaysShowWebsiteTitles)
-        XCTAssertTrue(s.cmdClickOpensInNewTab)
         XCTAssertFalse(s.activateNewTabsOnOpen)
         XCTAssertTrue(s.cmdNumberSwitchesTabs)
     }
@@ -490,14 +488,12 @@ final class BrowserSettingsTests: HermeticTestCase {
         s.set("wide", forKey: BrowserSettings.Key.tabLayout)
         s.set(false, forKey: BrowserSettings.Key.showWebsiteColor)
         s.set(true, forKey: BrowserSettings.Key.alwaysShowTabTitles)
-        s.set(false, forKey: BrowserSettings.Key.cmdClickNewTab)
         s.set(true, forKey: BrowserSettings.Key.activateNewTabs)
         s.set(false, forKey: BrowserSettings.Key.cmdNumberSwitch)
         s.set(2, forKey: BrowserSettings.Key.openPagesInTabs)
         XCTAssertEqual(s.tabLayout, "wide")
         XCTAssertFalse(s.showWebsiteColorInToolbar)
         XCTAssertTrue(s.alwaysShowWebsiteTitles)
-        XCTAssertFalse(s.cmdClickOpensInNewTab)
         XCTAssertTrue(s.activateNewTabsOnOpen)
         XCTAssertFalse(s.cmdNumberSwitchesTabs)
         XCTAssertEqual(s.openPagesInTabsMode, 2)
@@ -651,13 +647,6 @@ final class BrowserSettingsTests: HermeticTestCase {
         XCTAssertNil(s.matchQuickWebsiteSearch(for: "k anything"))
     }
 
-    func testAutoFillStoreRoundTripAndDefault() {
-        XCTAssertTrue(s.autoFillEntries(categoryKey: "Logins").isEmpty)
-        s.saveAutoFillEntries(["one", "two"], categoryKey: "Logins")
-        XCTAssertEqual(s.autoFillEntries(categoryKey: "Logins"), ["one", "two"])
-        XCTAssertTrue(s.autoFillEntries(categoryKey: "Cards").isEmpty)
-    }
-
     // MARK: - Search selection
 
     func testSearchDefaults() {
@@ -666,7 +655,6 @@ final class BrowserSettingsTests: HermeticTestCase {
         XCTAssertEqual(s.privateSearchEngine, .duckDuckGo)
         XCTAssertTrue(s.includeSearchSuggestions)
         XCTAssertTrue(s.enableQuickWebsiteSearch)
-        XCTAssertTrue(s.preloadTopHit)
         XCTAssertTrue(s.showFavoritesInSearch)
     }
 
@@ -704,10 +692,8 @@ final class BrowserSettingsTests: HermeticTestCase {
 
     func testSearchSuggestionAndFavoritesToggles() {
         s.set(false, forKey: BrowserSettings.Key.searchSuggestions)
-        s.set(false, forKey: BrowserSettings.Key.preloadTopHit)
         s.set(false, forKey: BrowserSettings.Key.showFavoritesInSearch)
         XCTAssertFalse(s.includeSearchSuggestions)
-        XCTAssertFalse(s.preloadTopHit)
         XCTAssertFalse(s.showFavoritesInSearch)
     }
 
@@ -749,6 +735,7 @@ final class BrowserSettingsTests: HermeticTestCase {
         XCTAssertTrue(s.devAllowUnsignedExtensions)
         XCTAssertFalse(s.devSeparateDevToolsWindow)
         XCTAssertFalse(s.devDisableCache)
+        XCTAssertFalse(s.remoteDebuggingEnabled)
     }
 
     func testMinimumFontSizeOnlyAppliesWhenEnabled() {

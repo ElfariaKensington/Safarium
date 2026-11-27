@@ -16,7 +16,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         case security = "Security"
         case privacy = "Privacy"
         case websites = "Websites"
-        case profiles = "Profiles"
         case extensions = "Extensions"
         case advanced = "Advanced"
         case developer = "Developer"
@@ -34,7 +33,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
             case .security: return "lock"
             case .privacy: return "hand.raised"
             case .websites: return "globe"
-            case .profiles: return "person"
             case .extensions: return "puzzlepiece.extension"
             case .advanced: return "gearshape.2"
             case .developer: return "wrench.and.screwdriver"
@@ -50,8 +48,7 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
             case .security: return 256
             case .privacy: return 384
             case .websites: return 456
-            case .profiles: return 296
-            case .extensions: return 468
+            case .extensions: return 520
             case .advanced: return 436
             case .developer: return 238
             }
@@ -69,7 +66,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         case downloads = "Downloads"
         case popups = "Pop-up Windows"
         case notifications = "Notifications"
-        case extensionAccess = "Extension Access"
 
         var symbolName: String {
             switch self {
@@ -83,7 +79,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
             case .downloads: return "arrow.down.circle.fill"
             case .popups: return "macwindow.on.rectangle"
             case .notifications: return "bell.badge.fill"
-            case .extensionAccess: return "puzzlepiece.extension.fill"
             }
         }
 
@@ -99,7 +94,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
             case .downloads: return NSColor(srgbRed: 0.52, green: 0.42, blue: 0.96, alpha: 1.0)
             case .popups: return NSColor(srgbRed: 0.92, green: 0.34, blue: 0.38, alpha: 1.0)
             case .notifications: return NSColor(srgbRed: 0.94, green: 0.32, blue: 0.28, alpha: 1.0)
-            case .extensionAccess: return NSColor(srgbRed: 0.25, green: 0.45, blue: 0.96, alpha: 1.0)
             }
         }
 
@@ -115,7 +109,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
             case .downloads: return "Allow websites below to download files:"
             case .popups: return "Configure pop-up windows for the websites below:"
             case .notifications: return "Allow websites below to send notifications:"
-            case .extensionAccess: return "Website access granted to installed extensions:"
             }
         }
 
@@ -127,7 +120,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
             case .camera, .microphone, .screenSharing, .location, .downloads, .notifications:
                 return ["Ask", "Deny", "Allow"]
             case .popups: return ["Block and Notify", "Block", "Allow"]
-            case .extensionAccess: return ["Allow", "Ask", "Deny"]
             }
         }
 
@@ -138,7 +130,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
             case .pageZoom: return 3
             case .camera, .microphone, .screenSharing, .location, .downloads, .notifications: return 0
             case .popups: return 0
-            case .extensionAccess: return 0
             }
         }
     }
@@ -191,7 +182,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         static let newTabOpensWith = "Safarium.Pref.NewTabOpensWith"
         static let homepage = "Safarium.Pref.Homepage"
         static let removeHistory = "Safarium.Pref.RemoveHistory"
-        static let startPageFavorites = "Safarium.Pref.StartPageFavorites"
         static let downloadLocation = "Safarium.Pref.DownloadLocation"
         static let removeDownloads = "Safarium.Pref.RemoveDownloads"
         static let openSafeFiles = "Safarium.Pref.OpenSafeFiles"
@@ -203,7 +193,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         static let refractiveGlassToolbar = "Safarium.Pref.RefractiveGlassToolbar"
         static let refractiveGlassFrost = "Safarium.Pref.RefractiveGlassFrost"
         static let alwaysShowTabTitles = "Safarium.Pref.AlwaysShowTabTitles"
-        static let cmdClickNewTab = "Safarium.Pref.CmdClickNewTab"
         static let activateNewTabs = "Safarium.Pref.ActivateNewTabs"
         static let cmdNumberSwitch = "Safarium.Pref.CmdNumberSwitch"
 
@@ -212,13 +201,11 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         static let privateSearchEngine = "Safarium.Pref.PrivateSearchEngine"
         static let searchSuggestions = "Safarium.Pref.SearchSuggestions"
         static let quickWebsiteSearch = "Safarium.Pref.QuickWebsiteSearch"
-        static let preloadTopHit = "Safarium.Pref.PreloadTopHit"
         static let showFavoritesInSearch = "Safarium.Pref.ShowFavoritesInSearch"
 
         static let autofillPasswords = "Safarium.Pref.AutoFillPasswords"
         static let autofillAddresses = "Safarium.Pref.AutoFillAddresses"
         static let autofillCards = "Safarium.Pref.AutoFillCards"
-        static let autofillOther = "Safarium.Pref.AutoFillOther"
 
         static let warnFraudulent = "Safarium.Pref.WarnFraudulent"
         static let enableJavaScript = "Safarium.Pref.EnableJavaScript"
@@ -242,10 +229,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         static let devAllowUnsigned = "Safarium.Pref.DevAllowUnsigned"
         static let devSeparateDevTools = "Safarium.Pref.DevSeparateDevTools"
         static let devDisableCache = "Safarium.Pref.DevDisableCache"
-
-        static let profilesEnabled = "Safarium.Pref.ProfilesEnabled"
-        static let profileNames = "Safarium.Pref.ProfileNames"
-        static let clearedShortcuts = "Safarium.Extensions.ClearedShortcuts"
     }
 
     // MARK: - Init
@@ -375,8 +358,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         if selectedPane == .extensions {
             rebuildExtensionsList()
             rebuildExtensionDetail()
-        } else if selectedPane == .websites && selectedWebsiteCategory == .extensionAccess {
-            selectPane(.websites, animated: false)
         }
     }
 
@@ -456,7 +437,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         case .security: view = buildSecurityPane()
         case .privacy: view = buildPrivacyPane()
         case .websites: view = buildWebsitesPane()
-        case .profiles: view = buildProfilesPane()
         case .extensions:
             view = buildExtensionsPane()
             rebuildExtensionsList()
@@ -477,7 +457,7 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
 
         // Auto-measure form stack height so controls & captions NEVER clip at the bottom edge.
         var targetHeight = pane.preferredContentHeight
-        if pane != .websites && pane != .extensions && pane != .profiles {
+        if pane != .websites && pane != .extensions {
             view.frame = NSRect(x: 0, y: 0, width: Self.windowWidth, height: max(targetHeight, 600))
             view.layoutSubtreeIfNeeded()
             if let stack = view.subviews.first(where: { $0 is NSStackView }) {
@@ -576,9 +556,11 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         hpField.font = NSFont.systemFont(ofSize: 13.0)
         hpField.target = self
         hpField.action = #selector(homepageFieldCommitted(_:))
+        #if compiler(>=6.4)
         if #available(macOS 26.0, *) {
             hpField.borderShape = .roundedRectangle
         }
+        #endif
         hpField.widthAnchor.constraint(equalToConstant: 296).isActive = true
         self.homepageField = hpField
         addFormRow(makeTwoColumnRow(label: "Homepage:", control: hpField), to: stack, spacingAfter: 8)
@@ -798,14 +780,6 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
 
         addFormRow(makeFormCheckboxRow(
             label: "Navigation:",
-            title: "⌘-click opens a link in a new tab",
-            caption: nil,
-            key: PrefKey.cmdClickNewTab,
-            defaultValue: true
-        ), to: stack, spacingAfter: 7)
-
-        addFormRow(makeFormCheckboxRow(
-            label: nil,
             title: "When a new tab or window opens, make it active",
             caption: nil,
             key: PrefKey.activateNewTabs,
@@ -844,99 +818,46 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         let pane = makeFormPaneBase(helpTopic: "AutoFill Settings")
         let stack = makeFormStack(in: pane, topInset: 24)
 
-        let items: [(label: String?, title: String, key: String, placeholder: String)] = [
-            ("AutoFill web forms:", "User names and passwords", PrefKey.autofillPasswords, "site.com — user@example.com"),
-            (nil, "Addresses and contact info", PrefKey.autofillAddresses, "Jane Doe, 1 Infinite Loop, Cupertino CA"),
-            (nil, "Credit cards", PrefKey.autofillCards, "Personal Visa •••• 4242 (08/29)"),
-            (nil, "Other forms", PrefKey.autofillOther, "Company Name / Tax ID")
-        ]
-
-        for (idx, item) in items.enumerated() {
-            let row = makeCheckboxWithTrailingGlassButtonRow(
-                label: item.label,
-                title: item.title,
-                key: item.key,
-                defaultValue: true,
-                buttonTitle: "Edit…",
-                buttonLeadingOffset: 248
-            ) { [weak self] in
-                guard let self else { return }
-                if item.key == PrefKey.autofillPasswords {
-                    self.presentPasswordsEditorSheet()
-                } else {
-                    self.presentAutoFillListSheet(title: item.title, categoryKey: item.key, placeholder: item.placeholder)
-                }
-            }
-            addFormRow(row, to: stack, spacingAfter: idx == items.count - 1 ? 0 : 12)
+        let passwordsRow = makeCheckboxWithTrailingGlassButtonRow(
+            label: "AutoFill web forms:",
+            title: "User names and passwords",
+            key: PrefKey.autofillPasswords,
+            defaultValue: true,
+            buttonTitle: "Passwords…",
+            buttonLeadingOffset: 248
+        ) { [weak self] in
+            self?.openPasswordsApp()
         }
+        addFormRow(passwordsRow, to: stack, spacingAfter: 12)
+
+        addFormRow(makeFormCheckboxRow(
+            label: nil,
+            title: "Addresses and contact info",
+            caption: nil,
+            key: PrefKey.autofillAddresses,
+            defaultValue: true
+        ), to: stack, spacingAfter: 12)
+
+        addFormRow(makeFormCheckboxRow(
+            label: nil,
+            title: "Credit cards",
+            caption: "Saved credentials are managed in macOS Passwords. Addresses and payment methods use Chromium AutoFill.",
+            key: PrefKey.autofillCards,
+            defaultValue: true
+        ), to: stack, spacingAfter: 0)
 
         return pane
     }
 
-    private func presentPasswordsEditorSheet() {
-        guard let win = window else { return }
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "User Names and Passwords"
-        alert.informativeText = "Open the Passwords app to inspect, edit, or export saved credentials, or manage local entries below."
-        alert.addButton(withTitle: "Open Passwords…")
-        alert.addButton(withTitle: "Edit Local Entries…")
-        alert.addButton(withTitle: "Cancel")
-        alert.beginSheetModal(for: win) { [weak self] resp in
-            guard let self else { return }
-            if resp == .alertFirstButtonReturn {
-                let passwordsApp = URL(fileURLWithPath: "/System/Applications/Passwords.app")
-                NSWorkspace.shared.open(passwordsApp)
-            } else if resp == .alertSecondButtonReturn {
-                self.presentAutoFillListSheet(
-                    title: "Saved Credentials",
-                    categoryKey: PrefKey.autofillPasswords,
-                    placeholder: "example.com — username"
-                )
-            }
-        }
-    }
-
-    private func presentAutoFillListSheet(title: String, categoryKey: String, placeholder: String) {
-        guard let win = window else { return }
-        let entries = BrowserSettings.shared.autoFillEntries(categoryKey: categoryKey)
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = "One entry per line. Changes are saved to your local Safarium profile."
-
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 380, height: 140))
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .bezelBorder
-        let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: 364, height: 140))
-        tv.font = NSFont.systemFont(ofSize: 12.5)
-        tv.string = entries.isEmpty ? "" : entries.joined(separator: "\n")
-        tv.isRichText = false
-        scroll.documentView = tv
-
-        let hint = NSTextField(labelWithString: "Example: \(placeholder)")
-        hint.font = NSFont.systemFont(ofSize: 11.0)
-        hint.textColor = .secondaryLabelColor
-        hint.frame = NSRect(x: 0, y: 0, width: 380, height: 16)
-
-        let acc = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 164))
-        scroll.frame = NSRect(x: 0, y: 22, width: 380, height: 142)
-        acc.addSubview(scroll)
-        acc.addSubview(hint)
-        alert.accessoryView = acc
-
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Clear All")
-        alert.addButton(withTitle: "Cancel")
-        alert.beginSheetModal(for: win) { resp in
-            if resp == .alertFirstButtonReturn {
-                let lines = tv.string
-                    .components(separatedBy: .newlines)
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-                BrowserSettings.shared.saveAutoFillEntries(lines, categoryKey: categoryKey)
-            } else if resp == .alertSecondButtonReturn {
-                BrowserSettings.shared.saveAutoFillEntries([], categoryKey: categoryKey)
-            }
+    private func openPasswordsApp() {
+        let passwordsApp = URL(fileURLWithPath: "/System/Applications/Passwords.app")
+        if FileManager.default.fileExists(atPath: passwordsApp.path) {
+            NSWorkspace.shared.open(passwordsApp)
+        } else {
+            presentInfoSheet(
+                title: "Passwords App Unavailable",
+                message: "Manage saved user names and passwords in System Settings → Passwords."
+            )
         }
     }
 
@@ -1302,90 +1223,63 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         sitesScroll.documentView = sitesDoc
         listCard.bodyView.addSubview(sitesScroll)
 
-        if selectedWebsiteCategory == .extensionAccess {
-            let hdr = makeSidebarSectionHeader("Installed Extensions", topPad: 8)
-            sitesStack.addArrangedSubview(hdr)
-            hdr.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
+        let openSites = openWebsitesProvider?() ?? []
+        let openHostSet = Set(openSites.map(\.host))
+        let configuredHosts = BrowserSettings.shared.configuredHosts(for: selectedWebsiteCategory.rawValue)
+            .filter { !openHostSet.contains($0) }
 
-            if extensions.isEmpty {
-                let empty = makeMutedRowLabel("No extensions installed.")
-                sitesStack.addArrangedSubview(empty)
-                empty.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
-            } else {
-                for ext in extensions {
-                    let meta = ExtensionManifestMetadata.parse(fromInstallPath: ext.installPath)
-                    let key = "Safarium.SitePolicy.ext.\(ext.id)"
-                    let row = makeWebsitePermissionRow(
-                        title: ext.name,
-                        icon: ext.icon,
-                        fallbackSymbol: "puzzlepiece.extension.fill",
-                        options: selectedWebsiteCategory.options,
-                        selectedIndex: prefInt(key, default: meta.hasBroadWebAccess ? 0 : 1),
-                        prefKey: key
-                    )
-                    sitesStack.addArrangedSubview(row)
-                    row.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
-                }
-            }
+        let hdr = makeSidebarSectionHeader("Currently Open Websites", topPad: 8)
+        sitesStack.addArrangedSubview(hdr)
+        hdr.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
+
+        if openSites.isEmpty {
+            let empty = makeMutedRowLabel("No websites are currently open.")
+            sitesStack.addArrangedSubview(empty)
+            empty.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
         } else {
-            let openSites = openWebsitesProvider?() ?? []
-            let openHostSet = Set(openSites.map(\.host))
-            let configuredHosts = BrowserSettings.shared.configuredHosts(for: selectedWebsiteCategory.rawValue)
-                .filter { !openHostSet.contains($0) }
-
-            let hdr = makeSidebarSectionHeader("Currently Open Websites", topPad: 8)
-            sitesStack.addArrangedSubview(hdr)
-            hdr.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
-
-            if openSites.isEmpty {
-                let empty = makeMutedRowLabel("No websites are currently open.")
-                sitesStack.addArrangedSubview(empty)
-                empty.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
-            } else {
-                for site in openSites {
-                    let key = "Safarium.SitePolicy.\(selectedWebsiteCategory.rawValue).\(site.host)"
-                    let idx = BrowserSettings.shared.websitePolicyIndex(
-                        category: selectedWebsiteCategory.rawValue,
-                        host: site.host,
-                        defaultIndex: selectedWebsiteCategory.defaultOptionIndex
-                    )
-                    let row = makeWebsitePermissionRow(
-                        title: site.host,
-                        icon: site.favicon,
-                        fallbackSymbol: "globe",
-                        options: selectedWebsiteCategory.options,
-                        selectedIndex: idx,
-                        prefKey: key,
-                        isSelected: selectedWebsiteHost == site.host
-                    )
-                    sitesStack.addArrangedSubview(row)
-                    row.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
-                }
+            for site in openSites {
+                let key = "Safarium.SitePolicy.\(selectedWebsiteCategory.rawValue).\(site.host)"
+                let idx = BrowserSettings.shared.websitePolicyIndex(
+                    category: selectedWebsiteCategory.rawValue,
+                    host: site.host,
+                    defaultIndex: selectedWebsiteCategory.defaultOptionIndex
+                )
+                let row = makeWebsitePermissionRow(
+                    title: site.host,
+                    icon: site.favicon,
+                    fallbackSymbol: "globe",
+                    options: selectedWebsiteCategory.options,
+                    selectedIndex: idx,
+                    prefKey: key,
+                    isSelected: selectedWebsiteHost == site.host
+                )
+                sitesStack.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
             }
+        }
 
-            if !configuredHosts.isEmpty {
-                let cfgHdr = makeSidebarSectionHeader("Configured Websites", topPad: 12)
-                sitesStack.addArrangedSubview(cfgHdr)
-                cfgHdr.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
-                for host in configuredHosts {
-                    let key = "Safarium.SitePolicy.\(selectedWebsiteCategory.rawValue).\(host)"
-                    let idx = BrowserSettings.shared.websitePolicyIndex(
-                        category: selectedWebsiteCategory.rawValue,
-                        host: host,
-                        defaultIndex: selectedWebsiteCategory.defaultOptionIndex
-                    )
-                    let row = makeWebsitePermissionRow(
-                        title: host,
-                        icon: FaviconCache.shared.cachedImage(forURLString: "https://\(host)/"),
-                        fallbackSymbol: "globe",
-                        options: selectedWebsiteCategory.options,
-                        selectedIndex: idx,
-                        prefKey: key,
-                        isSelected: selectedWebsiteHost == host
-                    )
-                    sitesStack.addArrangedSubview(row)
-                    row.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
-                }
+        if !configuredHosts.isEmpty {
+            let cfgHdr = makeSidebarSectionHeader("Configured Websites", topPad: 12)
+            sitesStack.addArrangedSubview(cfgHdr)
+            cfgHdr.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
+            for host in configuredHosts {
+                let key = "Safarium.SitePolicy.\(selectedWebsiteCategory.rawValue).\(host)"
+                let idx = BrowserSettings.shared.websitePolicyIndex(
+                    category: selectedWebsiteCategory.rawValue,
+                    host: host,
+                    defaultIndex: selectedWebsiteCategory.defaultOptionIndex
+                )
+                let row = makeWebsitePermissionRow(
+                    title: host,
+                    icon: FaviconCache.shared.cachedImage(forURLString: "https://\(host)/"),
+                    fallbackSymbol: "globe",
+                    options: selectedWebsiteCategory.options,
+                    selectedIndex: idx,
+                    prefKey: key,
+                    isSelected: selectedWebsiteHost == host
+                )
+                sitesStack.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: sitesStack.widthAnchor).isActive = true
             }
         }
 
@@ -1482,7 +1376,7 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         isSelected: Bool = false
     ) -> NSView {
         let row = SelectableSettingsRowView(isSelected: isSelected) { [weak self] in
-            guard let self, self.selectedWebsiteCategory != .extensionAccess else { return }
+            guard let self else { return }
             self.selectedWebsiteHost = title
             self.selectPane(.websites, animated: false)
         }
@@ -1543,171 +1437,7 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         selectPane(.websites, animated: false)
     }
 
-    // MARK: - 8. Profiles Pane (Exact Safari Centered Profiles Layout + Glass Pill)
-
-    private func buildProfilesPane() -> NSView {
-        let container = makeFormPaneBase(helpTopic: "Profiles Settings", showHelp: false)
-        let enabled = prefBool(PrefKey.profilesEnabled, default: false)
-
-        if !enabled {
-            let icons = NSStackView()
-            icons.orientation = .horizontal
-            icons.spacing = 24
-            icons.translatesAutoresizingMaskIntoConstraints = false
-
-            for sym in ["person.fill", "briefcase.fill", "graduationcap.fill"] {
-                let iv = NSImageView()
-                iv.translatesAutoresizingMaskIntoConstraints = false
-                let cfg = NSImage.SymbolConfiguration(pointSize: 32, weight: .regular)
-                iv.image = NSImage(systemSymbolName: sym, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
-                iv.contentTintColor = .tertiaryLabelColor
-                icons.addArrangedSubview(iv)
-            }
-            container.addSubview(icons)
-
-            let copy = NSTextField(wrappingLabelWithString:
-                "Profiles allow you to keep your personal browsing separate from your work or school browsing.\n\n" +
-                "Your history, cookies, and website data will be separated based on which profile you are using. You can also manage your extensions independently per profile.\n\n" +
-                "When you start using Profiles, a Personal profile will be automatically created for you based on your current settings. You can name your second profile, give it an icon, and set custom Favorites."
-            )
-            copy.translatesAutoresizingMaskIntoConstraints = false
-            copy.font = NSFont.systemFont(ofSize: 12.5)
-            copy.textColor = .secondaryLabelColor
-            container.addSubview(copy)
-
-            let startBtn = makeGlassButton(title: "Start Using Profiles", target: self, action: #selector(enableProfilesClicked))
-            container.addSubview(startBtn)
-
-            NSLayoutConstraint.activate([
-                icons.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-                icons.topAnchor.constraint(equalTo: container.topAnchor, constant: 28),
-
-                copy.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-                copy.topAnchor.constraint(equalTo: icons.bottomAnchor, constant: 22),
-                copy.widthAnchor.constraint(equalToConstant: 470),
-
-                startBtn.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-                startBtn.topAnchor.constraint(equalTo: copy.bottomAnchor, constant: 22)
-            ])
-        } else {
-            let names = UserDefaults.standard.stringArray(forKey: PrefKey.profileNames) ?? ["Personal", "Work"]
-            let activeName = BrowserSettings.shared.string(BrowserSettings.Key.activeProfileName, default: names.first ?? "Personal")
-            let card = ModernGlassPanelBox(cornerRadius: 14)
-            card.translatesAutoresizingMaskIntoConstraints = false
-            container.addSubview(card)
-
-            let stack = NSStackView()
-            stack.orientation = .vertical
-            stack.alignment = .leading
-            stack.spacing = 4
-            stack.translatesAutoresizingMaskIntoConstraints = false
-            card.bodyView.addSubview(stack)
-
-            for (idx, name) in names.enumerated() {
-                let isActive = (name == activeName)
-                let row = NSView()
-                row.translatesAutoresizingMaskIntoConstraints = false
-                let lbl = NSTextField(labelWithString: isActive ? "\(name)  •  Active" : name)
-                lbl.translatesAutoresizingMaskIntoConstraints = false
-                lbl.font = NSFont.systemFont(ofSize: 13.0, weight: isActive ? .semibold : .regular)
-                row.addSubview(lbl)
-
-                let actionBtn = TahoeActionGlassButton(title: isActive ? "Active" : "Switch") { [weak self] in
-                    guard let self, !isActive else { return }
-                    BrowserSettings.shared.set(name, forKey: BrowserSettings.Key.activeProfileName)
-                    self.selectPane(.profiles, animated: false)
-                }
-                actionBtn.isEnabled = !isActive
-                row.addSubview(actionBtn)
-
-                if idx > 0 {
-                    let delBtn = TahoeActionGlassButton(title: "Remove") { [weak self] in
-                        guard let self else { return }
-                        var updated = UserDefaults.standard.stringArray(forKey: PrefKey.profileNames) ?? ["Personal"]
-                        updated.removeAll { $0 == name }
-                        if updated.isEmpty { updated = ["Personal"] }
-                        UserDefaults.standard.set(updated, forKey: PrefKey.profileNames)
-                        if BrowserSettings.shared.string(BrowserSettings.Key.activeProfileName) == name {
-                            BrowserSettings.shared.set(updated.first ?? "Personal", forKey: BrowserSettings.Key.activeProfileName)
-                        }
-                        self.selectPane(.profiles, animated: false)
-                    }
-                    row.addSubview(delBtn)
-                    NSLayoutConstraint.activate([
-                        delBtn.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
-                        delBtn.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                        actionBtn.trailingAnchor.constraint(equalTo: delBtn.leadingAnchor, constant: -8),
-                        actionBtn.centerYAnchor.constraint(equalTo: row.centerYAnchor)
-                    ])
-                } else {
-                    NSLayoutConstraint.activate([
-                        actionBtn.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
-                        actionBtn.centerYAnchor.constraint(equalTo: row.centerYAnchor)
-                    ])
-                }
-
-                NSLayoutConstraint.activate([
-                    row.heightAnchor.constraint(equalToConstant: 36),
-                    lbl.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
-                    lbl.centerYAnchor.constraint(equalTo: row.centerYAnchor)
-                ])
-                stack.addArrangedSubview(row)
-                row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-            }
-
-            let addBtn = makeGlassButton(title: "New Profile…", target: self, action: #selector(promptNewProfile))
-            container.addSubview(addBtn)
-
-            NSLayoutConstraint.activate([
-                card.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-                card.topAnchor.constraint(equalTo: container.topAnchor, constant: 24),
-                card.widthAnchor.constraint(equalToConstant: 460),
-                card.bottomAnchor.constraint(equalTo: addBtn.topAnchor, constant: -16),
-
-                stack.leadingAnchor.constraint(equalTo: card.bodyView.leadingAnchor),
-                stack.trailingAnchor.constraint(equalTo: card.bodyView.trailingAnchor),
-                stack.topAnchor.constraint(equalTo: card.bodyView.topAnchor, constant: 10),
-                stack.bottomAnchor.constraint(lessThanOrEqualTo: card.bodyView.bottomAnchor, constant: -10),
-
-                addBtn.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-                addBtn.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -22)
-            ])
-        }
-
-        return container
-    }
-
-    @objc private func enableProfilesClicked() {
-        UserDefaults.standard.set(true, forKey: PrefKey.profilesEnabled)
-        if UserDefaults.standard.stringArray(forKey: PrefKey.profileNames) == nil {
-            UserDefaults.standard.set(["Personal", "Work"], forKey: PrefKey.profileNames)
-        }
-        selectPane(.profiles, animated: false)
-    }
-
-    @objc private func promptNewProfile() {
-        guard let win = window else { return }
-        let alert = NSAlert()
-        alert.messageText = "New Profile"
-        alert.informativeText = "Enter a name for the new Safarium profile."
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        input.placeholderString = "School, Dev, Research…"
-        alert.accessoryView = input
-        alert.addButton(withTitle: "Create")
-        alert.addButton(withTitle: "Cancel")
-        alert.beginSheetModal(for: win) { [weak self] resp in
-            guard let self, resp == .alertFirstButtonReturn else { return }
-            let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !name.isEmpty else { return }
-            var current = UserDefaults.standard.stringArray(forKey: PrefKey.profileNames) ?? ["Personal"]
-            guard !current.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) else { return }
-            current.append(name)
-            UserDefaults.standard.set(current, forKey: PrefKey.profileNames)
-            self.selectPane(.profiles, animated: false)
-        }
-    }
-
-    // MARK: - 9. Extensions Pane (Exact Safari Extensions Layout + Modern Glass Cards & Controls)
+    // MARK: - 8. Extensions Pane (Exact Safari Extensions Layout + Modern Glass Cards & Controls)
 
     private func buildExtensionsPane() -> NSView {
         let container = makeFormPaneBase(helpTopic: "Extensions Settings")
@@ -1998,22 +1728,12 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         )
         bodyStack.addArrangedSubview(warningCard)
         warningCard.widthAnchor.constraint(equalTo: bodyStack.widthAnchor).isActive = true
-        bodyStack.setCustomSpacing(12, after: warningCard)
 
-        let webHint = NSTextField(wrappingLabelWithString: "You can change this in the Websites section of Safarium Settings.")
-        webHint.font = NSFont.systemFont(ofSize: 12.5)
-        webHint.textColor = .labelColor
-        bodyStack.addArrangedSubview(webHint)
-        bodyStack.setCustomSpacing(8, after: webHint)
-
-        let editWebBtn = makeGlassButton(title: "Edit Websites…", target: self, action: #selector(openWebsitesSettings))
-        bodyStack.addArrangedSubview(editWebBtn)
-
-        // Shortcuts
+        // Shortcuts (read-only display of manifest-defined extension commands)
         if !meta.shortcuts.isEmpty {
-            bodyStack.setCustomSpacing(16, after: editWebBtn)
+            bodyStack.setCustomSpacing(16, after: warningCard)
 
-            let scHdr = NSTextField(labelWithString: "•  Shortcuts")
+            let scHdr = NSTextField(labelWithString: "Shortcuts")
             scHdr.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
             scHdr.textColor = .labelColor
             bodyStack.addArrangedSubview(scHdr)
@@ -2025,17 +1745,8 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
             bodyStack.addArrangedSubview(offersLbl)
             bodyStack.setCustomSpacing(6, after: offersLbl)
 
-            let clearedSet = Set(UserDefaults.standard.stringArray(forKey: PrefKey.clearedShortcuts) ?? [])
             for sc in meta.shortcuts {
-                let scKey = "\(ext.id)::\(sc.commandName)"
-                let displayedKey = clearedSet.contains(scKey) ? nil : sc.formattedShortcut
-                let row = ExtensionShortcutRowView(descriptionText: sc.descriptionText, shortcutText: displayedKey) { [weak self] in
-                    guard let self else { return }
-                    var list = Set(UserDefaults.standard.stringArray(forKey: PrefKey.clearedShortcuts) ?? [])
-                    list.insert(scKey)
-                    UserDefaults.standard.set(Array(list), forKey: PrefKey.clearedShortcuts)
-                    self.rebuildExtensionDetail()
-                }
+                let row = ExtensionShortcutRowView(descriptionText: sc.descriptionText, shortcutText: sc.formattedShortcut)
                 bodyStack.addArrangedSubview(row)
                 row.widthAnchor.constraint(equalTo: bodyStack.widthAnchor).isActive = true
             }
@@ -2081,7 +1792,7 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
             bodyStack.leadingAnchor.constraint(equalTo: bodyDoc.leadingAnchor, constant: 18),
             bodyStack.trailingAnchor.constraint(equalTo: bodyDoc.trailingAnchor, constant: -18),
             bodyStack.topAnchor.constraint(equalTo: bodyDoc.topAnchor, constant: 14),
-            bodyStack.bottomAnchor.constraint(equalTo: bodyDoc.bottomAnchor, constant: -16)
+            bodyStack.bottomAnchor.constraint(equalTo: bodyDoc.bottomAnchor, constant: -20)
         ])
     }
 
@@ -2150,13 +1861,7 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         }
     }
 
-    @objc private func openWebsitesSettings() {
-        selectedWebsiteCategory = .extensionAccess
-        selectedWebsiteHost = nil
-        selectPane(.websites, animated: true)
-    }
-
-    // MARK: - 10. Advanced Pane (Exact Safari Advanced Layout)
+    // MARK: - 9. Advanced Pane (Exact Safari Advanced Layout)
 
     private func buildAdvancedPane() -> NSView {
         let pane = makeFormPaneBase(helpTopic: "Advanced Settings")
@@ -2582,7 +2287,9 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         btn.font = NSFont.systemFont(ofSize: 13.0, weight: .regular)
         if #available(macOS 26.0, *) {
             btn.bezelStyle = .glass
+            #if compiler(>=6.4)
             btn.borderShape = .capsule
+            #endif
         } else {
             btn.bezelStyle = .rounded
         }
@@ -2597,9 +2304,11 @@ final class SafariSettingsWindowController: NSWindowController, NSToolbarDelegat
         let pop = TahoeBoundPopUpButton(options: options, selectedIndex: selectedIndex, onChange: onChange)
         pop.translatesAutoresizingMaskIntoConstraints = false
         pop.font = NSFont.systemFont(ofSize: 13.0)
+        #if compiler(>=6.4)
         if #available(macOS 26.0, *) {
             pop.borderShape = .capsule
         }
+        #endif
         return pop
     }
 
@@ -2714,7 +2423,9 @@ private final class TahoeActionGlassButton: NSButton {
         font = NSFont.systemFont(ofSize: 13.0)
         if #available(macOS 26.0, *) {
             bezelStyle = .glass
+            #if compiler(>=6.4)
             borderShape = .capsule
+            #endif
         } else {
             bezelStyle = .rounded
         }
@@ -3611,11 +3322,9 @@ private final class PermissionWarningCardView: NSView {
 }
 
 private final class ExtensionShortcutRowView: NSView {
-    private let onClear: () -> Void
     private let badgeBox = NSView()
 
-    init(descriptionText: String, shortcutText: String?, onClear: @escaping () -> Void) {
-        self.onClear = onClear
+    init(descriptionText: String, shortcutText: String) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
 
@@ -3624,6 +3333,7 @@ private final class ExtensionShortcutRowView: NSView {
         descLbl.font = NSFont.systemFont(ofSize: 12.5)
         descLbl.textColor = .labelColor
         descLbl.lineBreakMode = .byTruncatingTail
+        descLbl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         addSubview(descLbl)
 
         badgeBox.translatesAutoresizingMaskIntoConstraints = false
@@ -3633,23 +3343,11 @@ private final class ExtensionShortcutRowView: NSView {
         badgeBox.layer?.borderWidth = 0.5
         addSubview(badgeBox)
 
-        let keyLbl = NSTextField(labelWithString: shortcutText ?? "None")
+        let keyLbl = NSTextField(labelWithString: shortcutText)
         keyLbl.translatesAutoresizingMaskIntoConstraints = false
         keyLbl.font = NSFont.systemFont(ofSize: 12.0, weight: .medium)
-        keyLbl.textColor = shortcutText != nil ? .labelColor : .tertiaryLabelColor
+        keyLbl.textColor = .labelColor
         badgeBox.addSubview(keyLbl)
-
-        let clearBtn = NSButton()
-        clearBtn.translatesAutoresizingMaskIntoConstraints = false
-        clearBtn.isBordered = false
-        let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
-        clearBtn.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Clear Shortcut")?
-            .withSymbolConfiguration(cfg)
-        clearBtn.contentTintColor = .tertiaryLabelColor
-        clearBtn.isHidden = (shortcutText == nil)
-        clearBtn.target = self
-        clearBtn.action = #selector(handleClear)
-        addSubview(clearBtn)
 
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 26),
@@ -3657,14 +3355,9 @@ private final class ExtensionShortcutRowView: NSView {
             descLbl.centerYAnchor.constraint(equalTo: centerYAnchor),
             descLbl.trailingAnchor.constraint(lessThanOrEqualTo: badgeBox.leadingAnchor, constant: -12),
 
-            clearBtn.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -56),
-            clearBtn.centerYAnchor.constraint(equalTo: centerYAnchor),
-            clearBtn.widthAnchor.constraint(equalToConstant: 16),
-            clearBtn.heightAnchor.constraint(equalToConstant: 16),
-
-            badgeBox.trailingAnchor.constraint(equalTo: clearBtn.leadingAnchor, constant: -8),
+            badgeBox.trailingAnchor.constraint(equalTo: trailingAnchor),
             badgeBox.centerYAnchor.constraint(equalTo: centerYAnchor),
-            badgeBox.widthAnchor.constraint(greaterThanOrEqualToConstant: 62),
+            badgeBox.widthAnchor.constraint(greaterThanOrEqualToConstant: 56),
             badgeBox.heightAnchor.constraint(equalToConstant: 22),
 
             keyLbl.leadingAnchor.constraint(equalTo: badgeBox.leadingAnchor, constant: 8),
@@ -3690,8 +3383,6 @@ private final class ExtensionShortcutRowView: NSView {
             ? NSColor.white.withAlphaComponent(0.14)
             : NSColor.black.withAlphaComponent(0.10)).cgColor
     }
-
-    @objc private func handleClear() { onClear() }
 }
 
 // MARK: - Manifest.json Metadata Parser (Author, Permissions, Shortcuts)

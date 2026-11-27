@@ -156,33 +156,29 @@ final class TabHoverPreviewTests: HermeticTestCase {
         XCTAssertEqual(f.maxY, vis.maxY - 10, accuracy: 0.0001)
     }
 
-    func testVerticalPillPlacementUsesRailEdgePlusSix() {
+    func testVerticalPillPlacementUsesRailEdgePlusFour() {
         let vis = visibleFrame()
         moveWindow(to: NSPoint(x: vis.midX - 450, y: vis.midY - 300))
         let railX: CGFloat = 300
         let f = frame(placement: .belowVerticalPill(anchorView: anchor, railRightXInWindow: railX))
         let railOnScreen = hostWindow.convertToScreen(NSRect(x: railX, y: 0, width: 0, height: 0)).origin.x
-        XCTAssertEqual(f.minX, round(railOnScreen + 6), accuracy: 0.0001)
+        XCTAssertEqual(f.minX, round(railOnScreen + 4), accuracy: 0.0001)
     }
 
-    func testVerticalPillPlacementSitsBelowPillMidline() {
+    func testVerticalPillPlacementCentersVerticallyOnPillMidline() {
         let vis = visibleFrame()
         moveWindow(to: NSPoint(x: vis.midX - 450, y: vis.midY - 300))
         let f = frame(placement: .belowVerticalPill(anchorView: anchor, railRightXInWindow: 300))
         let a = screenRect(of: anchor)
-        let pillMinY = round(a.midY - 14)
-        XCTAssertEqual(f.maxY, pillMinY - 6, accuracy: 0.0001)
+        XCTAssertEqual(f.minY, round(a.midY - 224 * 0.5), accuracy: 0.0001)
     }
 
-    func testVerticalPillFlipsAboveWhenNoRoomBelow() {
+    func testVerticalPillClampsToBottomEdgeWhenNearBottom() {
         let vis = visibleFrame()
         anchor.frame = NSRect(x: 400, y: 0, width: 80, height: 30)
         moveWindow(to: NSPoint(x: vis.midX - 450, y: vis.minY + 5))
         let f = frame(placement: .belowVerticalPill(anchorView: anchor, railRightXInWindow: 300))
-        let a = screenRect(of: anchor)
-        // Not enough room below, so the card goes above the pill: midY + 14 + 6 = midY + 20.
-        let expectedY = min(max(round(a.midY + 20), vis.minY + 10), vis.maxY - 224 - 10)
-        XCTAssertEqual(f.minY, expectedY, accuracy: 0.0001)
+        XCTAssertEqual(f.minY, vis.minY + 10, accuracy: 0.0001)
     }
 
     func testPanelFrameKeepsRequestedCardSize() {

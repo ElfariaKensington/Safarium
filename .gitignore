@@ -9,8 +9,8 @@ BrowserCore/third_party/cef/
 BrowserCore/third_party/custom-chromium/
 .backup-*/
 Pasted *.heic
-safari-extracted/
-video-frames/
-spinner/
+/safari-extracted/
+/video-frames/
+/spinner/
 scripts/flicker/.wrec
 scripts/flicker/.toggle-overview

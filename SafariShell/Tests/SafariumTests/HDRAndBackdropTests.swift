@@ -87,8 +87,10 @@ final class HDRAndBackdropTests: HermeticTestCase {
     // MARK: ToolbarGlassView shape
 
     func testGlassCoversToolbarPlusSoftEdge() {
-        XCTAssertEqual(ToolbarGlassView.edgeHeight, 18)
-        XCTAssertEqual(ToolbarGlassView.totalHeight, SafariMetrics.toolbarHeight + 18)
+        XCTAssertEqual(ToolbarGlassView.edgeHeight, 10)
+        XCTAssertEqual(ToolbarGlassView.totalHeight, SafariMetrics.toolbarHeight + 10)
+        XCTAssertEqual(ToolbarGlassView.refractiveEdgeHeight, 26)
+        XCTAssertEqual(ToolbarGlassView.refractiveTotalHeight, SafariMetrics.toolbarHeight + 26)
     }
 
     func testQuinticFalloffEndpoints() {

@@ -61,6 +61,7 @@ target_link_libraries(SafariumBrowserCore PRIVATE
   "-framework ImageIO"
   "-framework IOSurface"
   "-framework QuartzCore"
+  "-framework UniformTypeIdentifiers"
 )
 
 set_target_properties(SafariumBrowserCore PROPERTIES

@@ -28,32 +28,33 @@ final class InspectPageTests: HermeticTestCase {
     // MARK: - URL Parsing & Normalization
 
     func testInspectURLParsingAllVariants() {
-        XCTAssertEqual(InspectPageURL.parse(URL(string: "chrome://inspect")), .devices)
-        XCTAssertEqual(InspectPageURL.parse(URL(string: "chrome://inspect/")), .devices)
-        XCTAssertEqual(InspectPageURL.parse(URL(string: "chrome://inspect/#devices")), .devices)
-        XCTAssertEqual(InspectPageURL.parse(URL(string: "chrome://inspect/#pages")), .pages)
-        XCTAssertEqual(InspectPageURL.parse(URL(string: "chrome://inspect/#extensions")), .extensions)
-        XCTAssertEqual(InspectPageURL.parse(URL(string: "chrome://inspect/#service-workers")), .serviceWorkers)
-        XCTAssertEqual(InspectPageURL.parse(URL(string: "chrome://inspect/#workers")), .workers)
-        XCTAssertEqual(InspectPageURL.parse(URL(string: "chrome://inspect/#other")), .other)
-        XCTAssertEqual(InspectPageURL.parse(URL(string: "chrome://inspect/#remote-debugging")), .remoteDebugging)
-        XCTAssertEqual(InspectPageURL.parse(URL(string: "chrome://inspect#remote-debugging")), .remoteDebugging)
-        XCTAssertEqual(InspectPageURL.parse(URL(string: "CHROME://INSPECT/#REMOTE-DEBUGGING")), .remoteDebugging)
+        XCTAssertEqual(InspectPageURL.parse(URL(string: "safarium://inspect")), .devices)
+        XCTAssertEqual(InspectPageURL.parse(URL(string: "safarium://inspect/")), .devices)
+        XCTAssertEqual(InspectPageURL.parse(URL(string: "safarium://inspect/#devices")), .devices)
+        XCTAssertEqual(InspectPageURL.parse(URL(string: "safarium://inspect/#pages")), .pages)
+        XCTAssertEqual(InspectPageURL.parse(URL(string: "safarium://inspect/#extensions")), .extensions)
+        XCTAssertEqual(InspectPageURL.parse(URL(string: "safarium://inspect/#service-workers")), .serviceWorkers)
+        XCTAssertEqual(InspectPageURL.parse(URL(string: "safarium://inspect/#workers")), .workers)
+        XCTAssertEqual(InspectPageURL.parse(URL(string: "safarium://inspect/#other")), .other)
+        XCTAssertEqual(InspectPageURL.parse(URL(string: "safarium://inspect/#remote-debugging")), .remoteDebugging)
+        XCTAssertEqual(InspectPageURL.parse(URL(string: "safarium://inspect#remote-debugging")), .remoteDebugging)
+        XCTAssertEqual(InspectPageURL.parse(URL(string: "SAFARIUM://INSPECT/#REMOTE-DEBUGGING")), .remoteDebugging)
 
+        XCTAssertNil(InspectPageURL.parse(URL(string: "chrome://inspect")))
         XCTAssertNil(InspectPageURL.parse(URL(string: "chrome://gpu")))
         XCTAssertNil(InspectPageURL.parse(URL(string: "https://inspect")))
         XCTAssertNil(InspectPageURL.parse(URL(string: "safarium://start")))
-        XCTAssertNil(InspectPageURL.parse(URL(string: "chrome://inspect/subpath")))
+        XCTAssertNil(InspectPageURL.parse(URL(string: "safarium://inspect/subpath")))
     }
 
     func testURLInputNormalizerAndDisplayDomainForInspectURLs() {
-        let u1 = URLInputNormalizer.normalize("chrome://inspect")
-        XCTAssertEqual(u1.absoluteString, "chrome://inspect")
-        XCTAssertEqual(URLInputNormalizer.displayDomain(for: u1), "chrome://inspect")
+        let u1 = URLInputNormalizer.normalize("safarium://inspect")
+        XCTAssertEqual(u1.absoluteString, "safarium://inspect")
+        XCTAssertEqual(URLInputNormalizer.displayDomain(for: u1), "safarium://inspect")
 
-        let u2 = URLInputNormalizer.normalize("chrome://inspect/#remote-debugging")
-        XCTAssertEqual(u2.absoluteString, "chrome://inspect/#remote-debugging")
-        XCTAssertEqual(URLInputNormalizer.displayDomain(for: u2), "chrome://inspect/#remote-debugging")
+        let u2 = URLInputNormalizer.normalize("safarium://inspect/#remote-debugging")
+        XCTAssertEqual(u2.absoluteString, "safarium://inspect/#remote-debugging")
+        XCTAssertEqual(URLInputNormalizer.displayDomain(for: u2), "safarium://inspect/#remote-debugging")
     }
 
     // MARK: - Settings Persistence & Validation
@@ -123,12 +124,12 @@ final class InspectPageTests: HermeticTestCase {
 
     func testMockBrowserTabRecognizesInspectAndRemoteDebugging() {
         let engine = MockBrowserEngine()
-        let tab = engine.createTab(initialURL: URL(string: "chrome://inspect/#remote-debugging"))
+        let tab = engine.createTab(initialURL: URL(string: "safarium://inspect/#remote-debugging"))
         XCTAssertTrue(tab.isInspectPage)
         XCTAssertTrue(tab.isNativeInternalPage)
         XCTAssertEqual(tab.inspectPageSection, .remoteDebugging)
 
-        tab.loadURL(URL(string: "chrome://inspect/#pages")!)
+        tab.loadURL(URL(string: "safarium://inspect/#pages")!)
         XCTAssertTrue(tab.isInspectPage)
         XCTAssertEqual(tab.inspectPageSection, .pages)
 

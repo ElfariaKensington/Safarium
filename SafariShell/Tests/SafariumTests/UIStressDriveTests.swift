@@ -5,7 +5,7 @@ import AppKit
 /// Human-style, headless (never ordered on screen) UI drive & stress tests against MockBrowserEngine.
 @MainActor
 final class UIStressDriveTests: HermeticTestCase {
-    nonisolated var scratch: String { "/private/tmp/claude-501/-Users-elfaria-SafariX/9c5f1d60-0c86-4a5d-9a2e-23146ae56677/scratchpad/shots" }
+    nonisolated var scratch: String { NSTemporaryDirectory() + "SafariumTestShots" }
 
     override func setUp() {
         super.setUp()
@@ -50,7 +50,10 @@ final class UIStressDriveTests: HermeticTestCase {
         print("PERF open300=\(mid - t0)s close299=\(t1 - mid)s")
         // Regression guard (PERF-1 reduced this from ~23 s): the tab strip now reuses its separator views instead of
         // allocating one NSView per slot per update; the rest of the time is MockBrowserTab building demo pages.
-        XCTAssertLessThan(t1 - t0, 16, "300 tab open/close should stay interactive")
+        // Virtualized CI runners run ~2x slower than bare-metal Apple Silicon, so allow 30s under CI=true while
+        // keeping the strict 16s budget locally.
+        let budgetSeconds: TimeInterval = ProcessInfo.processInfo.environment["CI"] != nil ? 30 : 16
+        XCTAssertLessThan(t1 - t0, budgetSeconds, "300 tab open/close should stay interactive")
         _ = weakTab
     }
 

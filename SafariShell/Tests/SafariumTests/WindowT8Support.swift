@@ -30,6 +30,11 @@ final class T8SpyTab: NSObject, BrowserTabEngine {
     private(set) var findQueries: [String] = []
     private(set) var closed = false
     private(set) var resetPageScaleCount = 0
+    private(set) var getPageSourceCallCount = 0
+    private(set) var savePageWithPanelCallCount = 0
+    private(set) var lastSavedFromWindow: NSWindow?
+    var pageSourceToReturn: String? = "<html><body>Spy</body></html>"
+    var savePageResult: (Bool, URL?) = (true, URL(fileURLWithPath: "/tmp/spy-saved.html"))
 
     var pageZoomFactor: Double { zoom }
     var isAudioMuted: Bool { muted }
@@ -52,6 +57,15 @@ final class T8SpyTab: NSObject, BrowserTabEngine {
     func executeJavaScriptInAllFrames(_ script: String) {}
     func printPage() {}
     func exportToPDF(atPath path: String, completion: @escaping (Bool) -> Void) { completion(false) }
+    func getPageSource(completion: @escaping (String?) -> Void) {
+        getPageSourceCallCount += 1
+        completion(pageSourceToReturn)
+    }
+    func savePageWithPanel(for window: NSWindow?, completion: ((Bool, URL?) -> Void)?) {
+        savePageWithPanelCallCount += 1
+        lastSavedFromWindow = window
+        completion?(savePageResult.0, savePageResult.1)
+    }
     func setAudioMuted(_ muted: Bool) { self.muted = muted }
     func closeTab() { closed = true }
     func endPageOvershoot() {}
@@ -144,16 +158,20 @@ class T8WindowTestCase: HermeticTestCase {
 
     override func setUp() {
         super.setUp()
-        _ = NSApplication.shared
-        for key in t8SessionKeys { UserDefaults.standard.removeObject(forKey: key) }
+        MainActor.assumeIsolated {
+            _ = NSApplication.shared
+            for key in t8SessionKeys { UserDefaults.standard.removeObject(forKey: key) }
+        }
     }
 
     override func tearDown() {
-        for wc in made {
-            wc.window?.close()
+        MainActor.assumeIsolated {
+            for wc in made {
+                wc.window?.close()
+            }
+            made.removeAll()
+            for key in t8SessionKeys { UserDefaults.standard.removeObject(forKey: key) }
         }
-        made.removeAll()
-        for key in t8SessionKeys { UserDefaults.standard.removeObject(forKey: key) }
         super.tearDown()
     }
 

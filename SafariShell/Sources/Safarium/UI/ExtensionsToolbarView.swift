@@ -238,6 +238,9 @@ final class ExtensionsToolbarCoordinator {
         for zone in ExtensionToolbarZone.mergedGroupZones {
             guard let grp = mergedGroups[zone] else { continue }
             let tokens = resolved.mergedTokens[zone.rawValue] ?? []
+            if grp.updateMergedExtensionsInPlace(itemsByID: allExtensionsByID, tokenOrder: tokens) {
+                continue
+            }
             var extButtons: [ExtensionToolbarIconButton] = []
             for token in tokens where token.hasPrefix("ext:") {
                 let id = String(token.dropFirst("ext:".count))
@@ -940,17 +943,17 @@ final class ExtensionsToolbarCapsuleView: NSView {
     }
 
     private func wireButtonCallbacks(_ btn: ExtensionToolbarIconButton) {
-        let item = btn.item
+        let extID = btn.item.id
         btn.onLeftClick = { [weak self, weak btn] in
             guard let self, let btn else { return }
-            self.onClickExtension?(item, btn)
+            self.onClickExtension?(btn.item, btn)
         }
         btn.onManage = { [weak self, weak btn] in
             guard let self, let btn else { return }
-            self.onManageExtension?(item, btn)
+            self.onManageExtension?(btn.item, btn)
         }
         btn.onRemove = { [weak self] in
-            self?.onRemoveExtension?(item.id)
+            self?.onRemoveExtension?(extID)
         }
         btn.onOpenStore = { [weak self] in
             self?.onOpenChromeWebStore?()
@@ -959,10 +962,10 @@ final class ExtensionsToolbarCapsuleView: NSView {
             self?.onCustomizeToolbar?()
         }
         btn.contextMenuProvider = { [weak self] in
-            self?.contextMenuProvider?(item.id) ?? []
+            self?.contextMenuProvider?(extID) ?? []
         }
         btn.onTriggerContextMenuItem = { [weak self] menuItemID in
-            self?.onTriggerContextMenuItem?(item.id, menuItemID)
+            self?.onTriggerContextMenuItem?(extID, menuItemID)
         }
     }
 
@@ -973,6 +976,17 @@ final class ExtensionsToolbarCapsuleView: NSView {
     }
 
     func update(extensions newExtensions: [BrowserExtensionItem]) {
+        if placeholderIndex == nil,
+           iconButtons.count == newExtensions.count,
+           zip(iconButtons, newExtensions).allSatisfy({ $0.0.item.id == $0.1.id }) {
+            self.extensions = newExtensions
+            for (btn, item) in zip(iconButtons, newExtensions) {
+                btn.update(item: item)
+            }
+            syncHiddenState()
+            return
+        }
+
         placeholderIndex = nil
         self.extensions = newExtensions
 
@@ -1288,7 +1302,7 @@ private final class FlippedExtensionsHostView: NSView {
 }
 
 final class ExtensionToolbarIconButton: NSView {
-    let item: BrowserExtensionItem
+    private(set) var item: BrowserExtensionItem
     var onLeftClick: (() -> Void)?
     var onManage: (() -> Void)?
     var onRemove: (() -> Void)?
@@ -1393,6 +1407,43 @@ final class ExtensionToolbarIconButton: NSView {
             badgeContainer.isHidden = false
         } else {
             badgeContainer.isHidden = true
+        }
+    }
+
+    /// Updates icon, badge, and accessibility metadata in place without tearing down the view or triggering animations.
+    func update(item newItem: BrowserExtensionItem) {
+        let prev = self.item
+        self.item = newItem
+
+        if newItem.name != prev.name {
+            toolTip = "\(newItem.name) (Drag to move)"
+            setAccessibilityLabel(newItem.name)
+        }
+
+        if newItem.icon !== prev.icon {
+            if let icon = newItem.icon {
+                iconImageView.image = icon
+                iconImageView.contentTintColor = nil
+            } else {
+                iconImageView.image = AssetLoader.shared.symbol(named: "puzzlepiece.extension.fill", pointSize: 15.0, weight: .regular)
+                iconImageView.contentTintColor = isDarkMode ? .white : NSColor(white: 0.16, alpha: 1.0)
+            }
+        }
+
+        let newText = (newItem.badgeText?.isEmpty == false) ? newItem.badgeText : nil
+        let oldText = (prev.badgeText?.isEmpty == false) ? prev.badgeText : nil
+        if newText != oldText {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            if let text = newText {
+                badgeLabel.stringValue = text
+                badgeContainer.layer?.backgroundColor = (newItem.badgeColor ?? NSColor(srgbRed: 0.933, green: 0.243, blue: 0.220, alpha: 1.0)).cgColor
+                badgeContainer.isHidden = false
+            } else {
+                badgeLabel.stringValue = ""
+                badgeContainer.isHidden = true
+            }
+            CATransaction.commit()
         }
     }
 
@@ -1856,6 +1907,10 @@ final class ExtensionPopoverController: NSObject, NSPopoverDelegate {
     private var localDismissMonitor: Any?
     private var globalDismissMonitor: Any?
     private var appResignObserver: NSObjectProtocol?
+    private var panelResignKeyObserver: NSObjectProtocol?
+    private var parentResignMainObserver: NSObjectProtocol?
+    private var parentMiniaturizeObserver: NSObjectProtocol?
+    private var parentWillCloseObserver: NSObjectProtocol?
 
     deinit {
         removeDismissMonitors()
@@ -1879,6 +1934,22 @@ final class ExtensionPopoverController: NSObject, NSPopoverDelegate {
         if let appResignObserver {
             NotificationCenter.default.removeObserver(appResignObserver)
             self.appResignObserver = nil
+        }
+        if let panelResignKeyObserver {
+            NotificationCenter.default.removeObserver(panelResignKeyObserver)
+            self.panelResignKeyObserver = nil
+        }
+        if let parentResignMainObserver {
+            NotificationCenter.default.removeObserver(parentResignMainObserver)
+            self.parentResignMainObserver = nil
+        }
+        if let parentMiniaturizeObserver {
+            NotificationCenter.default.removeObserver(parentMiniaturizeObserver)
+            self.parentMiniaturizeObserver = nil
+        }
+        if let parentWillCloseObserver {
+            NotificationCenter.default.removeObserver(parentWillCloseObserver)
+            self.parentWillCloseObserver = nil
         }
     }
 
@@ -1906,6 +1977,20 @@ final class ExtensionPopoverController: NSObject, NSPopoverDelegate {
                     self.closeActivePopover(animated: true)
                     return nil
                 }
+                let mods = event.modifierFlags.intersection([.command, .shift, .option, .control])
+                if mods.contains(.command) {
+                    let ch = (event.charactersIgnoringModifiers ?? "").lowercased()
+                    let isTabNumber = (mods == .command) && ((Int(ch).map { (1...9).contains($0) } ?? false) || [18, 19, 20, 21, 23, 22, 26, 28, 25].contains(event.keyCode))
+                    let isWindowOpeningShortcut = (mods == .command && (ch == "," || ch == "n" || ch == "q" || ch == "h"))
+                        || (mods == [.command, .shift] && ch == "n")
+                    let isBrowserCommand = isTabNumber || isWindowOpeningShortcut
+                        || (mods == .command && ["l", "t", "w", "s", "o", "f", "r"].contains(ch))
+                        || (mods == [.command, .shift] && ["t", "w", "[" , "]"].contains(ch))
+                        || (mods == [.command, .option] && (event.keyCode == 123 || event.keyCode == 124 || ch == "f"))
+                    if isBrowserCommand {
+                        self.closeActivePopover(animated: false, restoreParentKey: !isWindowOpeningShortcut)
+                    }
+                }
                 return event
             }
             if event.window === panel {
@@ -1923,12 +2008,12 @@ final class ExtensionPopoverController: NSObject, NSPopoverDelegate {
                     return event
                 }
             }
-            self.closeActivePopover(animated: true)
+            self.closeActivePopover(animated: true, restoreParentKey: false)
             return event
         }
         globalDismissMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             DispatchQueue.main.async {
-                self?.closeActivePopover(animated: true)
+                self?.closeActivePopover(animated: true, restoreParentKey: false)
             }
         }
         appResignObserver = NotificationCenter.default.addObserver(
@@ -1936,7 +2021,47 @@ final class ExtensionPopoverController: NSObject, NSPopoverDelegate {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.closeActivePopover(animated: false)
+            self?.closeActivePopover(animated: false, restoreParentKey: false)
+        }
+        if let panel = activePanel {
+            panelResignKeyObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResignKeyNotification,
+                object: panel,
+                queue: .main
+            ) { [weak self, weak panel] _ in
+                DispatchQueue.main.async { [weak self, weak panel] in
+                    guard let self,
+                          let panel,
+                          self.activePanel === panel,
+                          !self.isPreloadingBeforeBloom,
+                          !self.isOpeningBloomActive,
+                          !panel.isKeyWindow else { return }
+                    self.closeActivePopover(animated: false, restoreParentKey: false)
+                }
+            }
+        }
+        if let parentWin = activeParentWindow {
+            parentResignMainObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResignMainNotification,
+                object: parentWin,
+                queue: .main
+            ) { [weak self] _ in
+                self?.closeActivePopover(animated: false, restoreParentKey: false)
+            }
+            parentMiniaturizeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didMiniaturizeNotification,
+                object: parentWin,
+                queue: .main
+            ) { [weak self] _ in
+                self?.closeActivePopover(animated: false, restoreParentKey: false)
+            }
+            parentWillCloseObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: parentWin,
+                queue: .main
+            ) { [weak self] _ in
+                self?.closeActivePopover(animated: false, restoreParentKey: false)
+            }
         }
     }
 
@@ -1997,7 +2122,7 @@ final class ExtensionPopoverController: NSObject, NSPopoverDelegate {
         }
     }
 
-    private func closeActivePopover(animated: Bool) {
+    private func closeActivePopover(animated: Bool, restoreParentKey: Bool = true) {
         flushPendingAnimatedCloseIfNeeded()
         cancelPendingBloomTimers()
         removeDismissMonitors()
@@ -2045,7 +2170,12 @@ final class ExtensionPopoverController: NSObject, NSPopoverDelegate {
                 oldParentWin?.removeChildWindow(oldPanel)
                 oldPanel.orderOut(nil)
             }
-            if let oldParentWin, oldParentWin.isVisible, self?.activePanel == nil {
+            if restoreParentKey,
+               let oldParentWin,
+               oldParentWin.isVisible,
+               self?.activePanel == nil,
+               NSApp.isActive,
+               (NSApp.keyWindow == nil || NSApp.keyWindow === oldPanel || NSApp.keyWindow === oldParentWin) {
                 oldParentWin.makeKey()
             }
         }
@@ -2165,8 +2295,12 @@ final class ExtensionPopoverController: NSObject, NSPopoverDelegate {
         closeActivePopover(animated: false)
     }
 
-    func close() {
-        closeActivePopover(animated: false)
+    var isShown: Bool {
+        activePanel != nil || activePopover?.isShown == true
+    }
+
+    func close(restoreParentKey: Bool = true) {
+        closeActivePopover(animated: false, restoreParentKey: restoreParentKey)
     }
 
     private func applyPanelResize(_ target: NSSize) {

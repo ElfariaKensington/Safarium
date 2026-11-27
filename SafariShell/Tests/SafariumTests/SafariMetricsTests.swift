@@ -24,8 +24,9 @@ final class SafariMetricsTests: HermeticTestCase {
         XCTAssertGreaterThan(SafariMetrics.defaultWindowHeight, SafariMetrics.minWindowHeight)
     }
 
-    func testBleedMatchesToolbarHeight() {
-        XCTAssertEqual(SafariMetrics.backgroundExtensionBleedHeight, SafariMetrics.toolbarHeight)
+    func testBleedExceedsOrMatchesToolbarHeight() {
+        XCTAssertEqual(SafariMetrics.backgroundExtensionBleedHeight, 52)
+        XCTAssertGreaterThanOrEqual(SafariMetrics.backgroundExtensionBleedHeight, SafariMetrics.toolbarHeight)
     }
 
     // MARK: - Glass capsules and groups

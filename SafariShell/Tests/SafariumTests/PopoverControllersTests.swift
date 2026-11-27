@@ -274,8 +274,7 @@ final class PopoverControllersTests: HermeticTestCase {
         let vc = makeWebsiteContent()
         let blockers = try XCTUnwrap(checkbox(in: vc.view, titled: "Enable content blockers"))
         XCTAssertEqual(blockers.state, .on, "content blockers default on")
-        let reader = try XCTUnwrap(checkbox(in: vc.view, titled: "Use Reader when available"))
-        XCTAssertEqual(reader.state, .off)
+        XCTAssertNil(checkbox(in: vc.view, titled: "Use Reader when available"))
         let zoom = try XCTUnwrap(popup(in: vc.view, firstItem: "50%"))
         XCTAssertEqual(zoom.indexOfSelectedItem, 3, "page zoom defaults to 100%")
         let autoPlay = try XCTUnwrap(popup(in: vc.view, firstItem: "Allow All Auto-Play"))
@@ -362,15 +361,10 @@ final class PopoverControllersTests: HermeticTestCase {
         XCTAssertEqual(BrowserSettings.shared.websitePolicyIndex(category: "Adaptive Dark Mode", host: "example.com", defaultIndex: 0), 0)
     }
 
-    func testReaderAndContentBlockerCheckboxesNotifyTheirOwnCallbacks() throws {
+    func testContentBlockerCheckboxNotifiesCallback() throws {
         let vc = makeWebsiteContent()
-        let reader = Counter(), blockers = Counter()
-        vc.onReaderModeChanged = { reader.flag = $0 }
+        let blockers = Counter()
         vc.onContentBlockersChanged = { blockers.flag = $0 }
-
-        try XCTUnwrap(checkbox(in: vc.view, titled: "Use Reader when available")).performClick(nil)
-        XCTAssertEqual(reader.flag, true)
-        XCTAssertNil(blockers.flag)
 
         try XCTUnwrap(checkbox(in: vc.view, titled: "Enable content blockers")).performClick(nil)
         XCTAssertEqual(blockers.flag, false, "content blockers start on, so one click turns them off")

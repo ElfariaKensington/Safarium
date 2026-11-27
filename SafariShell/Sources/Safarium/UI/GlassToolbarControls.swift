@@ -100,9 +100,11 @@ final class GlassActionCapsule: NSView {
             let gv = NSGlassEffectView()
             gv.style = .regular
             gv.cornerRadius = SafariMetrics.glassButtonCornerRadius
+            #if compiler(>=6.4)
             if #available(macOS 27.0, *) {
                 gv.effectIsInteractive = true
             }
+            #endif
             self.glassView = gv
         } else {
             let vev = NSVisualEffectView()
@@ -125,7 +127,7 @@ final class GlassActionCapsule: NSView {
     private func setupHierarchy(initialWidth: CGFloat) {
         translatesAutoresizingMaskIntoConstraints = false
         setContentHuggingPriority(.required, for: .horizontal)
-        setContentCompressionResistancePriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let wc = widthAnchor.constraint(equalToConstant: initialWidth)
         // Below `required` so a collapsed (width 0) parent cluster wins quietly instead of AppKit logging an unsatisfiable-constraint break.
@@ -148,7 +150,7 @@ final class GlassActionCapsule: NSView {
         stackView.orientation = .horizontal
         stackView.alignment = .centerY
         stackView.spacing = 0
-        stackView.edgeInsets = NSEdgeInsets(top: 0, left: horizontalPadding, bottom: 0, right: horizontalPadding)
+        syncStackEdgeInsets()
         if fullSlotHover {
             stackView.wantsLayer = true
             stackView.layer?.masksToBounds = true
@@ -246,7 +248,9 @@ final class GlassActionCapsule: NSView {
         guard let spec = specs.first(where: { $0.id == id }),
               let btn = buttons[id] else { return }
 
-        let targetWidth = max(SafariMetrics.glassButtonSize, currentRequiredWidth)
+        let reqW = currentRequiredWidth
+        let targetWidth = reqW > 0.5 ? max(SafariMetrics.glassButtonSize, reqW) : 0.0
+        syncStackEdgeInsets()
 
         let apply = {
             btn.isHidden = hidden
@@ -254,7 +258,7 @@ final class GlassActionCapsule: NSView {
             self.totalWidthConstraint?.constant = targetWidth
         }
 
-        if animated {
+        if animated && window?.isVisible == true && bounds.width > 1.0 {
             layoutSubtreeIfNeeded()
             btn.wantsLayer = true
             if !hidden {
@@ -311,8 +315,15 @@ final class GlassActionCapsule: NSView {
 
     // MARK: - Merged Extension Icon Slots (Free Drag & Drop into Liquid Glass Button Groups)
 
+    private func syncStackEdgeInsets() {
+        let pad = (currentRequiredWidth > 0.5) ? horizontalPadding : 0.0
+        stackView.edgeInsets = NSEdgeInsets(top: 0, left: pad, bottom: 0, right: pad)
+    }
+
     private func recalculateTotalWidth(animated: Bool) {
-        let targetWidth = max(SafariMetrics.glassButtonSize, currentRequiredWidth)
+        let reqW = currentRequiredWidth
+        let targetWidth = reqW > 0.5 ? max(SafariMetrics.glassButtonSize, reqW) : 0.0
+        syncStackEdgeInsets()
         if animated {
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.18
@@ -384,6 +395,26 @@ final class GlassActionCapsule: NSView {
             }
         }
         return nil
+    }
+
+    /// Updates already-merged extension buttons in place when the ordered extension IDs match, avoiding view churn.
+    func updateMergedExtensionsInPlace(itemsByID: [String: BrowserExtensionItem], tokenOrder: [String]) -> Bool {
+        let expectedIDs = tokenOrder.compactMap { token -> String? in
+            guard token.hasPrefix("ext:") else { return nil }
+            let id = String(token.dropFirst("ext:".count))
+            return itemsByID[id] != nil ? id : nil
+        }
+        let currentOrderedIDs = stackView.arrangedSubviews.compactMap { ($0 as? ExtensionToolbarIconButton)?.item.id }
+        guard expectedIDs == currentOrderedIDs,
+              expectedIDs.count == mergedButtons.count else {
+            return false
+        }
+        for id in expectedIDs {
+            if let item = itemsByID[id], let btn = mergedButtons[id] {
+                btn.update(item: item)
+            }
+        }
+        return true
     }
 
     func setMergedExtensions(_ buttonsInGroup: [ExtensionToolbarIconButton], tokenOrder: [String]) {
@@ -876,7 +907,7 @@ final class GlassToolbarClusterView: NSView {
 
         translatesAutoresizingMaskIntoConstraints = false
         setContentHuggingPriority(.required, for: .horizontal)
-        setContentCompressionResistancePriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         containerView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(containerView)
@@ -891,7 +922,7 @@ final class GlassToolbarClusterView: NSView {
         stackView.alignment = .centerY
         stackView.spacing = spacing
         stackView.setContentHuggingPriority(.required, for: .horizontal)
-        stackView.setContentCompressionResistancePriority(.required, for: .horizontal)
+        stackView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         if #available(macOS 26.0, *), let gcv = containerView as? NSGlassEffectContainerView {
             stackView.translatesAutoresizingMaskIntoConstraints = true

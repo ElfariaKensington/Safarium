@@ -106,6 +106,7 @@ class SXBrowserClient;
                                   nextID:(NSInteger)nextID
                            validEntryIDs:(NSArray<NSNumber *> *)validIDs;
 - (void)handleNavigationVisuallyReadyFromBFCache:(BOOL)fromBFCache;
+- (void)handleScriptTraverseNavigation;
 - (void)handleNativeVideoID:(NSString *)videoID
                      srcURL:(NSString *)srcURL
                        rect:(NSRect)rect
@@ -168,6 +169,9 @@ class SXBrowserClient;
                    forDownloadID:(uint32_t)downloadID;
 - (void)unregisterDownloadCallbackForDownloadID:(uint32_t)downloadID;
 - (void)tabDidClose:(SXBrowserTab *)tab;
+- (void)noteBrowserCreated;
+- (void)noteBrowserClosed;
+- (NSInteger)liveBrowserCount;
 - (NSArray<NSString *> *)startupExtensionDirectories;
 - (void)notifyExtensionsUpdated;
 - (void)postNewTabRequestForURL:(NSURL *)url;

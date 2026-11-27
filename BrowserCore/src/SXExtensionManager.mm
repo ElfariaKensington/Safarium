@@ -871,6 +871,7 @@ class SXExtensionPopupClient : public CefClient,
 
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     CEF_REQUIRE_UI_THREAD();
+    [[SXEngineRuntime sharedRuntime] noteBrowserCreated];
     browser_ = browser;
     NSView *strongHost = host_view_;
     if (strongHost && browser && browser->GetHost()) {
@@ -936,12 +937,14 @@ class SXExtensionPopupClient : public CefClient,
 
   bool DoClose(CefRefPtr<CefBrowser> browser) override {
     CEF_REQUIRE_UI_THREAD();
+    bool stillAttachedToWindow = false;
     if (browser && browser->GetHost()) {
       NSView *cefView =
           CAST_CEF_WINDOW_HANDLE_TO_NSVIEW(browser->GetHost()->GetWindowHandle());
       if (cefView && cefView.superview) {
         [cefView removeFromSuperview];
       }
+      stillAttachedToWindow = (cefView && cefView.window != nil);
     }
     if (is_popout_) {
       NSView *strongHost = host_view_;
@@ -952,11 +955,14 @@ class SXExtensionPopupClient : public CefClient,
         }
       });
     }
-    return true;
+    // Returning false once detached lets CEF destroy the browser and invoke OnBeforeClose
+    // cleanly without touching any host NSWindow.
+    return stillAttachedToWindow;
   }
 
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
     CEF_REQUIRE_UI_THREAD();
+    [[SXEngineRuntime sharedRuntime] noteBrowserClosed];
     browser_ = nullptr;
     host_view_ = nil;
   }
@@ -1200,6 +1206,7 @@ class SXLiveExtensionLoader : public CefClient,
 
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     CEF_REQUIRE_UI_THREAD();
+    [[SXEngineRuntime sharedRuntime] noteBrowserCreated];
     if (!browser) return;
     int bid = browser->GetIdentifier();
     open_browsers_.push_back(browser);
@@ -1306,6 +1313,7 @@ class SXLiveExtensionLoader : public CefClient,
 
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
     CEF_REQUIRE_UI_THREAD();
+    [[SXEngineRuntime sharedRuntime] noteBrowserClosed];
     if (!browser) return;
     int bid = browser->GetIdentifier();
     open_browsers_.erase(
@@ -4206,10 +4214,13 @@ static BOOL SXURLMatchesContentScriptEntry(NSString *urlString, NSDictionary *en
   _liveBrowsers.clear();
   if (_liveLoader) {
     _liveLoader->Shutdown();
-    for (int i = 0; i < 40 && _liveLoader->HasOpenBrowsers(); ++i) {
+    for (int i = 0; i < 80 && _liveLoader->HasOpenBrowsers(); ++i) {
       CefDoMessageLoopWork();
       [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
                                beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    }
+    if (!_liveLoader->HasOpenBrowsers()) {
+      _liveLoader = nullptr;
     }
   }
 }

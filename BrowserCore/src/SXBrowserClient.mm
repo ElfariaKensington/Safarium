@@ -723,6 +723,17 @@ bool SXBrowserClient::OnProcessMessageReceived(
     return true;
   }
 
+  if (name == "sx.nav_traverse") {
+    if ([NSThread isMainThread]) {
+      [strongTab handleScriptTraverseNavigation];
+    } else {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [strongTab handleScriptTraverseNavigation];
+      });
+    }
+    return true;
+  }
+
   if (name == "sx.native_video") {
     CefRefPtr<CefListValue> args = message->GetArgumentList();
     if (!args || args->GetSize() < 8) {
@@ -1226,6 +1237,7 @@ bool SXBrowserClient::OnBeforePopup(CefRefPtr<CefBrowser> browser,
 
 void SXBrowserClient::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
   CEF_REQUIRE_UI_THREAD();
+  [[SXEngineRuntime sharedRuntime] noteBrowserCreated];
   browser_ = browser;
   if (browser && browser->GetHost()) {
     CefRefPtr<CefRequestContext> ctx = browser->GetHost()->GetRequestContext();
@@ -1251,31 +1263,41 @@ bool SXBrowserClient::DoClose(CefRefPtr<CefBrowser> browser) {
   if (strongTab) {
     [strongTab handleBrowserClosing];
   }
-  // Detach CEF's child NSView from its parent NSWindow hierarchy and return TRUE
-  // so CEF NEVER sends -[NSWindow performClose:] to Safarium's host NSWindow when
-  // closing an individual tab in a multi-tab window!
+  // Detach CEF's child NSView from its parent NSWindow hierarchy so CEF NEVER sends
+  // -[NSWindow performClose:] to Safarium's host NSWindow when closing a single tab.
+  // Once detached (cefView.window == nil), return false so CEF destroys the browser
+  // immediately and fires OnBeforeClose instead of leaking a half-closed browser until shutdown.
+  bool stillAttachedToWindow = false;
   if (browser && browser->GetHost()) {
     NSView* cefView =
         CAST_CEF_WINDOW_HANDLE_TO_NSVIEW(browser->GetHost()->GetWindowHandle());
     if (cefView && cefView.superview) {
       [cefView removeFromSuperview];
     }
+    stillAttachedToWindow = (cefView && cefView.window != nil);
   }
-  return true;
+  return stillAttachedToWindow;
 }
 
 void SXBrowserClient::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
   CEF_REQUIRE_UI_THREAD();
+  [[SXEngineRuntime sharedRuntime] noteBrowserClosed];
   [[SXExtensionManager sharedManager] unregisterActiveBrowser:browser];
   devtools_registration_ = nullptr;
   browser_ = nullptr;
+  pending_save_dialog_downloads_.clear();
+  started_download_ids_.clear();
 
   SXBrowserTab* strongTab = RetainTab();
   DetachTab();
   if (strongTab) {
-    dispatch_async(dispatch_get_main_queue(), ^{
+    if ([NSThread isMainThread]) {
       [strongTab handleBrowserClosed];
-    });
+    } else {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [strongTab handleBrowserClosed];
+      });
+    }
   }
 }
 
@@ -1948,10 +1970,10 @@ bool SXBrowserClient::OnContextMenuCommand(
       if (activeFrame) activeFrame->ViewSource();
       return true;
     case kSXMenuSavePageAs: {
-      std::string pageUrl = params->GetPageUrl().ToString();
-      if (!pageUrl.empty() && browser->GetHost()) {
-        force_save_dialog_url_ = pageUrl;
-        browser->GetHost()->StartDownload(CefString(pageUrl));
+      if (strongTab) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [strongTab savePageWithPanelForWindow:strongTab.contentView.window completion:nil];
+        });
       }
       return true;
     }
@@ -2224,7 +2246,18 @@ bool SXBrowserClient::OnBeforeDownload(
 
   NSString* suggested = NSStringFromCefString(suggested_name);
   NSString* destPath = UniqueDownloadPath(suggested);
-  callback->Continue(CefString(destPath.UTF8String), showSaveDialog);
+  uint32_t downloadID = download_item->GetId();
+  if (showSaveDialog) {
+    // Wait until the user actually confirms the Save dialog (indicated by a non-empty full path
+    // in OnDownloadUpdated) before notifying didStartDownload. If the user cancels or hasn't
+    // clicked Save yet, didStartDownload must NEVER fire.
+    pending_save_dialog_downloads_[downloadID] = suggested_name.ToString();
+    callback->Continue(CefString(destPath.UTF8String), true);
+    return true;
+  }
+
+  started_download_ids_.insert(downloadID);
+  callback->Continue(CefString(destPath.UTF8String), false);
 
   SXDownloadItem* item = BuildDownloadItem(download_item, suggested_name, destPath);
   SXBrowserTab* strongTab = RetainTab();
@@ -2247,10 +2280,56 @@ void SXBrowserClient::OnDownloadUpdated(
   uint32_t downloadID = download_item->GetId();
   BOOL keepCallback = (download_item->IsInProgress() || download_item->IsPaused() || download_item->IsInterrupted()) &&
                       !download_item->IsComplete() && !download_item->IsCanceled();
+
+  auto pendingIt = pending_save_dialog_downloads_.find(downloadID);
+  if (pendingIt != pending_save_dialog_downloads_.end()) {
+    bool hasChosenPath = !download_item->GetFullPath().empty();
+    if (download_item->IsCanceled() ||
+        (!hasChosenPath && !download_item->IsInProgress() && !download_item->IsComplete() && !download_item->IsPaused())) {
+      // Save dialog was canceled or download aborted before confirmation — never notify UI.
+      pending_save_dialog_downloads_.erase(pendingIt);
+      [[SXEngineRuntime sharedRuntime] unregisterDownloadCallbackForDownloadID:downloadID];
+      return;
+    }
+    if (!hasChosenPath) {
+      // Save dialog is still open (user hasn't clicked Save yet) — stay silent.
+      return;
+    }
+    // User confirmed the Save dialog and chose a destination path: emit didStartDownload now.
+    std::string origSuggested = pendingIt->second;
+    pending_save_dialog_downloads_.erase(pendingIt);
+    if (keepCallback) {
+      started_download_ids_.insert(downloadID);
+      if (callback) {
+        [[SXEngineRuntime sharedRuntime] registerDownloadCallback:callback
+                                                    forDownloadID:downloadID];
+      }
+    } else {
+      [[SXEngineRuntime sharedRuntime] unregisterDownloadCallbackForDownloadID:downloadID];
+    }
+    SXDownloadItem* item = BuildDownloadItem(download_item, CefString(origSuggested), nil);
+    SXBrowserTab* strongTab = RetainTab();
+    if (strongTab) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [strongTab handleDownloadStarted:item];
+        if (!keepCallback) {
+          [strongTab handleDownloadUpdated:item];
+        }
+      });
+    }
+    return;
+  }
+
+  if (started_download_ids_.count(downloadID) == 0) {
+    // Ignore pre-OnBeforeDownload updates or updates for canceled/denied Save dialogs.
+    return;
+  }
+
   if (keepCallback && callback) {
     [[SXEngineRuntime sharedRuntime] registerDownloadCallback:callback
                                                 forDownloadID:downloadID];
   } else {
+    started_download_ids_.erase(downloadID);
     [[SXEngineRuntime sharedRuntime] unregisterDownloadCallbackForDownloadID:downloadID];
   }
 

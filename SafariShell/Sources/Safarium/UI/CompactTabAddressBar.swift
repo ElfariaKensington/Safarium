@@ -84,6 +84,7 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
 
     /// Hit-tests a window point against both the active tab pill and every inactive tab slot (for middle-click-to-close).
     func tabID(atWindowPoint ptInWindow: NSPoint) -> String? {
+        guard !items.isEmpty else { return nil }
         let ptInHost = trackHostView.convert(ptInWindow, from: nil)
         guard trackHostView.bounds.contains(ptInHost) else { return nil }
         if activePillSurfaceView.frame.contains(ptInHost), !activeTabID.isEmpty {
@@ -357,9 +358,11 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
             let tgv = NSGlassEffectView()
             tgv.style = .regular
             tgv.cornerRadius = SafariMetrics.tabPillCornerRadius
+            #if compiler(>=6.4)
             if #available(macOS 27.0, *) {
                 tgv.effectIsInteractive = false
             }
+            #endif
             tgv.translatesAutoresizingMaskIntoConstraints = false
             tgv.isHidden = !BrowserSettings.shared.refractiveGlassToolbar
             trackBgView.addSubview(tgv)
@@ -411,9 +414,11 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
             let gv = NSGlassEffectView()
             gv.style = .regular
             gv.cornerRadius = SafariMetrics.tabInnerCornerRadius
+            #if compiler(>=6.4)
             if #available(macOS 27.0, *) {
                 gv.effectIsInteractive = false
             }
+            #endif
             gv.translatesAutoresizingMaskIntoConstraints = false
             activePillGlassHost.addSubview(gv)
             NSLayoutConstraint.activate([
@@ -1348,6 +1353,11 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
                     tabID: active.id
                 )
             }
+        } else {
+            activeTabID = ""
+            activeIsStartPage = true
+            activeURLString = ""
+            activeIsLoading = false
         }
 
         rebuildAndLayout(forceAnimated: animated)
@@ -1538,13 +1548,13 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
         let structureSig = visible.map(\.id).joined(separator: ",") + "|p=\(pinnedSig)|h=\(hiddenDraggedTabID ?? "")|ph=\(phSig)|\(isSidebarOpen)"
         let structureChanged = (structureSig != lastStructureSig)
         lastStructureSig = structureSig
-        let defaultAnimate = (window != nil) && !(window?.inLiveResize ?? true) && hasLaidOutOnce && structureChanged
+        let defaultAnimate = (window?.isVisible == true) && bounds.width > 1.0 && !(window?.inLiveResize ?? true) && hasLaidOutOnce && structureChanged
         let shouldAnimate = forceAnimated ?? defaultAnimate
 
         let widthChanged = abs((trackWidthConstraint?.constant ?? 0) - targetW) > 0.5
         let centerChanged = abs((trackCenterXConstraint?.constant ?? 0) - targetCenterX) > 0.5
         if widthChanged || centerChanged {
-            if shouldAnimate {
+            if shouldAnimate && (window?.isVisible == true) && bounds.width > 1.0 {
                 beginFocusRingDeferral()
                 NSAnimationContext.runAnimationGroup({ ctx in
                     ctx.duration = 0.28
@@ -2082,9 +2092,11 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
                 activePillGlassHost.isHidden = false
                 activePillGlassHost.layer?.preferredDynamicRange = .standard
                 gv.layer?.preferredDynamicRange = .standard
+                #if compiler(>=6.4)
                 if #available(macOS 27.0, *) {
                     gv.effectIsInteractive = false
                 }
+                #endif
                 gv.cornerRadius = activePillSurfaceView.layer?.cornerRadius ?? SafariMetrics.tabInnerCornerRadius
                 if theme.prefersLightInk {
                     gv.style = .clear

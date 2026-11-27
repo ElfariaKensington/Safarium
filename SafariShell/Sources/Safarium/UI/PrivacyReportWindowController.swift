@@ -932,7 +932,9 @@ enum PrivacyUIStyle {
         button.font = NSFont.systemFont(ofSize: 12.5, weight: accent ? .medium : .regular)
         if #available(macOS 26.0, *) {
             button.bezelStyle = .glass
+            #if compiler(>=6.4)
             button.borderShape = .capsule
+            #endif
         } else {
             button.bezelStyle = .rounded
         }

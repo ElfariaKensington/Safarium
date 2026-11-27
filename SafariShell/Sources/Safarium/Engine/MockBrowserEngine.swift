@@ -683,6 +683,80 @@ final class MockBrowserTab: NSObject, BrowserTabEngine {
         completion(TopEdgeColorSample(color: avgColor))
     }
 
+    func getPageSource(completion: @escaping (String?) -> Void) {
+        guard currentURL != nil, !isNativeInternalPage else {
+            completion(nil)
+            return
+        }
+        let escapedTitle = title
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        let urlStr = currentURL?.absoluteString ?? "about:blank"
+        completion("<!doctype html>\n<html>\n<head><meta charset=\"utf-8\"><title>\(escapedTitle)</title></head>\n<body><!-- \(urlStr) --><h1>\(escapedTitle)</h1></body>\n</html>\n")
+    }
+
+    func exportToPDF(atPath path: String, completion: @escaping (Bool) -> Void) {
+        guard currentURL != nil, !isNativeInternalPage else {
+            completion(false)
+            return
+        }
+        let pdfData = documentView.dataWithPDF(inside: documentView.bounds)
+        do {
+            try pdfData.write(to: URL(fileURLWithPath: path), options: .atomic)
+            completion(true)
+        } catch {
+            completion(false)
+        }
+    }
+
+    func savePageWithPanel(for window: NSWindow?, completion: ((Bool, URL?) -> Void)? = nil) {
+        guard currentURL != nil, !isNativeInternalPage else {
+            completion?(false, nil)
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "Save As"
+        let rawName = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hostFallback = currentURL?.host ?? "Page"
+        let safeStem = (rawName.isEmpty ? hostFallback : rawName)
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        let stem = safeStem.isEmpty ? "Page" : safeStem
+        panel.allowedContentTypes = [.html]
+        panel.nameFieldStringValue = "\(stem).html"
+
+        let handleResponse: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard let self, response == .OK, let destURL = panel.url else {
+                completion?(false, nil)
+                return
+            }
+            if destURL.pathExtension.lowercased() == "pdf" {
+                self.exportToPDF(atPath: destURL.path) { ok in
+                    completion?(ok, ok ? destURL : nil)
+                }
+            } else {
+                self.getPageSource { html in
+                    guard let html, let data = html.data(using: .utf8) else {
+                        completion?(false, nil)
+                        return
+                    }
+                    do {
+                        try data.write(to: destURL, options: .atomic)
+                        completion?(true, destURL)
+                    } catch {
+                        completion?(false, nil)
+                    }
+                }
+            }
+        }
+        if let window {
+            panel.beginSheetModal(for: window, completionHandler: handleResponse)
+        } else {
+            handleResponse(panel.runModal())
+        }
+    }
+
     private static func makeFavicon(letter: String, color: NSColor) -> NSImage {
         let size = NSSize(width: 16, height: 16)
         let img = NSImage(size: size)

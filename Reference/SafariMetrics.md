@@ -67,7 +67,7 @@ All toolbar pills sit vertically centered at `y = 7 pt` (`height = 38 pt`, `corn
 - On this machine, `CGSCopyManagedDisplaySpaces` reports Space `1` (Desktop 1, active) and Space `2357` (Desktop 2).
 - `SAFARIX_DESKTOP=2` can optionally move the window to Space `2357` via `SkyLight` (`CGSMainConnectionID`, `CGSCopyManagedDisplaySpaces`, `CGSMoveWindowsToManagedSpace`).
 
-## 8. Newly Dropped Reference Files (`/Users/elfaria/SafariX/`)
+## 8. Newly Dropped Reference Files (`Reference/Screenshots/`)
 - `Pasted 2026-11-24 at 8.13.07 PM.heic` (`3160×2110`): Content Shield extension popover anchored under toolbar extension button.
 - `Pasted 2026-11-24 at 8.13.13 PM.heic` (`3160×2110`): Bitwarden Vault extension popover anchored under toolbar extension button.
 - `Pasted 2026-11-24 at 8.13.24 PM.heic` (`3160×2120`): Extension toolbar button right-click context menu (`Bitwarden >`, `Manage Extension...`, `Customize Toolbar...`).

@@ -4,7 +4,7 @@ import QuartzCore
 /// 1:1 port of Safarium's native AppKit floating `NSPanel` + `NSGlassEffectView` Address Bar Popover
 /// (`SafariumUnifiedField.swift:1200–2040`), matching native macOS 27.3 Safari (`05_addressbar_popover_top.png`):
 /// - Real floating `NSPanel` child window (`cornerRadius = 22 pt`, `NSGlassEffectView(style: .regular)`)
-/// - Screen-coordinate centering locked directly 6pt beneath the focused URL pill (`536 × ≤506 pt`)
+/// - Screen-coordinate centering locked directly 6pt beneath the focused URL pill (`480–620 × ≤560 pt`)
 /// - Exact `sidePad = 38 pt`, `20 pt` bold `#383D42` headers, `6×2` `66 × 66 pt` Favorites squircle grid,
 ///   tall `226 × 156 pt` Recently Viewed cards (with clock timestamp & `"N Tabs ›"` pill), `58 pt` Reading List rows,
 ///   and full keyboard-navigable query autocomplete (`Top Hit`, `Google Search`, `Switch to Tab`, `Bookmarks and History`)

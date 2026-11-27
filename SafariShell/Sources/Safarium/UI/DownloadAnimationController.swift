@@ -25,8 +25,7 @@ final class DownloadAnimationController: NSObject {
     private var progressTrackLayer: CAShapeLayer?
     private var progressRingLayer: CAShapeLayer?
     private var ringGlyphShown = false
-    private var simulationTimer: Timer?
-    private var nextSimulatedID: UInt32 = 9000
+    private var confirmedDownloadIDs: Set<UInt32> = []
 
     private struct PendingFlight {
         let originRect: NSRect
@@ -58,7 +57,6 @@ final class DownloadAnimationController: NSObject {
         for t in resumeWatchdogs.values { t.invalidate() }
         resumeWatchdogs.removeAll()
         flightPollTimer?.invalidate()
-        simulationTimer?.invalidate()
         dockProgress.unpublishAll()
         activePopover?.close()
     }
@@ -89,6 +87,14 @@ final class DownloadAnimationController: NSObject {
     // MARK: - Download events
 
     func handleDownloadStarted(_ item: BrowserDownloadItem, fromOriginInWindow origin: NSPoint? = nil) {
+        // Never trigger download animations or toolbar pills when a Save dialog merely opened or was cancelled.
+        let hasDestinationOrBytes = item.isComplete || item.receivedBytes > 0 || (item.fullPath?.isEmpty == false)
+        guard !item.isCanceled,
+              (item.isInProgress || item.isComplete || item.isPaused),
+              hasDestinationOrBytes else {
+            return
+        }
+        confirmedDownloadIDs.insert(item.id)
         let wasEmpty = downloads.isEmpty
         lastSampleByID[item.id] = (item.receivedBytes, CFAbsoluteTimeGetCurrent())
         speedByID[item.id] = 0
@@ -102,6 +108,18 @@ final class DownloadAnimationController: NSObject {
     }
 
     func handleDownloadUpdated(_ item: BrowserDownloadItem) {
+        // Ignore updates for downloads that never cleared Save dialog confirmation.
+        let isKnown = confirmedDownloadIDs.contains(item.id) || downloads.contains(where: { $0.id == item.id })
+        if !isKnown {
+            let hasDestinationOrBytes = item.isComplete || item.receivedBytes > 0 || (item.fullPath?.isEmpty == false)
+            guard !item.isCanceled,
+                  (item.isInProgress || item.isComplete),
+                  hasDestinationOrBytes else {
+                return
+            }
+            confirmedDownloadIDs.insert(item.id)
+        }
+
         // Check if a pending resume attempt succeeded or failed
         if let timer = resumeWatchdogs[item.id] {
             let baseline = resumeBaselineBytes[item.id] ?? 0
@@ -158,43 +176,6 @@ final class DownloadAnimationController: NSObject {
                     self.onToolbarVisibilityChanged?(true)
                 }
             }
-        }
-    }
-
-    func triggerSimulatedDownload(fromOriginInWindow origin: NSPoint? = nil) {
-        simulationTimer?.invalidate()
-        nextSimulatedID += 1
-        let id = nextSimulatedID
-        let total: Int64 = 18_400_000
-        let downloadsDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first?.path ?? NSHomeDirectory()
-        let path = (downloadsDir as NSString).appendingPathComponent("Safarium-Release.dmg")
-        let localURL = URL(fileURLWithPath: path)
-
-        func make(_ received: Int64, done: Bool) -> BrowserDownloadItem {
-            BrowserDownloadItem(
-                id: id,
-                suggestedFileName: "Safarium-Release.dmg",
-                fullPath: path,
-                url: localURL,
-                totalBytes: total,
-                receivedBytes: received,
-                percentComplete: Int32((Double(received) / Double(total) * 100).rounded()),
-                isInProgress: !done,
-                isComplete: done,
-                isCanceled: false
-            )
-        }
-        handleDownloadStarted(make(0, done: false), fromOriginInWindow: origin)
-
-        var step = 0
-        let totalSteps = 22
-        simulationTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) { [weak self] timer in
-            guard let self else { timer.invalidate(); return }
-            step += 1
-            let frac = min(1.0, Double(step) / Double(totalSteps))
-            let done = step >= totalSteps
-            self.handleDownloadUpdated(make(Int64(Double(total) * frac), done: done))
-            if done { timer.invalidate() }
         }
     }
 

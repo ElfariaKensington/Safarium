@@ -7,7 +7,6 @@ final class WebsiteSettingsPopoverController: NSObject, NSPopoverDelegate {
 
     var onPageZoomChanged: ((Double) -> Void)?
     var onAdaptiveDarkModeChanged: ((Bool) -> Void)?
-    var onReaderModeChanged: ((Bool) -> Void)?
     var onContentBlockersChanged: ((Bool) -> Void)?
 
     var isShown: Bool { popover?.isShown ?? false }
@@ -24,7 +23,6 @@ final class WebsiteSettingsPopoverController: NSObject, NSPopoverDelegate {
         let vc = WebsiteSettingsPopoverViewController(host: host)
         vc.onPageZoomChanged = { [weak self] factor in self?.onPageZoomChanged?(factor) }
         vc.onAdaptiveDarkModeChanged = { [weak self] enabled in self?.onAdaptiveDarkModeChanged?(enabled) }
-        vc.onReaderModeChanged = { [weak self] enabled in self?.onReaderModeChanged?(enabled) }
         vc.onContentBlockersChanged = { [weak self] enabled in self?.onContentBlockersChanged?(enabled) }
 
         let pop = NSPopover()
@@ -59,7 +57,6 @@ final class WebsiteSettingsPopoverViewController: NSViewController {
 
     var onPageZoomChanged: ((Double) -> Void)?
     var onAdaptiveDarkModeChanged: ((Bool) -> Void)?
-    var onReaderModeChanged: ((Bool) -> Void)?
     var onContentBlockersChanged: ((Bool) -> Void)?
 
     static let zoomOptions = ["50%", "75%", "85%", "100%", "115%", "125%", "150%", "175%", "200%", "250%", "300%"]
@@ -98,7 +95,7 @@ final class WebsiteSettingsPopoverViewController: NSViewController {
         root.addSubview(header)
         y += 32.0
 
-        // Section 1: 3 Checkboxes
+        // Section 1: 2 Checkboxes
         func addCheckbox(title: String, isInitiallyOn: Bool, onToggle: @escaping (Bool) -> Void) {
             let btn = NSButton(checkboxWithTitle: title, target: self, action: #selector(checkboxChanged(_:)))
             btn.font = NSFont.systemFont(ofSize: 13.0, weight: .regular)
@@ -118,9 +115,6 @@ final class WebsiteSettingsPopoverViewController: NSViewController {
             }
         }
 
-        addBinaryPolicyCheckbox(title: "Use Reader when available", category: "Reader", defaultOn: false) { [weak self] on in
-            self?.onReaderModeChanged?(on)
-        }
         addCheckbox(
             title: "Enable content blockers",
             isInitiallyOn: settings.isContentBlockersEnabled(forHost: host)

@@ -264,7 +264,8 @@ final class GlassToolbarControlsTests: HermeticTestCase {
         XCTAssertEqual(capsule.orderedSlotTokens(), ["native:b", "ext:x", "native:a", "native:c", "ext:y"])
         XCTAssertTrue(capsule.hasMergedExtensions)
         XCTAssertNotNil(capsule.anchorExtensionButton(forExtensionID: "y"))
-        XCTAssertEqual(capsule.currentRequiredWidth, 6 + 38 + 75 + 38 + 2 * 32)
+        let expectedWidth: CGFloat = 6 + 38 + 75 + 38 + 64
+        XCTAssertEqual(capsule.currentRequiredWidth, expectedWidth)
     }
 
     func testDuplicateTokensAreIgnoredWhenPlacingMergedSlots() {

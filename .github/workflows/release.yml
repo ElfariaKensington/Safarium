@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_override:
+        description: "Optional version tag override (defaults to vYYYY.MM.DD-<run_number>)"
+        required: false
+        type: string
+        default: ""
+      release_notes:
+        description: "Optional release notes prepended above auto-generated notes"
+        required: false
+        type: string
+        default: ""
+      prerelease:
+        description: "Mark GitHub Release as prerelease"
+        required: false
+        type: boolean
+        default: false
+      build_artifact:
+        description: "Build and attach Safarium.app zip artifact if buildable on runner"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: xcode-27
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute release tag
+        id: tag
+        env:
+          TAG_OVERRIDE: ${{ inputs.tag_override }}
+        run: |
+          set -euo pipefail
+          TAG="$(printf '%s' "$TAG_OVERRIDE" | xargs)"
+          if [[ -z "$TAG" ]]; then
+            BASE="v$(date -u +%Y.%m.%d)-${{ github.run_number }}"
+            if git rev-parse -q --verify "refs/tags/${BASE}" >/dev/null 2>&1; then
+              TAG="${BASE}-$(git rev-parse --short HEAD)"
+            else
+              TAG="${BASE}"
+            fi
+          fi
+          echo "Release tag: ${TAG}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Select newest available Xcode
+        if: ${{ inputs.build_artifact }}
+        run: |
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          BEST_XCODE="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [[ -n "$BEST_XCODE" && -d "$BEST_XCODE/Contents/Developer" ]]; then
+            echo "Selecting Xcode: $BEST_XCODE"
+            sudo xcode-select -s "$BEST_XCODE/Contents/Developer"
+          fi
+          xcodebuild -version || true
+          swift --version
+
+      - name: Cache CEF framework
+        if: ${{ inputs.build_artifact }}
+        uses: actions/cache@v4
+        with:
+          path: BrowserCore/third_party/cef
+          key: cef-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-chromium-framework.sh') }}
+
+      - name: Build BrowserCore (optional)
+        if: ${{ inputs.build_artifact }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
+            brew install cmake ninja
+          fi
+          ./scripts/build-chromium-framework.sh --mode=cef
+
+      - name: Build and package Safarium.app artifact
+        id: build
+        if: ${{ inputs.build_artifact }}
+        continue-on-error: true
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          SAFARIUM_CONFIG=release SAFARIUM_BUNDLE_COPY_ASSETS=1 SAFARIUM_NO_LAUNCH=1 ./scripts/run.sh
+          ARTIFACT_NAME="Safarium-${TAG}-macos-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent build/Safarium.app "build/${ARTIFACT_NAME}"
+          echo "artifact=build/${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          CUSTOM_NOTES: ${{ inputs.release_notes }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          ARTIFACT_PATH: ${{ steps.build.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          ARGS=(
+            "$TAG"
+            --target "${{ github.sha }}"
+            --title "Safarium $TAG"
+            --generate-notes
+          )
+          if [[ "$PRERELEASE" == "true" ]]; then
+            ARGS+=(--prerelease)
+          fi
+          if [[ -n "$(printf '%s' "$CUSTOM_NOTES" | xargs)" ]]; then
+            NOTES_FILE="$(mktemp)"
+            printf '%s\n' "$CUSTOM_NOTES" > "$NOTES_FILE"
+            ARGS+=(--notes-file "$NOTES_FILE")
+          fi
+          if [[ -n "${ARTIFACT_PATH:-}" && -f "${ARTIFACT_PATH:-}" ]]; then
+            ARGS+=("$ARTIFACT_PATH")
+          fi
+          gh release create "${ARGS[@]}"

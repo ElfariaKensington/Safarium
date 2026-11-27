@@ -43,8 +43,13 @@ if command -v vtool >/dev/null 2>&1; then
     vtool -set-build-version macos 26.0 27.2 -replace -output "$MACOS_DIR/Safarium" "$MACOS_DIR/Safarium"
 fi
 
-# Expose Reference/ assets inside the app bundle cleanly via symlink for fast incremental packaging
-ln -sfn "$ROOT_DIR/Reference" "$RESOURCES_DIR/Reference"
+# Expose Reference/ assets inside the app bundle (copy when SAFARIUM_BUNDLE_COPY_ASSETS=1, else symlink for fast dev)
+if [[ "${SAFARIUM_BUNDLE_COPY_ASSETS:-0}" == "1" ]]; then
+    rm -rf "$RESOURCES_DIR/Reference"
+    ditto "$ROOT_DIR/Reference" "$RESOURCES_DIR/Reference"
+else
+    ln -sfn "$ROOT_DIR/Reference" "$RESOURCES_DIR/Reference"
+fi
 
 # If BrowserCore is built and its bundler helper exists, embed Chromium/CEF frameworks cleanly
 if [[ -x "$ROOT_DIR/BrowserCore/scripts/bundle-browsercore.sh" && -f "$ROOT_DIR/BrowserCore/build/libSafariumBrowserCore.dylib" ]]; then
@@ -65,6 +70,11 @@ if [[ -n "$SIGN_ID" ]]; then
     codesign --force --sign "$SIGN_ID" --entitlements "$ENTITLEMENTS" "$APP_BUNDLE" 2>&1 ||         codesign --force --sign - --entitlements "$ENTITLEMENTS" "$APP_BUNDLE" >/dev/null 2>&1 || true
 else
     codesign --force --sign - --entitlements "$ENTITLEMENTS" "$APP_BUNDLE" >/dev/null 2>&1 || true
+fi
+
+if [[ "${SAFARIUM_NO_LAUNCH:-0}" == "1" ]]; then
+    echo "[Safarium] Build & bundle complete (SAFARIUM_NO_LAUNCH=1)."
+    exit 0
 fi
 
 # ONLY now — after compilation and packaging succeeded — terminate previous Safarium process(es)

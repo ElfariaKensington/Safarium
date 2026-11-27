@@ -43,7 +43,8 @@ SWAP_PATH=""
 CHROMIUM_SRC="${HOME}/chromium"
 CEF_BRANCH="8078"
 
-for arg in "$@"; do
+while [[ $# -gt 0 ]]; do
+  arg="$1"
   case "${arg}" in
     --mode=*)
       MODE="${arg#*=}"
@@ -68,6 +69,7 @@ for arg in "$@"; do
       exit 0
       ;;
   esac
+  shift || break
 done
 
 verify_arm64_framework() {

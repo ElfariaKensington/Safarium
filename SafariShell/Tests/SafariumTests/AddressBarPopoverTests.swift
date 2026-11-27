@@ -256,26 +256,26 @@ final class AddressBarPopoverTests: HermeticTestCase {
     // MARK: - Popover width
 
     func testPopoverWidthWithoutHostUsesDefaultWidthCap() {
-        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: nil), 536)
+        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: nil), 620)
     }
 
-    func testPopoverWidthCapsAtFiveHundredThirtySix() {
-        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 1000), 536)
+    func testPopoverWidthCapsAtSixHundredTwenty() {
+        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 1000), 620)
+        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 644), 620)
+    }
+
+    func testPopoverWidthShrinksWithNarrowHostButNotBelowFourEighty() {
         XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 560), 536)
+        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 504), 480)
+        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 300), 480)
+        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 0), 480)
+        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: -100), 480)
     }
 
-    func testPopoverWidthShrinksWithNarrowHostButNotBelowFourForty() {
-        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 500), 476)
-        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 464), 440)
-        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 300), 440)
-        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 0), 440)
-        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: -100), 440)
-    }
-
-    func testPopoverWidthBoundaryAtFourSixtyFiveAndFiveSixty() {
-        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 465), 441)
-        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 559), 535)
-        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 560), 536)
+    func testPopoverWidthBoundaryAtFiveOhFiveAndSixFortyFour() {
+        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 505), 481)
+        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 643), 619)
+        XCTAssertEqual(Ctl.popoverWidth(hostWindowWidth: 644), 620)
     }
 
     // MARK: - Start popover mode (blank / URL query)
@@ -437,11 +437,11 @@ final class AddressBarPopoverTests: HermeticTestCase {
         XCTAssertEqual(urlOf(items[0])?.absoluteString, "https://www.apple.com/shop")
     }
 
-    func testTopHitFromOpenTabByTitlePrefixShowsDomain() {
+    func testTopHitFromOpenTabByTitlePrefixShowsDisplayURL() {
         let items = build("apple", tabs: [tab("t1", "Apple Store", "https://example.org/x")])
         XCTAssertEqual(items.first?.style, .topHit)
         XCTAssertEqual(items.first?.title, "example.org")
-        XCTAssertEqual(items.first?.subtitle, "example.org")
+        XCTAssertEqual(items.first?.subtitle, "example.org/x")
     }
 
     func testStartPageTabIsNeverTopHit() {
@@ -482,11 +482,11 @@ final class AddressBarPopoverTests: HermeticTestCase {
         XCTAssertEqual(styles(items), [.googleSuggestion])
     }
 
-    func testRecentGroupTopHitWithEmptyTitleUsesDomainAsSubtitle() {
+    func testRecentGroupTopHitWithEmptyTitleUsesDisplayURLAsSubtitle() {
         let items = build("git", recent: [group("github.com", "https://github.com/repo")])
         XCTAssertEqual(items.first?.style, .topHit)
         XCTAssertEqual(items.first?.title, "github.com")
-        XCTAssertEqual(items.first?.subtitle, "github.com")
+        XCTAssertEqual(items.first?.subtitle, "github.com/repo")
     }
 
     func testRecentGroupTopHitUsesTitleAsSubtitleWhenPresent() {
@@ -661,16 +661,16 @@ final class AddressBarPopoverTests: HermeticTestCase {
     }
 
     func testBookmarkHistoryRowUsesDomainWhenTitleBlank() {
-        seedHistory([(title: "   ", url: "https://blank.example/page")])
+        seedHistory([(title: "Blank Top", url: "https://blank.example/"), (title: "   ", url: "https://page-blank.example/page")])
         let items = build("blank")
         let row = items.first { $0.style == .bookmarkOrHistory }
-        XCTAssertEqual(row?.title, "blank.example")
-        XCTAssertEqual(row?.subtitle, "blank.example")
+        XCTAssertEqual(row?.title, "page-blank.example")
+        XCTAssertEqual(row?.subtitle, "page-blank.example/page")
     }
 
     func testHistoryMatchesOnURLText() {
         seedHistory([(title: "Unrelated", url: "https://match-by-url.example/")])
-        let items = build("match-by-url")
+        let items = build("by-url")
         XCTAssertTrue(items.contains { $0.style == .bookmarkOrHistory })
     }
 
@@ -705,14 +705,14 @@ final class AddressBarPopoverTests: HermeticTestCase {
 
     func testHistoryTitleMatchAddsSingleRow() {
         AssetLoader.shared.recordHistoryVisit(url: URL(string: "https://ok.example/")!, title: "Broken Candidate")
-        let items = build("broken")
+        let items = build("candidate")
         XCTAssertEqual(items.filter { $0.style == .bookmarkOrHistory }.count, 1)
     }
 
     // MARK: - Suggestion row ordering and totals
 
     func testRowOrderIsTopHitSwitchSearchThenBookmarks() {
-        seedHistory([(title: "Fox News", url: "https://fox.example/")])
+        seedHistory([(title: "Fox News", url: "https://fox.example/"), (title: "Fox Archive", url: "https://fox-archive.example/")])
         let items = build("fox", tabs: [
             tab("a", "Fox A", "https://a.example/"),
             tab("b", "Fox B", "https://b.example/"),

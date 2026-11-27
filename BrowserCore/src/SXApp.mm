@@ -97,6 +97,7 @@ class SXRogueChromeWindowTrapClient : public CefClient,
 
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     CEF_REQUIRE_UI_THREAD();
+    [[SXEngineRuntime sharedRuntime] noteBrowserCreated];
     if (!browser) return;
     std::string urlStr;
     if (browser->GetMainFrame()) {
@@ -182,6 +183,7 @@ class SXRogueChromeWindowTrapClient : public CefClient,
 
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
     CEF_REQUIRE_UI_THREAD();
+    [[SXEngineRuntime sharedRuntime] noteBrowserClosed];
     if (!browser) return;
     std::lock_guard<std::mutex> lock(mu_);
     forwarded_ids_.erase(browser->GetIdentifier());

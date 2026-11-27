@@ -22,7 +22,6 @@ final class BrowserSettings {
         static let newTabOpensWith = "Safarium.Pref.NewTabOpensWith"
         static let homepage = "Safarium.Pref.Homepage"
         static let removeHistory = "Safarium.Pref.RemoveHistory"
-        static let startPageFavorites = "Safarium.Pref.StartPageFavorites"
         static let downloadLocation = "Safarium.Pref.DownloadLocation"
         static let customDownloadDir = "Safarium.Pref.CustomDownloadDir"
         static let removeDownloads = "Safarium.Pref.RemoveDownloads"
@@ -35,7 +34,6 @@ final class BrowserSettings {
         static let refractiveGlassToolbar = "Safarium.Pref.RefractiveGlassToolbar"
         static let refractiveGlassFrost = "Safarium.Pref.RefractiveGlassFrost"
         static let alwaysShowTabTitles = "Safarium.Pref.AlwaysShowTabTitles"
-        static let cmdClickNewTab = "Safarium.Pref.CmdClickNewTab"
         static let activateNewTabs = "Safarium.Pref.ActivateNewTabs"
         static let cmdNumberSwitch = "Safarium.Pref.CmdNumberSwitch"
 
@@ -44,13 +42,11 @@ final class BrowserSettings {
         static let privateSearchEngine = "Safarium.Pref.PrivateSearchEngine"
         static let searchSuggestions = "Safarium.Pref.SearchSuggestions"
         static let quickWebsiteSearch = "Safarium.Pref.QuickWebsiteSearch"
-        static let preloadTopHit = "Safarium.Pref.PreloadTopHit"
         static let showFavoritesInSearch = "Safarium.Pref.ShowFavoritesInSearch"
 
         static let autofillPasswords = "Safarium.Pref.AutoFillPasswords"
         static let autofillAddresses = "Safarium.Pref.AutoFillAddresses"
         static let autofillCards = "Safarium.Pref.AutoFillCards"
-        static let autofillOther = "Safarium.Pref.AutoFillOther"
 
         static let warnFraudulent = "Safarium.Pref.WarnFraudulent"
         static let enableJavaScript = "Safarium.Pref.EnableJavaScript"
@@ -84,11 +80,6 @@ final class BrowserSettings {
         static let remoteDebuggingPort = "Safarium.Pref.RemoteDebuggingPort"
         static let inspectDiscoverNetworkTargets = "Safarium.Pref.InspectDiscoverNetworkTargets"
         static let inspectNetworkTargets = "Safarium.Pref.InspectNetworkTargets"
-
-        static let profilesEnabled = "Safarium.Pref.ProfilesEnabled"
-        static let profileNames = "Safarium.Pref.ProfileNames"
-        static let activeProfileName = "Safarium.Pref.ActiveProfileName"
-        static let clearedShortcuts = "Safarium.Extensions.ClearedShortcuts"
 
         static let savedSessionTabs = "Safarium.Session.SavedTabs.v1"
         static let savedSessionActiveIndex = "Safarium.Session.ActiveIndex.v1"
@@ -412,11 +403,10 @@ final class BrowserSettings {
         }
     }
     var alwaysShowWebsiteTitles: Bool { bool(Key.alwaysShowTabTitles, default: false) }
-    var cmdClickOpensInNewTab: Bool { bool(Key.cmdClickNewTab, default: true) }
     var activateNewTabsOnOpen: Bool { bool(Key.activateNewTabs, default: false) }
     var cmdNumberSwitchesTabs: Bool { bool(Key.cmdNumberSwitch, default: true) }
 
-    // MARK: - Quick Website Search & Local AutoFill Stores
+    // MARK: - Quick Website Search
 
     struct QuickSearchSite: Codable, Equatable {
         var keyword: String
@@ -470,15 +460,6 @@ final class BrowserSettings {
         return (matched, rest, url)
     }
 
-    func autoFillEntries(categoryKey: String) -> [String] {
-        defaults.stringArray(forKey: "Safarium.AutoFillStore.\(categoryKey)") ?? []
-    }
-
-    func saveAutoFillEntries(_ entries: [String], categoryKey: String) {
-        defaults.set(entries, forKey: "Safarium.AutoFillStore.\(categoryKey)")
-        notifyChanged(key: categoryKey)
-    }
-
     // MARK: - Search
 
     var primarySearchEngine: SearchEngine {
@@ -497,7 +478,6 @@ final class BrowserSettings {
 
     var includeSearchSuggestions: Bool { bool(Key.searchSuggestions, default: true) }
     var enableQuickWebsiteSearch: Bool { bool(Key.quickWebsiteSearch, default: true) }
-    var preloadTopHit: Bool { bool(Key.preloadTopHit, default: true) }
     var showFavoritesInSearch: Bool { bool(Key.showFavoritesInSearch, default: true) }
 
     // MARK: - Security & Privacy
@@ -542,6 +522,7 @@ final class BrowserSettings {
     var devSeparateDevToolsWindow: Bool { bool(Key.devSeparateDevTools, default: false) }
     var devDisableCache: Bool { bool(Key.devDisableCache, default: false) }
 
+    /// Disabled by default in production; users must explicitly opt in via `safarium://inspect/#remote-debugging`.
     var remoteDebuggingEnabled: Bool {
         get { bool(Key.remoteDebuggingEnabled, default: false) }
         set { set(newValue, forKey: Key.remoteDebuggingEnabled) }

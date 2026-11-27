@@ -1,1 +1,314 @@
-../../safari-extracted/bookmarks.json
+{
+  "bookmarks" : [
+    {
+      "children" : [
+        {
+          "color" : "#1D1D1F",
+          "id" : "fav_apple_0",
+          "title" : "Apple",
+          "type" : "bookmark",
+          "url" : "https://www.apple.com/"
+        },
+        {
+          "color" : "#007AFF",
+          "id" : "fav_icloud_1",
+          "title" : "iCloud",
+          "type" : "bookmark",
+          "url" : "https://www.icloud.com/"
+        },
+        {
+          "color" : "#6001D2",
+          "id" : "fav_yahoo_2",
+          "title" : "Yahoo",
+          "type" : "bookmark",
+          "url" : "https://www.yahoo.com/"
+        },
+        {
+          "color" : "#008373",
+          "id" : "fav_bing_3",
+          "title" : "Bing",
+          "type" : "bookmark",
+          "url" : "https://www.bing.com/"
+        },
+        {
+          "color" : "#4285F4",
+          "id" : "fav_google_4",
+          "title" : "Google",
+          "type" : "bookmark",
+          "url" : "https://www.google.com/?client=safari&channel=mac_bm"
+        },
+        {
+          "color" : "#636366",
+          "id" : "fav_wikipedia_5",
+          "title" : "Wikipedia",
+          "type" : "bookmark",
+          "url" : "https://www.wikipedia.org/"
+        },
+        {
+          "color" : "#1877F2",
+          "id" : "fav_facebook_6",
+          "title" : "Facebook",
+          "type" : "bookmark",
+          "url" : "https://www.facebook.com/"
+        },
+        {
+          "color" : "#1DA1F2",
+          "id" : "fav_twitter_7",
+          "title" : "Twitter",
+          "type" : "bookmark",
+          "url" : "https://twitter.com/"
+        },
+        {
+          "color" : "#0A66C2",
+          "id" : "fav_linkedin_8",
+          "title" : "LinkedIn",
+          "type" : "bookmark",
+          "url" : "https://www.linkedin.com/"
+        },
+        {
+          "color" : "#0059B3",
+          "id" : "fav_the_weather_channel_9",
+          "title" : "The Weather Channel",
+          "type" : "bookmark",
+          "url" : "https://www.weather.com/"
+        },
+        {
+          "color" : "#D32323",
+          "id" : "fav_yelp_10",
+          "title" : "Yelp",
+          "type" : "bookmark",
+          "url" : "https://www.yelp.com/"
+        },
+        {
+          "color" : "#34E0A1",
+          "id" : "fav_tripadvisor_11",
+          "title" : "TripAdvisor",
+          "type" : "bookmark",
+          "url" : "https://www.tripadvisor.com/"
+        }
+      ],
+      "id" : "bm_folder_0",
+      "rawTitle" : "BookmarksBar",
+      "title" : "Favorites",
+      "type" : "folder"
+    }
+  ],
+  "Children" : [
+    {
+      "Children" : [
+        {
+          "ReadingListNonSync" : {
+            "neverFetchMetadata" : true
+          },
+          "URIDictionary" : {
+            "title" : "Apple"
+          },
+          "URLString" : "https://www.apple.com/",
+          "WebBookmarkType" : "WebBookmarkTypeLeaf"
+        },
+        {
+          "ReadingListNonSync" : {
+            "neverFetchMetadata" : true
+          },
+          "URIDictionary" : {
+            "title" : "iCloud"
+          },
+          "URLString" : "https://www.icloud.com/",
+          "WebBookmarkType" : "WebBookmarkTypeLeaf"
+        },
+        {
+          "ReadingListNonSync" : {
+            "neverFetchMetadata" : true
+          },
+          "URIDictionary" : {
+            "title" : "Yahoo"
+          },
+          "URLString" : "https://www.yahoo.com/",
+          "WebBookmarkType" : "WebBookmarkTypeLeaf"
+        },
+        {
+          "ReadingListNonSync" : {
+            "neverFetchMetadata" : true
+          },
+          "URIDictionary" : {
+            "title" : "Bing"
+          },
+          "URLString" : "https://www.bing.com/",
+          "WebBookmarkType" : "WebBookmarkTypeLeaf"
+        },
+        {
+          "ReadingListNonSync" : {
+            "neverFetchMetadata" : true
+          },
+          "URIDictionary" : {
+            "title" : "Google"
+          },
+          "URLString" : "https://www.google.com/?client=safari&channel=mac_bm",
+          "WebBookmarkType" : "WebBookmarkTypeLeaf"
+        },
+        {
+          "ReadingListNonSync" : {
+            "neverFetchMetadata" : true
+          },
+          "URIDictionary" : {
+            "title" : "Wikipedia"
+          },
+          "URLString" : "https://www.wikipedia.org/",
+          "WebBookmarkType" : "WebBookmarkTypeLeaf"
+        },
+        {
+          "ReadingListNonSync" : {
+            "neverFetchMetadata" : true
+          },
+          "URIDictionary" : {
+            "title" : "Facebook"
+          },
+          "URLString" : "https://www.facebook.com/",
+          "WebBookmarkType" : "WebBookmarkTypeLeaf"
+        },
+        {
+          "ReadingListNonSync" : {
+            "neverFetchMetadata" : true
+          },
+          "URIDictionary" : {
+            "title" : "Twitter"
+          },
+          "URLString" : "https://twitter.com/",
+          "WebBookmarkType" : "WebBookmarkTypeLeaf"
+        },
+        {
+          "ReadingListNonSync" : {
+            "neverFetchMetadata" : true
+          },
+          "URIDictionary" : {
+            "title" : "LinkedIn"
+          },
+          "URLString" : "https://www.linkedin.com/",
+          "WebBookmarkType" : "WebBookmarkTypeLeaf"
+        },
+        {
+          "ReadingListNonSync" : {
+            "neverFetchMetadata" : true
+          },
+          "URIDictionary" : {
+            "title" : "The Weather Channel"
+          },
+          "URLString" : "https://www.weather.com/",
+          "WebBookmarkType" : "WebBookmarkTypeLeaf"
+        },
+        {
+          "ReadingListNonSync" : {
+            "neverFetchMetadata" : true
+          },
+          "URIDictionary" : {
+            "title" : "Yelp"
+          },
+          "URLString" : "https://www.yelp.com/",
+          "WebBookmarkType" : "WebBookmarkTypeLeaf"
+        },
+        {
+          "ReadingListNonSync" : {
+            "neverFetchMetadata" : true
+          },
+          "URIDictionary" : {
+            "title" : "TripAdvisor"
+          },
+          "URLString" : "https://www.tripadvisor.com/",
+          "WebBookmarkType" : "WebBookmarkTypeLeaf"
+        }
+      ],
+      "Title" : "BookmarksBar",
+      "WebBookmarkType" : "WebBookmarkTypeList"
+    }
+  ],
+  "favorites" : [
+    {
+      "color" : "#1D1D1F",
+      "id" : "fav_apple_0",
+      "title" : "Apple",
+      "type" : "bookmark",
+      "url" : "https://www.apple.com/"
+    },
+    {
+      "color" : "#007AFF",
+      "id" : "fav_icloud_1",
+      "title" : "iCloud",
+      "type" : "bookmark",
+      "url" : "https://www.icloud.com/"
+    },
+    {
+      "color" : "#6001D2",
+      "id" : "fav_yahoo_2",
+      "title" : "Yahoo",
+      "type" : "bookmark",
+      "url" : "https://www.yahoo.com/"
+    },
+    {
+      "color" : "#008373",
+      "id" : "fav_bing_3",
+      "title" : "Bing",
+      "type" : "bookmark",
+      "url" : "https://www.bing.com/"
+    },
+    {
+      "color" : "#4285F4",
+      "id" : "fav_google_4",
+      "title" : "Google",
+      "type" : "bookmark",
+      "url" : "https://www.google.com/?client=safari&channel=mac_bm"
+    },
+    {
+      "color" : "#636366",
+      "id" : "fav_wikipedia_5",
+      "title" : "Wikipedia",
+      "type" : "bookmark",
+      "url" : "https://www.wikipedia.org/"
+    },
+    {
+      "color" : "#1877F2",
+      "id" : "fav_facebook_6",
+      "title" : "Facebook",
+      "type" : "bookmark",
+      "url" : "https://www.facebook.com/"
+    },
+    {
+      "color" : "#1DA1F2",
+      "id" : "fav_twitter_7",
+      "title" : "Twitter",
+      "type" : "bookmark",
+      "url" : "https://twitter.com/"
+    },
+    {
+      "color" : "#0A66C2",
+      "id" : "fav_linkedin_8",
+      "title" : "LinkedIn",
+      "type" : "bookmark",
+      "url" : "https://www.linkedin.com/"
+    },
+    {
+      "color" : "#0059B3",
+      "id" : "fav_the_weather_channel_9",
+      "title" : "The Weather Channel",
+      "type" : "bookmark",
+      "url" : "https://www.weather.com/"
+    },
+    {
+      "color" : "#D32323",
+      "id" : "fav_yelp_10",
+      "title" : "Yelp",
+      "type" : "bookmark",
+      "url" : "https://www.yelp.com/"
+    },
+    {
+      "color" : "#34E0A1",
+      "id" : "fav_tripadvisor_11",
+      "title" : "TripAdvisor",
+      "type" : "bookmark",
+      "url" : "https://www.tripadvisor.com/"
+    }
+  ],
+  "safariVersion" : "27.3",
+  "source" : "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app/Contents/Resources/BuiltInBookmarks_en.plist",
+  "WebBookmarkFileVersion" : 1,
+  "WebBookmarkType" : "WebBookmarkTypeList"
+}

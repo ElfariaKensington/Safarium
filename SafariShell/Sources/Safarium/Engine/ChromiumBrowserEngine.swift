@@ -797,6 +797,24 @@ final class ChromiumTabAdapter: NSObject, BrowserTabEngine, SXBrowserTabDelegate
             completion(ok)
         }
     }
+    func getPageSource(completion: @escaping (String?) -> Void) {
+        guard !showingStartPage, let sxTab else {
+            completion(nil)
+            return
+        }
+        sxTab.getPageSource { htmlSource in
+            completion(htmlSource)
+        }
+    }
+    func savePageWithPanel(for window: NSWindow?, completion: ((Bool, URL?) -> Void)? = nil) {
+        guard !showingStartPage, let sxTab else {
+            completion?(false, nil)
+            return
+        }
+        sxTab.savePageWithPanel(for: window) { saved, savedURL in
+            completion?(saved, savedURL)
+        }
+    }
     func setAudioMuted(_ muted: Bool) {
         sxTab?.setAudioMuted(muted)
     }

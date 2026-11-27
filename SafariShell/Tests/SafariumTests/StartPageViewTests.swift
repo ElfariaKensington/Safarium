@@ -348,6 +348,8 @@ final class StartPageViewTests: HermeticTestCase {
         let view = makeView()
         view.configurePrivateMode(true)
         XCTAssertTrue(view.recentRowStack.arrangedSubviews.isEmpty)
+        XCTAssertEqual(view.recentHeaderLabel?.isHidden, true)
+        XCTAssertTrue(view.recentRowStack.isHidden)
     }
 
     func testPrivateModeMustNotReseedFromHistoryChanges() {

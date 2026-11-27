@@ -252,6 +252,8 @@ protocol BrowserTabEngine: AnyObject {
     func closeAuthPopup()
     func printPage()
     func exportToPDF(atPath path: String, completion: @escaping (Bool) -> Void)
+    func getPageSource(completion: @escaping (String?) -> Void)
+    func savePageWithPanel(for window: NSWindow?, completion: ((Bool, URL?) -> Void)?)
     func setAudioMuted(_ muted: Bool)
     var isAudioMuted: Bool { get }
     func closeTab()
@@ -374,6 +376,8 @@ extension BrowserTabEngine {
     func closeAuthPopup() {}
     func printPage() {}
     func exportToPDF(atPath path: String, completion: @escaping (Bool) -> Void) { completion(false) }
+    func getPageSource(completion: @escaping (String?) -> Void) { completion(nil) }
+    func savePageWithPanel(for window: NSWindow?, completion: ((Bool, URL?) -> Void)?) { completion?(false, nil) }
     func setAudioMuted(_ muted: Bool) {}
     var isAudioMuted: Bool { false }
 }

@@ -9,6 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var privacyReportWindowController: PrivacyReportWindowController?
 
     private var appMenuRef: NSMenu?
+    private var fileMenuRef: NSMenu?
+    private var saveAsMenuItem: NSMenuItem?
     private var settingsForDomainMenuItem: NSMenuItem?
     private var importFromBrowserSubmenu: NSMenu?
     private var viewMenuRef: NSMenu?
@@ -33,10 +35,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let key = NSApp.keyWindow?.windowController as? SafariWindowController {
             return key
         }
+        if let parentKey = NSApp.keyWindow?.parent?.windowController as? SafariWindowController {
+            return parentKey
+        }
         if let main = NSApp.mainWindow?.windowController as? SafariWindowController {
             return main
         }
         return windowControllers.last
+    }
+
+    private func dismissAllExtensionPopovers(restoreParentKey: Bool = true) {
+        for wc in windowControllers {
+            wc.dismissExtensionPopover(restoreParentKey: restoreParentKey)
+        }
     }
 
     var openWindowCount: Int { windowControllers.count }
@@ -300,7 +311,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         appMenu.addItem(siteSettingsItem)
         appMenu.addItem(makeMenuItem("Clear History…", action: #selector(clearHistoryAction)))
         appMenu.addItem(makeMenuItem("Clear All Data…", action: #selector(clearAllDataAction)))
-        appMenu.addItem(makeMenuItem("Manage Profiles…", action: #selector(openProfilesSettingsAction)))
         appMenu.addItem(.separator())
 
         let servicesItem = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
@@ -322,6 +332,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 2. File Menu
         let fileMenuItem = NSMenuItem()
         let fileMenu = NSMenu(title: "File")
+        fileMenu.delegate = self
+        self.fileMenuRef = fileMenu
 
         fileMenu.addItem(makeMenuItem("New Window", action: #selector(newWindowAction), keyEquivalent: "n"))
         fileMenu.addItem(makeMenuItem("New Private Window", action: #selector(newPrivateWindowAction), keyEquivalent: "N", modifiers: [.command, .shift]))
@@ -336,6 +348,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         fileMenu.addItem(makeMenuItem("Close All Windows", action: #selector(closeAllWindowsAction), keyEquivalent: "W", modifiers: [.command, .option, .shift]))
         fileMenu.addItem(.separator())
 
+        let saveAsItem = makeMenuItem("Save As…", action: #selector(saveAsAction), keyEquivalent: "s")
+        self.saveAsMenuItem = saveAsItem
+        fileMenu.addItem(saveAsItem)
         fileMenu.addItem(makeMenuItem("Share…", action: #selector(sharePageAction), symbol: "square.and.arrow.up"))
         fileMenu.addItem(makeMenuItem("Export as PDF…", action: #selector(exportAsPDFAction)))
         fileMenu.addItem(.separator())
@@ -703,6 +718,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        if menu === fileMenuRef {
+            saveAsMenuItem?.isEnabled = activeWindowController?.canSaveActiveTab ?? false
+            return
+        }
+
         if menu === viewMenuRef {
             let sidebarOpen = activeWindowController?.isSidebarCurrentlyOpen ?? false
             toggleSidebarMenuItem?.title = sidebarOpen ? "Hide Sidebar" : "Show Sidebar"
@@ -784,25 +804,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Menu Actions
 
     @objc private func newWindowAction() {
+        dismissAllExtensionPopovers(restoreParentKey: false)
         let target = BrowserSettings.shared.resolvedNewWindowURL(activeTabURL: activeWindowController?.activeWebPageURLString.flatMap { URL(string: $0) })
         openNewWindow(url: target, isPrivate: false)
     }
 
     @objc private func newPrivateWindowAction() {
+        dismissAllExtensionPopovers(restoreParentKey: false)
         openNewWindow(url: URL(string: "safarium://start"), isPrivate: true)
     }
 
     @objc private func closeWindowAction() {
+        dismissAllExtensionPopovers(restoreParentKey: false)
         activeWindowController?.window?.performClose(nil)
     }
 
     @objc private func closeAllWindowsAction() {
+        dismissAllExtensionPopovers(restoreParentKey: false)
         for wc in Array(windowControllers) {
             wc.window?.performClose(nil)
         }
     }
 
     @objc private func newTabAction() {
+        dismissAllExtensionPopovers()
         if let ctrl = activeWindowController {
             let target = BrowserSettings.shared.resolvedNewTabURL(activeTabURL: ctrl.activeWebPageURLString.flatMap { URL(string: $0) })
             ctrl.createNewTab(url: target, activate: true)
@@ -813,29 +838,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func reopenClosedTabAction() {
+        dismissAllExtensionPopovers()
         activeWindowController?.reopenLastClosedTab()
     }
 
     @objc private func reopenSpecificClosedTabAction(_ sender: NSMenuItem) {
+        dismissAllExtensionPopovers()
         activeWindowController?.reopenClosedTab(atReversedIndex: sender.tag)
     }
 
     @objc private func openFileAction() {
+        dismissAllExtensionPopovers()
         let target = activeWindowController ?? openNewWindow()
         target?.openLocalFileDialog()
     }
 
     @objc private func focusAddressBarAction() {
+        dismissAllExtensionPopovers()
         activeWindowController?.focusAddressBar()
     }
 
     @objc private func closeTabAction() {
+        dismissAllExtensionPopovers()
         if let keyWin = NSApp.keyWindow,
            !windowControllers.contains(where: { $0.window === keyWin }) {
             keyWin.performClose(nil)
             return
         }
         activeWindowController?.closeActiveTab()
+    }
+
+    @objc private func saveAsAction() {
+        dismissAllExtensionPopovers()
+        activeWindowController?.saveActiveTab()
     }
 
     @objc private func sharePageAction() {
@@ -1088,6 +1123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func selectTabByNumberAction(_ sender: NSMenuItem) {
+        dismissAllExtensionPopovers()
         guard BrowserSettings.shared.cmdNumberSwitchesTabs else { return }
         activeWindowController?.selectTabShortcut(tag: sender.tag)
     }
@@ -1132,6 +1168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pane: SafariSettingsWindowController.Pane = .extensions,
         selectingExtensionID: String? = nil
     ) {
+        dismissAllExtensionPopovers(restoreParentKey: false)
         guard let engine else { return }
         if settingsWindowController == nil {
             let vc = SafariSettingsWindowController(engine: engine, initialPane: pane)
@@ -1211,10 +1248,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openWebsiteSettingsAction() {
         showSettingsWindow(pane: .websites)
-    }
-
-    @objc private func openProfilesSettingsAction() {
-        showSettingsWindow(pane: .profiles)
     }
 
     @objc private func openAutoFillSettingsAction() {

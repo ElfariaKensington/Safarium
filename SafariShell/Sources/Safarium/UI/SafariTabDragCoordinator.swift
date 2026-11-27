@@ -25,6 +25,44 @@ struct TabDragVisualSnapshot {
     /// Cursor position inside `initialPillRectInScreen`, measured from bottom-left of the pill.
     let cursorOffsetInPill: NSPoint
     let sourceWindowSize: NSSize
+    let liveFrameSurface: IOSurface?
+    let hasOtherCompatibleWindows: Bool
+
+    init(
+        tabID: String,
+        title: String,
+        displayDomain: String,
+        url: URL?,
+        favicon: NSImage?,
+        pageSnapshot: NSImage?,
+        isActiveTab: Bool,
+        isStartPage: Bool,
+        isPrivate: Bool,
+        isSingleTabSourceWindow: Bool,
+        theme: AdaptiveChromeTheme,
+        initialPillRectInScreen: NSRect,
+        cursorOffsetInPill: NSPoint,
+        sourceWindowSize: NSSize,
+        liveFrameSurface: IOSurface? = nil,
+        hasOtherCompatibleWindows: Bool = true
+    ) {
+        self.tabID = tabID
+        self.title = title
+        self.displayDomain = displayDomain
+        self.url = url
+        self.favicon = favicon
+        self.pageSnapshot = pageSnapshot
+        self.isActiveTab = isActiveTab
+        self.isStartPage = isStartPage
+        self.isPrivate = isPrivate
+        self.isSingleTabSourceWindow = isSingleTabSourceWindow
+        self.theme = theme
+        self.initialPillRectInScreen = initialPillRectInScreen
+        self.cursorOffsetInPill = cursorOffsetInPill
+        self.sourceWindowSize = sourceWindowSize
+        self.liveFrameSurface = liveFrameSurface
+        self.hasOtherCompatibleWindows = hasOtherCompatibleWindows
+    }
 }
 
 /// Drop target resolved for any compatible Safarium window under the cursor.
@@ -186,8 +224,21 @@ final class SafariTabDragCoordinator: NSObject {
             }
 
             evaluateCursorTarget(screenPoint: screenPt)
-            // Immediately move panel origin to track cursor with zero latency; spring ticks on vsync!
-            applyCurrentVisualStateToPanel()
+            // Fast GPU window-drag path once morphed in a single-tab single-window drag (zero layout/CGPath/blur work).
+            if snapshot.isSingleTabSourceWindow,
+               !snapshot.hasOtherCompatibleWindows,
+               morphProgress >= 0.9999,
+               abs(currentPillWidth - targetPillWidth) < 0.01,
+               abs(trackMagnetAmount - trackMagnetTarget) < 0.01,
+               let card = cardView,
+               abs(card.bounds.width - previewSize.width) < 0.5,
+               abs(card.bounds.height - previewSize.height) < 0.5 {
+                let rect = computeCurrentCardScreenRect()
+                dragPanel?.moveOriginOnly(toScreenRect: rect, shadowPad: Self.shadowPad)
+            } else {
+                // Immediately move panel origin to track cursor with zero latency; spring ticks on vsync!
+                applyCurrentVisualStateToPanel()
+            }
         }
 
         stopDragDisplayLink()
@@ -283,6 +334,15 @@ final class SafariTabDragCoordinator: NSObject {
               let card = cardView,
               let appDelegate = NSApp.delegate as? AppDelegate else { return }
 
+        // Single-tab single-window fast path: no other windows can accept a drop, so skip orderedWindows scans.
+        if snapshot.isSingleTabSourceWindow && !snapshot.hasOtherCompatibleWindows {
+            morphTarget = 1.0
+            targetPillWidth = max(110.0, snapshot.initialPillRectInScreen.width)
+            trackMagnetTarget = 0.0
+            card.updateThemeIfChanged(snapshot.theme)
+            return
+        }
+
         let extraHysteresis: CGFloat = (morphTarget < 0.5 && lastHoverTarget != nil) ? 10.0 : 0.0
         let skipWindow = snapshot.isSingleTabSourceWindow ? sourceWindowController : nil
 
@@ -369,6 +429,15 @@ final class SafariTabDragCoordinator: NSObject {
     private func applyCurrentVisualStateToPanel(snapToExactPillRect: NSRect? = nil) {
         guard let panel = dragPanel, let card = cardView else { return }
         let cardScreenRect = snapToExactPillRect ?? computeCurrentCardScreenRect()
+        if snapToExactPillRect == nil,
+           morphProgress >= 0.9999,
+           abs(currentPillWidth - targetPillWidth) < 0.01,
+           abs(trackMagnetAmount - trackMagnetTarget) < 0.01,
+           abs(card.bounds.width - cardScreenRect.width) < 0.25,
+           abs(card.bounds.height - cardScreenRect.height) < 0.25 {
+            panel.moveOriginOnly(toScreenRect: cardScreenRect, shadowPad: Self.shadowPad)
+            return
+        }
         panel.positionCard(atScreenRect: cardScreenRect, shadowPad: Self.shadowPad)
         card.applyMorphProgress(morphProgress)
     }
@@ -489,7 +558,15 @@ final class SafariTabDragCoordinator: NSObject {
         )
 
         if snapshot.isSingleTabSourceWindow {
-            source.window?.setFrame(targetWinFrame, display: true)
+            if let win = source.window {
+                if abs(win.frame.width - targetWinFrame.width) < 0.5 &&
+                    abs(win.frame.height - targetWinFrame.height) < 0.5 {
+                    win.setFrameOrigin(targetWinFrame.origin)
+                } else {
+                    win.setFrame(targetWinFrame, display: false)
+                }
+            }
+            card.prepareForWindowBloom()
             startSettleDisplayLink(
                 panel: panel,
                 card: card,
@@ -615,7 +692,7 @@ final class SafariTabDragCoordinator: NSObject {
         panel.placeCardInsideFixedCanvas(cardScreenRect: rect)
         if state.bloomToWindowRadius {
             let cornerR = 14.0 + (SafariMetrics.windowCornerRadius - 14.0) * eased
-            card.applyMorphProgress(m, overrideCornerRadius: cornerR)
+            card.applyMorphProgress(m, overrideCornerRadius: cornerR, bloomProgress: eased)
         } else {
             card.applyMorphProgress(m)
         }
@@ -700,6 +777,16 @@ private final class TabDragCanvasPanel: NSPanel {
         cardView.translatesAutoresizingMaskIntoConstraints = true
         cardView.autoresizingMask = []
         hostContainer.addSubview(cardView)
+    }
+
+    /// Pure origin translation when card size & morph are already settled (zero layout or layer work).
+    func moveOriginOnly(toScreenRect cardRect: NSRect, shadowPad: CGFloat) {
+        currentCardScreenRect = cardRect
+        let panelOriginX = cardRect.minX - shadowPad
+        let panelOriginY = cardRect.maxY + shadowPad - frame.height
+        if abs(frame.origin.x - panelOriginX) > 0.05 || abs(frame.origin.y - panelOriginY) > 0.05 {
+            setFrameOrigin(NSPoint(x: panelOriginX, y: panelOriginY))
+        }
     }
 
     /// Positions `cardView` at exact screen coordinates WITHOUT resizing the NSPanel.
@@ -787,6 +874,14 @@ private final class TabDragMorphCardView: NSView {
     private let pillPageMenuIcon = NSImageView()
 
     private let showPageMenuIcon: Bool
+    private var lastLaidOutSize: CGSize = .zero
+    private var cachedPreviewTitleFitWidth: CGFloat = 0
+    private var cachedPreviewAvailWidth: CGFloat = -1
+    private var cachedPillTitleFitWidth: CGFloat = 0
+    private var cachedPillAvailWidth: CGFloat = -1
+    private var lastAppliedShadowMorph: CGFloat = -1
+    private var lastAppliedShadowSize: CGSize = .zero
+    private var isWindowBlooming: Bool = false
 
     init(snapshot: TabDragVisualSnapshot) {
         self.snapshot = snapshot
@@ -851,7 +946,11 @@ private final class TabDragMorphCardView: NSView {
         previewFallbackBg.wantsLayer = true
         previewContainer.addSubview(previewFallbackBg)
 
-        previewSnapshotView.setSnapshot(snapshot.pageSnapshot)
+        if let liveSurface = snapshot.liveFrameSurface {
+            previewSnapshotView.setLiveSurface(liveSurface)
+        } else {
+            previewSnapshotView.setSnapshot(snapshot.pageSnapshot)
+        }
         previewContainer.addSubview(previewSnapshotView)
 
         // --- 2. Exact Compact Tab Pill Subtree (manual frame layout, zero constraint solves) ---
@@ -889,9 +988,15 @@ private final class TabDragMorphCardView: NSView {
         let w = b.width
         let h = b.height
         guard w > 1, h > 1 else { return }
+        guard abs(w - lastLaidOutSize.width) > 0.05 || abs(h - lastLaidOutSize.height) > 0.05 else {
+            return
+        }
+        lastLaidOutSize = b.size
 
         clippedSurface.frame = b
-        frostEffectView.frame = b
+        if !frostEffectView.isHidden {
+            frostEffectView.frame = b
+        }
         surfaceTintView.frame = b
 
         // Preview subtree
@@ -904,41 +1009,54 @@ private final class TabDragMorphCardView: NSView {
         previewSnapshotView.frame = bodyRect
         previewSnapshotView.layoutSnapshotLayer()
 
-        // Centered favicon + title in preview header
+        // Centered favicon + title in preview header (cache CoreText width across translation/vertical steps)
         let pFavSz: CGFloat = 14.0
         let pGap: CGFloat = 5.0
         let pAvailW = max(20.0, w - 20.0)
-        let pTitleSize = previewTitleLabel.sizeThatFits(NSSize(width: pAvailW - pFavSz - pGap, height: 18.0))
-        let pTitleW = min(max(12.0, pAvailW - pFavSz - pGap), ceil(pTitleSize.width))
+        let maxPreviewTextW = max(12.0, pAvailW - pFavSz - pGap)
+        if abs(maxPreviewTextW - cachedPreviewAvailWidth) > 0.5 {
+            cachedPreviewAvailWidth = maxPreviewTextW
+            cachedPreviewTitleFitWidth = ceil(previewTitleLabel.sizeThatFits(NSSize(width: maxPreviewTextW, height: 18.0)).width)
+        }
+        let pTitleW = min(maxPreviewTextW, max(12.0, cachedPreviewTitleFitWidth))
         let pTotalW = pFavSz + pGap + pTitleW
         let pStartX = max(10.0, (w - pTotalW) * 0.5)
         previewFaviconView.frame = NSRect(x: pStartX, y: (headerH - pFavSz) * 0.5, width: pFavSz, height: pFavSz)
         previewTitleLabel.frame = NSRect(x: pStartX + pFavSz + pGap, y: (headerH - 16.0) * 0.5, width: pTitleW, height: 16.0)
 
-        // Pill subtree (stays pinned to top 31pt of card)
-        let pillH = SafariMetrics.tabInnerHeight
-        pillContainer.frame = NSRect(x: 0, y: 0, width: w, height: pillH)
+        // Pill subtree (stays pinned to top 31pt of card when pill is visible)
+        if (pillContainer.layer?.opacity ?? 1.0) > 0.001 {
+            let pillH = SafariMetrics.tabInnerHeight
+            pillContainer.frame = NSRect(x: 0, y: 0, width: w, height: pillH)
 
-        let leftPad: CGFloat = 10.0
-        let rightPad: CGFloat = showPageMenuIcon ? 32.0 : 10.0
-        let badgeSz = SafariMetrics.fieldIconBadgeSize
-        let gap: CGFloat = 6.0
-        let availPillW = max(24.0, w - leftPad - rightPad)
-        let titleFit = pillTitleLabel.sizeThatFits(NSSize(width: max(12.0, availPillW - badgeSz - gap), height: 18.0))
-        let titleW = min(max(12.0, availPillW - badgeSz - gap), ceil(titleFit.width))
-        let totalPillContentW = badgeSz + gap + titleW
-        let pillStartX = max(leftPad, min(w - rightPad - totalPillContentW, (w - totalPillContentW) * 0.5))
+            let leftPad: CGFloat = 10.0
+            let rightPad: CGFloat = showPageMenuIcon ? 32.0 : 10.0
+            let badgeSz = SafariMetrics.fieldIconBadgeSize
+            let gap: CGFloat = 6.0
+            let availPillW = max(24.0, w - leftPad - rightPad)
+            let maxPillTextW = max(12.0, availPillW - badgeSz - gap)
+            if abs(maxPillTextW - cachedPillAvailWidth) > 0.5 {
+                cachedPillAvailWidth = maxPillTextW
+                cachedPillTitleFitWidth = ceil(pillTitleLabel.sizeThatFits(NSSize(width: maxPillTextW, height: 18.0)).width)
+            }
+            let titleW = min(maxPillTextW, max(12.0, cachedPillTitleFitWidth))
+            let totalPillContentW = badgeSz + gap + titleW
+            let pillStartX = max(leftPad, min(w - rightPad - totalPillContentW, (w - totalPillContentW) * 0.5))
 
-        pillFaviconBadge.frame = NSRect(x: pillStartX, y: (pillH - badgeSz) * 0.5, width: badgeSz, height: badgeSz)
-        pillFaviconView.frame = NSRect(x: (badgeSz - 14.5) * 0.5, y: (badgeSz - 14.5) * 0.5, width: 14.5, height: 14.5)
-        pillTitleLabel.frame = NSRect(x: pillStartX + badgeSz + gap, y: (pillH - 17.0) * 0.5, width: titleW, height: 17.0)
-        if showPageMenuIcon {
-            pillPageMenuIcon.frame = NSRect(x: w - 11.0 - 16.0, y: (pillH - 16.0) * 0.5, width: 16.0, height: 16.0)
+            pillFaviconBadge.frame = NSRect(x: pillStartX, y: (pillH - badgeSz) * 0.5, width: badgeSz, height: badgeSz)
+            pillFaviconView.frame = NSRect(x: (badgeSz - 14.5) * 0.5, y: (badgeSz - 14.5) * 0.5, width: 14.5, height: 14.5)
+            pillTitleLabel.frame = NSRect(x: pillStartX + badgeSz + gap, y: (pillH - 17.0) * 0.5, width: titleW, height: 17.0)
+            if showPageMenuIcon {
+                pillPageMenuIcon.frame = NSRect(x: w - 11.0 - 16.0, y: (pillH - 16.0) * 0.5, width: 16.0, height: 16.0)
+            }
         }
 
-        // Update explicit GPU shadowPath so CoreAnimation NEVER renders an offscreen alpha shadow pass!
-        let r = min(lastAppliedRadius, min(w, h) * 0.5)
-        layer?.shadowPath = CGPath(roundedRect: b, cornerWidth: r, cornerHeight: r, transform: nil)
+        // Update explicit GPU shadowPath only when shadow is visible
+        if !isWindowBlooming, (layer?.shadowOpacity ?? 0) > 0.001 {
+            let r = min(lastAppliedRadius, min(w, h) * 0.5)
+            layer?.shadowPath = CGPath(roundedRect: b, cornerWidth: r, cornerHeight: r, transform: nil)
+            lastAppliedShadowSize = b.size
+        }
     }
 
     private static func makePageMenuIcon() -> NSImage {
@@ -1060,8 +1178,16 @@ private final class TabDragMorphCardView: NSView {
         CATransaction.commit()
     }
 
+    /// Disables behind-window NSVisualEffectView reallocations and shadow path updates during full-window bloom.
+    func prepareForWindowBloom() {
+        isWindowBlooming = true
+        frostEffectView.isHidden = true
+        layer?.shadowPath = nil
+        layer?.shadowOpacity = 0.0
+    }
+
     /// Drives the continuous 120Hz pill (`0.0`) <-> preview thumbnail (`1.0`) visual morph on GPU layers.
-    func applyMorphProgress(_ raw: CGFloat, overrideCornerRadius: CGFloat? = nil) {
+    func applyMorphProgress(_ raw: CGFloat, overrideCornerRadius: CGFloat? = nil, bloomProgress: CGFloat? = nil) {
         let p = max(0.0, min(1.0, raw))
         let radius = overrideCornerRadius ?? (SafariMetrics.tabInnerCornerRadius + (14.0 - SafariMetrics.tabInnerCornerRadius) * p)
         lastAppliedRadius = radius
@@ -1078,12 +1204,21 @@ private final class TabDragMorphCardView: NSView {
         previewContainer.layer?.opacity = Float(previewAlpha)
         clippedSurface.layer?.opacity = Float(1.0 - 0.03 * p)
 
-        layer?.shadowOpacity = Float(0.16 + (0.28 - 0.16) * p)
-        layer?.shadowRadius = 9.0 + (22.0 - 9.0) * p
-        layer?.shadowOffset = CGSize(width: 0, height: 3.0 + (8.0 - 3.0) * p)
-        if bounds.width > 1, bounds.height > 1 {
-            let r = min(radius, min(bounds.width, bounds.height) * 0.5)
-            layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: r, cornerHeight: r, transform: nil)
+        if isWindowBlooming || bloomProgress != nil {
+            if (layer?.shadowOpacity ?? 0) > 0.001 {
+                layer?.shadowOpacity = 0.0
+                layer?.shadowPath = nil
+            }
+        } else if abs(p - lastAppliedShadowMorph) > 0.002 || bounds.size != lastAppliedShadowSize {
+            lastAppliedShadowMorph = p
+            lastAppliedShadowSize = bounds.size
+            layer?.shadowOpacity = Float(0.16 + (0.28 - 0.16) * p)
+            layer?.shadowRadius = 9.0 + (22.0 - 9.0) * p
+            layer?.shadowOffset = CGSize(width: 0, height: 3.0 + (8.0 - 3.0) * p)
+            if bounds.width > 1, bounds.height > 1 {
+                let r = min(radius, min(bounds.width, bounds.height) * 0.5)
+                layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: r, cornerHeight: r, transform: nil)
+            }
         }
 
         CATransaction.commit()
@@ -1091,10 +1226,11 @@ private final class TabDragMorphCardView: NSView {
 }
 
 /// Pure GPU `CALayer` top-aligned edge-to-edge Retina snapshot view (0 CPU bitmap draws at 120Hz).
-/// Non-flipped (`isFlipped == false`) so `CGImage` always composites right-side up directly on GPU.
+/// Non-flipped (`isFlipped == false`) so `CGImage` / `IOSurface` always composites right-side up directly on GPU.
 private final class GPUEdgeToEdgeSnapshotView: NSView {
     private let imageLayer = CALayer()
     private var pixelSize: CGSize = .zero
+    private var usingLiveSurface: Bool = false
 
     override var isFlipped: Bool { false }
 
@@ -1110,7 +1246,22 @@ private final class GPUEdgeToEdgeSnapshotView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    func setLiveSurface(_ surface: IOSurface?) {
+        guard let surface else { return }
+        let w = CGFloat(IOSurfaceGetWidth(surface))
+        let h = CGFloat(IOSurfaceGetHeight(surface))
+        guard w > 1, h > 1 else { return }
+        usingLiveSurface = true
+        pixelSize = CGSize(width: w, height: h)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        imageLayer.contents = surface
+        layoutSnapshotLayer()
+        CATransaction.commit()
+    }
+
     func setSnapshot(_ image: NSImage?) {
+        if usingLiveSurface { return }
         guard let image,
               let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             imageLayer.contents = nil

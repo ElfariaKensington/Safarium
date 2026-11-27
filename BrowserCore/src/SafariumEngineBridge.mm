@@ -15,6 +15,7 @@
 #include "include/cef_browser.h"
 #include "include/cef_cookie.h"
 #include "include/cef_request_context_handler.h"
+#include "include/cef_string_visitor.h"
 #include "include/cef_task.h"
 #include "include/cef_version.h"
 #include "include/wrapper/cef_closure_task.h"
@@ -23,6 +24,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 #import <QuartzCore/QuartzCore.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/runtime.h>
 #import <IOSurface/IOSurface.h>
 
@@ -783,12 +785,9 @@ static FILE *SXFreezeDebugFile(void) {
 // empty new view is on screen from the next frame. Watching -setHidden: lets the freeze frame go up in that same
 // AppKit transaction, so no blank frame is ever presented.
 static void (*gSXOrigRWHVSetHidden)(id, SEL, BOOL) = NULL;
+static void (*gSXOrigRWHVRemoveFromSuperview)(id, SEL) = NULL;
 
-static void SXRWHVSetHidden(id self, SEL _cmd, BOOL hidden) {
-  NSView *view = (NSView *)self;
-  BOOL changed = (view.isHidden != hidden);
-  if (gSXOrigRWHVSetHidden) gSXOrigRWHVSetHidden(self, _cmd, hidden);
-  if (!changed) return;
+static void SXNotifyHostTabRenderWidgetSwap(NSView *view) {
   for (NSView *v = view.superview; v; v = v.superview) {
     if ([v isKindOfClass:[SXBrowserHostView class]]) {
       SXBrowserHostView *host = (SXBrowserHostView *)v;
@@ -799,20 +798,56 @@ static void SXRWHVSetHidden(id self, SEL _cmd, BOOL hidden) {
   }
 }
 
+static void SXRWHVSetHidden(id self, SEL _cmd, BOOL hidden) {
+  NSView *view = (NSView *)self;
+  BOOL changed = (view.isHidden != hidden);
+  if (changed) {
+    // Pin the freeze overlay BEFORE Chromium hides/shows the view so the cover lands in the same
+    // AppKit transaction while the view hierarchy is still intact.
+    SXNotifyHostTabRenderWidgetSwap(view);
+  }
+  if (gSXOrigRWHVSetHidden) gSXOrigRWHVSetHidden(self, _cmd, hidden);
+}
+
+static void SXRWHVRemoveFromSuperview(id self, SEL _cmd) {
+  NSView *view = (NSView *)self;
+  if (!view.isHidden && view.superview) {
+    SXNotifyHostTabRenderWidgetSwap(view);
+  }
+  if (gSXOrigRWHVRemoveFromSuperview) gSXOrigRWHVRemoveFromSuperview(self, _cmd);
+}
+
 static void SXInstallRenderWidgetVisibilityHook(void) {
   static dispatch_once_t once;
   dispatch_once(&once, ^{
     Class cls = NSClassFromString(@"RenderWidgetHostViewCocoa");
-    SEL sel = @selector(setHidden:);
-    Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;
-    if (!m) return;
-    IMP hook = (IMP)SXRWHVSetHidden;
-    IMP inherited = method_getImplementation(m);
+    if (!cls) return;
     // Override on RenderWidgetHostViewCocoa only (never swap NSView's own implementation).
-    if (class_addMethod(cls, sel, hook, method_getTypeEncoding(m))) {
-      gSXOrigRWHVSetHidden = (void (*)(id, SEL, BOOL))inherited;
-    } else {
-      gSXOrigRWHVSetHidden = (void (*)(id, SEL, BOOL))method_setImplementation(m, hook);
+    {
+      SEL sel = @selector(setHidden:);
+      Method m = class_getInstanceMethod(cls, sel);
+      if (m) {
+        IMP hook = (IMP)SXRWHVSetHidden;
+        IMP inherited = method_getImplementation(m);
+        if (class_addMethod(cls, sel, hook, method_getTypeEncoding(m))) {
+          gSXOrigRWHVSetHidden = (void (*)(id, SEL, BOOL))inherited;
+        } else {
+          gSXOrigRWHVSetHidden = (void (*)(id, SEL, BOOL))method_setImplementation(m, hook);
+        }
+      }
+    }
+    {
+      SEL sel = @selector(removeFromSuperview);
+      Method m = class_getInstanceMethod(cls, sel);
+      if (m) {
+        IMP hook = (IMP)SXRWHVRemoveFromSuperview;
+        IMP inherited = method_getImplementation(m);
+        if (class_addMethod(cls, sel, hook, method_getTypeEncoding(m))) {
+          gSXOrigRWHVRemoveFromSuperview = (void (*)(id, SEL))inherited;
+        } else {
+          gSXOrigRWHVRemoveFromSuperview = (void (*)(id, SEL))method_setImplementation(m, hook);
+        }
+      }
     }
   });
 }
@@ -1146,6 +1181,7 @@ class SXDevToolsClient : public CefClient,
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
 
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+    [[SXEngineRuntime sharedRuntime] noteBrowserCreated];
     if (!browser || !browser->GetHost()) return;
     NSView *devView = CAST_CEF_WINDOW_HANDLE_TO_NSVIEW(browser->GetHost()->GetWindowHandle());
     SXBrowserTab *strongTab = tab_;
@@ -1187,6 +1223,7 @@ class SXDevToolsClient : public CefClient,
 
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
     (void)browser;
+    [[SXEngineRuntime sharedRuntime] noteBrowserClosed];
     SXBrowserTab *strongTab = tab_;
     if (strongTab) {
       dispatch_async(dispatch_get_main_queue(), ^{
@@ -1238,6 +1275,7 @@ class SXAuthPopupClient : public CefClient,
   }
 
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+    [[SXEngineRuntime sharedRuntime] noteBrowserCreated];
     SXBrowserTab *strongTab = tab_;
     if (strongTab) {
       [strongTab handleAuthPopupBrowserCreated:browser];
@@ -1278,16 +1316,19 @@ class SXAuthPopupClient : public CefClient,
   }
 
   bool DoClose(CefRefPtr<CefBrowser> browser) override {
+    bool stillAttachedToWindow = false;
     if (browser && browser->GetHost()) {
       NSView *cefView = CAST_CEF_WINDOW_HANDLE_TO_NSVIEW(browser->GetHost()->GetWindowHandle());
       if (cefView && cefView.superview) {
         [cefView removeFromSuperview];
       }
+      stillAttachedToWindow = (cefView && cefView.window != nil);
     }
-    return true;
+    return stillAttachedToWindow;
   }
 
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
+    [[SXEngineRuntime sharedRuntime] noteBrowserClosed];
     SXBrowserTab *strongTab = tab_;
     if (strongTab) {
       dispatch_async(dispatch_get_main_queue(), ^{
@@ -1328,6 +1369,62 @@ class SXAuthPopupClient : public CefClient,
   (void)notification;
   [self.ownerTab closeDevTools];
 }
+@end
+
+@interface SXSaveFormatAccessoryController : NSObject
+@property (nonatomic, weak, nullable) NSSavePanel *panel;
+@property (nonatomic, strong) NSPopUpButton *formatPopup;
+@property (nonatomic, strong) NSView *accessoryView;
+- (instancetype)initWithPanel:(NSSavePanel *)panel;
+- (void)formatChanged:(id)sender;
+@end
+
+@implementation SXSaveFormatAccessoryController
+
+- (instancetype)initWithPanel:(NSSavePanel *)panel {
+  if ((self = [super init])) {
+    _panel = panel;
+    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 320, 44)];
+    NSTextField *label = [NSTextField labelWithString:@"Format:"];
+    label.font = [NSFont systemFontOfSize:13.0];
+    label.alignment = NSTextAlignmentRight;
+    label.frame = NSMakeRect(16, 12, 64, 20);
+    [container addSubview:label];
+
+    NSPopUpButton *popup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(88, 9, 212, 26) pullsDown:NO];
+    [popup addItemWithTitle:@"Page Source"];
+    [popup addItemWithTitle:@"PDF"];
+    [popup selectItemAtIndex:0];
+    popup.target = self;
+    popup.action = @selector(formatChanged:);
+    [container addSubview:popup];
+
+    _formatPopup = popup;
+    _accessoryView = container;
+  }
+  return self;
+}
+
+- (void)formatChanged:(id)sender {
+  (void)sender;
+  NSSavePanel *panel = self.panel;
+  if (!panel) return;
+  BOOL isPDF = (self.formatPopup.indexOfSelectedItem == 1);
+  if (@available(macOS 11.0, *)) {
+    panel.allowedContentTypes = isPDF ? @[UTTypePDF] : @[UTTypeHTML];
+  } else {
+    panel.allowedFileTypes = isPDF ? @[@"pdf"] : @[@"html", @"htm"];
+  }
+  NSString *currentName = panel.nameFieldStringValue ?: @"Untitled";
+  NSString *stem = currentName;
+  NSString *lowerExt = currentName.pathExtension.lowercaseString;
+  if ([lowerExt isEqualToString:@"html"] || [lowerExt isEqualToString:@"htm"] || [lowerExt isEqualToString:@"pdf"]) {
+    stem = [currentName stringByDeletingPathExtension];
+  }
+  if (stem.length == 0) stem = @"Untitled";
+  panel.nameFieldStringValue = [stem stringByAppendingPathExtension:(isPDF ? @"pdf" : @"html")];
+}
+
 @end
 
 @implementation SXBrowserTab
@@ -2517,6 +2614,29 @@ class SXPdfPrintCallback : public CefPdfPrintCallback {
   void (^completion_)(BOOL);
   IMPLEMENT_REFCOUNTING(SXPdfPrintCallback);
 };
+
+class SXPageSourceVisitor : public CefStringVisitor {
+ public:
+  explicit SXPageSourceVisitor(void (^completion)(NSString * _Nullable))
+      : completion_([completion copy]) {}
+  void Visit(const CefString& string) override {
+    if (!completion_) return;
+    std::string utf8 = string.ToString();
+    NSString *html = [[NSString alloc] initWithBytes:utf8.data()
+                                              length:utf8.size()
+                                            encoding:NSUTF8StringEncoding];
+    if (!html) {
+      html = [NSString stringWithUTF8String:utf8.c_str()] ?: @"";
+    }
+    void (^cb)(NSString * _Nullable) = completion_;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      cb(html);
+    });
+  }
+ private:
+  void (^completion_)(NSString * _Nullable);
+  IMPLEMENT_REFCOUNTING(SXPageSourceVisitor);
+};
 }  // namespace
 
 - (void)executeJavaScript:(NSString *)script {
@@ -2610,6 +2730,131 @@ class SXPdfPrintCallback : public CefPdfPrintCallback {
   settings.prefer_css_page_size = 1;
   CefRefPtr<CefPdfPrintCallback> cb = new SXPdfPrintCallback(completion);
   _browser->GetHost()->PrintToPDF(CefString(filePath.UTF8String), settings, cb);
+}
+
+- (void)getPageSourceWithCompletion:(void (^)(NSString * _Nullable htmlSource))completion {
+  if (!completion) return;
+  if (_isClosed || !_browser) {
+    dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+    return;
+  }
+  CefRefPtr<CefBrowser> targetBrowser = _browser;
+  void (^cb)(NSString * _Nullable) = [completion copy];
+  CefPostTask(TID_UI, CefCreateClosureTask(base::BindOnce(
+      ^(CefRefPtr<CefBrowser> b) {
+        CefRefPtr<CefFrame> mainFrame = b ? b->GetMainFrame() : nullptr;
+        if (!mainFrame || !mainFrame->IsValid()) {
+          dispatch_async(dispatch_get_main_queue(), ^{ cb(nil); });
+          return;
+        }
+        mainFrame->GetSource(new SXPageSourceVisitor(cb));
+      },
+      targetBrowser)));
+}
+
+static NSString *SXSanitizedSaveFileBaseName(NSString * _Nullable title, NSURL * _Nullable url) {
+  NSString *candidate = [title stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  if (candidate.length == 0) {
+    NSString *last = url.lastPathComponent;
+    if (last.length > 0 && ![last isEqualToString:@"/"]) {
+      candidate = last;
+    } else if (url.host.length > 0) {
+      candidate = url.host;
+    } else {
+      candidate = @"Untitled";
+    }
+  }
+  NSString *ext = candidate.pathExtension.lowercaseString;
+  if ([ext isEqualToString:@"html"] || [ext isEqualToString:@"htm"] || [ext isEqualToString:@"pdf"]) {
+    NSString *stripped = [candidate stringByDeletingPathExtension];
+    if (stripped.length > 0) candidate = stripped;
+  }
+  NSMutableCharacterSet *illegal = [NSMutableCharacterSet characterSetWithCharactersInString:@"/:\\?%*|\"<>"];
+  [illegal formUnionWithCharacterSet:[NSCharacterSet controlCharacterSet]];
+  [illegal formUnionWithCharacterSet:[NSCharacterSet newlineCharacterSet]];
+  NSArray<NSString *> *parts = [candidate componentsSeparatedByCharactersInSet:illegal];
+  NSString *clean = [[parts componentsJoinedByString:@"-"]
+      stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  while ([clean hasPrefix:@"."]) {
+    clean = [clean substringFromIndex:1];
+  }
+  if (clean.length > 120) {
+    clean = [clean substringToIndex:120];
+  }
+  return clean.length > 0 ? clean : @"Untitled";
+}
+
+- (void)savePageWithPanelForWindow:(nullable NSWindow *)window
+                        completion:(nullable void (^)(BOOL saved, NSURL * _Nullable savedURL))completion {
+  if (_isClosed || !_browser) {
+    if (completion) {
+      dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, nil); });
+    }
+    return;
+  }
+
+  dispatch_block_t presentPanel = ^{
+    if (self->_isClosed || !self->_browser) {
+      if (completion) completion(NO, nil);
+      return;
+    }
+    NSSavePanel *panel = [NSSavePanel savePanel];
+    panel.canCreateDirectories = YES;
+    panel.extensionHidden = NO;
+    NSString *baseName = SXSanitizedSaveFileBaseName(self.title, self.currentURL);
+    panel.nameFieldStringValue = [baseName stringByAppendingPathExtension:@"html"];
+    if (@available(macOS 11.0, *)) {
+      panel.allowedContentTypes = @[UTTypeHTML];
+    } else {
+      panel.allowedFileTypes = @[@"html", @"htm"];
+    }
+    SXSaveFormatAccessoryController *accessory = [[SXSaveFormatAccessoryController alloc] initWithPanel:panel];
+    panel.accessoryView = accessory.accessoryView;
+
+    __weak SXBrowserTab *weakSelf = self;
+    void (^handleResult)(NSModalResponse) = ^(NSModalResponse response) {
+      SXBrowserTab *strongSelf = weakSelf;
+      // Keep accessory alive until panel finishes.
+      BOOL isPDF = (accessory.formatPopup.indexOfSelectedItem == 1);
+      if (response != NSModalResponseOK || !panel.URL || !strongSelf || strongSelf->_isClosed) {
+        if (completion) completion(NO, nil);
+        return;
+      }
+      NSURL *destURL = panel.URL;
+      if (isPDF || [destURL.pathExtension.lowercaseString isEqualToString:@"pdf"]) {
+        [strongSelf exportToPDFAtPath:destURL.path completion:^(BOOL success) {
+          if (completion) completion(success, success ? destURL : nil);
+        }];
+      } else {
+        [strongSelf getPageSourceWithCompletion:^(NSString * _Nullable htmlSource) {
+          if (!htmlSource) {
+            if (completion) completion(NO, nil);
+            return;
+          }
+          NSError *writeErr = nil;
+          BOOL ok = [htmlSource writeToURL:destURL
+                                atomically:YES
+                                  encoding:NSUTF8StringEncoding
+                                     error:&writeErr];
+          if (completion) completion(ok, ok ? destURL : nil);
+        }];
+      }
+    };
+
+    NSWindow *targetWindow = window ?: self.hostView.window;
+    if (targetWindow && targetWindow.isVisible) {
+      [panel beginSheetModalForWindow:targetWindow completionHandler:handleResult];
+    } else {
+      NSModalResponse resp = [panel runModal];
+      handleResult(resp);
+    }
+  };
+
+  if ([NSThread isMainThread]) {
+    presentPanel();
+  } else {
+    dispatch_async(dispatch_get_main_queue(), presentPanel);
+  }
 }
 
 - (void)setAudioMuted:(BOOL)muted {
@@ -3447,12 +3692,105 @@ class SXPdfPrintCallback : public CefPdfPrintCallback {
     _freezeCommittedGeneration = _freezeGeneration;
     _freezeImage = nil;
   }
+  if (fromBFCache && _freezeOverlay && _client && [self freezeFrameEligibleForCapture]) {
+    // On a BFCache restore (or tab re-show), Blink's rAF fires BEFORE Viz finishes re-rasterizing
+    // the evicted tiles and submitting the new IOSurface/CAContext to WindowServer (~70-100ms).
+    // Queueing a priority CopyFromSurface on the restored RenderWidgetHostView acts as an exact
+    // Viz compositor frame-presentation barrier AND refreshes _standbyImage in the same round-trip.
+    NSUInteger readyGen = _freezeGeneration;
+    CGFloat scale = self.hostView.window.backingScaleFactor;
+    if (scale < 1.0) scale = 2.0;
+    CGFloat capturedScrollY = self.scrollY;
+    NSInteger capturedEntryID = self.currentNavigationEntryID;
+    CFTimeInterval capturedHiddenGen = _tabHiddenAt;
+    __weak SXBrowserTab *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+      SXBrowserTab *strongSelf = weakSelf;
+      if (strongSelf && strongSelf->_freezeGeneration == readyGen && strongSelf->_freezeOverlay) {
+        SXFreezeLog(@"bfcache-barrier-timeout gen=%lu", (unsigned long)readyGen);
+        [strongSelf removeFreezeFrame];
+      }
+    });
+    _client->CaptureFreezeFramePNG([weakSelf, readyGen, scale, capturedScrollY, capturedEntryID, capturedHiddenGen](const std::string& pngBytes) {
+      NSData *data = pngBytes.empty() ? nil : [NSData dataWithBytes:pngBytes.data() length:pngBytes.size()];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        SXBrowserTab *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf->_isClosed) return;
+        if (strongSelf->_freezeGeneration == readyGen && strongSelf->_freezeOverlay) {
+          SXFreezeLog(@"bfcache-barrier-done gen=%lu bytes=%zu", (unsigned long)readyGen, pngBytes.size());
+          // Wait one CA commit turn (16ms) after Viz fulfills CopyFromSurface so WindowServer
+          // has latched the restored CALayerHost IOSurface before dropping the cover.
+          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+            SXBrowserTab *s2 = weakSelf;
+            if (s2 && s2->_freezeGeneration == readyGen && s2->_freezeOverlay) {
+              [s2 removeFreezeFrame];
+            }
+          });
+        }
+      });
+      if (!data) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+          [weakSelf capturePeriodicPreviewIfEligibleForce:YES];
+        });
+        return;
+      }
+      dispatch_async(SXPreviewSnapshotDecodeQueue(), ^{
+        CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+        if (!src) return;
+        NSDictionary *opts = @{ (__bridge NSString *)kCGImageSourceShouldCacheImmediately : @YES };
+        CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, (__bridge CFDictionaryRef)opts);
+        CFRelease(src);
+        if (!img) return;
+        id surface = SXCopyImageToIOSurface(img);
+        CGImageRelease(img);
+        if (!surface) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+          SXBrowserTab *strongSelf = weakSelf;
+          if (!strongSelf || strongSelf->_isClosed || !strongSelf->_tabActiveState) return;
+          if (strongSelf->_tabHiddenAt != capturedHiddenGen) return;
+          if (strongSelf->_freezeGeneration == readyGen && capturedEntryID == strongSelf.currentNavigationEntryID) {
+            strongSelf->_standbyImage = surface;
+            strongSelf->_standbyScale = scale;
+            strongSelf->_standbyCapturedAt = CACurrentMediaTime();
+            strongSelf->_standbyScrollY = capturedScrollY;
+          }
+        });
+      });
+    }, /*priority=*/true);
+    return;
+  }
   [self removeFreezeFrame];
-  // Refresh the standing copy for the new page soon (back/forward-cache restores don't fire load-end captures).
+  // Refresh the standing copy for the new page promptly (back/forward-cache restores don't fire load-end captures,
+  // and script-triggered history.back() needs a fresh standby copy quickly).
   __weak SXBrowserTab *weakSelf = self;
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
     [weakSelf capturePeriodicPreviewIfEligibleForce:YES];
   });
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    [weakSelf capturePeriodicPreviewIfEligibleForce:YES];
+  });
+}
+
+- (void)handleScriptTraverseNavigation {
+  if (_isClosed || _freezeOverlay) return;
+  // Script-triggered history.back() / history.forward() / history.go() starts in the renderer
+  // before Chromium empties the old view's remote CALayerHost or swaps RenderWidgetHostViewCocoa.
+  // When the standing copy already matches the screen, pin it directly WITHOUT queuing a
+  // redundant CaptureFreezeFramePNG of the departing page (which would stall the Viz barrier).
+  SXFreezeLog(@"traverse gen=%lu standby=%d", (unsigned long)_freezeGeneration, _standbyImage != nil);
+  if ([self standbyImageMatchesScreen]) {
+    _freezeGeneration += 1;
+    _freezeRequestedAt = CACurrentMediaTime();
+    _freezeIncomingGeneration = _freezeGeneration;
+    _freezeImage = _standbyImage;
+    _freezeImageScale = _standbyScale;
+    _freezeCapturedAt = CACurrentMediaTime();
+    [self presentFreezeFrameIfReady];
+    return;
+  }
+  [self handleMainFrameNavigationWillStart];
+  _freezeIncomingGeneration = _freezeGeneration;
+  [self presentFreezeFrameIfReady];
 }
 
 #pragma mark Navigation freeze frame
@@ -3495,20 +3833,21 @@ static const CFTimeInterval kSXFreezeFrameMaxImageAge = 4.0;    // capture older
   }
   if ([self standbyImageMatchesScreen]) {
     // Until the fresh copy arrives, the standing one covers a very fast commit.
+    // Refresh _freezeCapturedAt so presentFreezeFrameIfReady never rejects a valid standby copy on age mismatch.
     _freezeImage = _standbyImage;
     _freezeImageScale = _standbyScale;
-    _freezeCapturedAt = _standbyCapturedAt;
+    _freezeCapturedAt = CACurrentMediaTime();
   }
   {
     // A navigation that never gets going (Chromium skipping a history entry, a cancelled load) must not leave
     // the state pending: that would block standby refreshes and ignore the next ready signal.
     NSUInteger startGen = _freezeGeneration;
     __weak SXBrowserTab *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
       SXBrowserTab *strongSelf = weakSelf;
       if (!strongSelf || strongSelf->_freezeGeneration != startGen) return;
       if (strongSelf->_freezeCommittedGeneration == startGen || strongSelf->_freezeIncomingGeneration == startGen) return;
-      if (strongSelf.loading) return;
+      if (strongSelf.loading || (strongSelf->_browser && strongSelf->_browser->IsLoading())) return;
       SXFreezeLog(@"abandon gen=%lu", (unsigned long)startGen);
       strongSelf->_freezeCommittedGeneration = startGen;
       strongSelf->_freezeImage = nil;
@@ -3593,6 +3932,7 @@ static const CFTimeInterval kSXFreezeFrameMaxImageAge = 4.0;    // capture older
   overlay.layer.contents = image;
   [host addSubview:overlay positioned:NSWindowAbove relativeTo:nil];
   [CATransaction commit];
+  [CATransaction flush];
   _freezeOverlay = overlay;
   _freezeImage = nil;
   SXFreezeLog(@"present gen=%lu", (unsigned long)_freezeGeneration);
@@ -3616,7 +3956,7 @@ static const CFTimeInterval kSXFreezeFrameMaxImageAge = 4.0;    // capture older
   if (!_freezeImage && [self standbyImageMatchesScreen]) {
     _freezeImage = _standbyImage;
     _freezeImageScale = _standbyScale;
-    _freezeCapturedAt = _standbyCapturedAt;
+    _freezeCapturedAt = CACurrentMediaTime();
   }
   [self presentFreezeFrameIfReady];
 }
@@ -3743,7 +4083,7 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
 
 - (BOOL)standbyImageMatchesScreen {
   if (!_standbyImage || ![self freezeFrameEligibleForCapture]) return NO;
-  if ((CACurrentMediaTime() - _standbyCapturedAt) > 6.0) return NO;
+  if ((CACurrentMediaTime() - _standbyCapturedAt) > 30.0) return NO;
   // The copy is dropped at every commit, so it always shows the current document; the history entry ID can't be
   // compared here because Chromium has already switched it to the destination by the time the views swap.
   if (fabs(_standbyScrollY - self.scrollY) > 1.0) return NO;
@@ -4065,6 +4405,7 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
   std::unordered_map<uint32_t, CefRefPtr<CefDownloadItemCallback>> _downloads;
   std::mutex _prefsMutex;
   NSDictionary<NSString *, id> *_latestPreferences;
+  std::atomic<int> _liveBrowserCount;
 }
 
 @property (nonatomic, readwrite, getter=isInitialized) BOOL initialized;
@@ -4311,11 +4652,14 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
     }
   }
 
-  // Ad-hoc signed local builds may be blocked by macOS hardened sandbox extension checks
-  // unless signed with a Developer ID; allow explicit opt-in via SAFARIUM_ENABLE_SANDBOX=1.
-  const char *enableSandbox = getenv("SAFARIUM_ENABLE_SANDBOX");
-  BOOL useSandbox =
-      hasBundledHelpers && enableSandbox && strcmp(enableSandbox, "1") == 0;
+  // Enable Chromium's macOS OS sandbox by default whenever bundled helpers and libcef_sandbox.dylib
+  // are present inside a .app bundle. Allow explicit opt-out via SAFARIUM_DISABLE_SANDBOX=1 for
+  // unbundled development or debugging runs.
+  NSString *sandboxLibPath = [frameworkPath stringByAppendingPathComponent:@"Libraries/libcef_sandbox.dylib"];
+  BOOL hasSandboxLib = [[NSFileManager defaultManager] fileExistsAtPath:sandboxLibPath];
+  const char *disableSandbox = getenv("SAFARIUM_DISABLE_SANDBOX");
+  BOOL sandboxDisabled = (disableSandbox && strcmp(disableSandbox, "1") == 0);
+  BOOL useSandbox = hasBundledHelpers && hasSandboxLib && !sandboxDisabled;
   settings.no_sandbox = useSandbox ? false : true;
 
   if (config.locale.length > 0) {
@@ -4616,6 +4960,21 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
 
 - (void)tabDidClose:(SXBrowserTab *)tab {
   [self.mutableTabs removeObject:tab];
+}
+
+- (void)noteBrowserCreated {
+  _liveBrowserCount.fetch_add(1, std::memory_order_acq_rel);
+}
+
+- (void)noteBrowserClosed {
+  int prev = _liveBrowserCount.fetch_sub(1, std::memory_order_acq_rel);
+  if (prev <= 0) {
+    _liveBrowserCount.store(0, std::memory_order_release);
+  }
+}
+
+- (NSInteger)liveBrowserCount {
+  return (NSInteger)_liveBrowserCount.load(std::memory_order_acquire);
 }
 
 - (void)registerDownloadCallback:(CefRefPtr<CefDownloadItemCallback>)callback
@@ -5171,8 +5530,6 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
     return;
   }
 
-  [[SXExtensionManager sharedManager] shutdown];
-
   [self.pumpTimer invalidate];
   self.pumpTimer = nil;
   if (self.scrollPhaseMonitor) {
@@ -5180,31 +5537,61 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
     self.scrollPhaseMonitor = nil;
   }
 
-  NSArray<SXBrowserTab *> *tabs = [self.mutableTabs copy];
-  for (SXBrowserTab *tab in tabs) {
-    [tab closeTab];
-  }
-
-  // Pump briefly so browsers complete OnBeforeClose before CefShutdown.
-  for (int i = 0; i < 20 && self.mutableTabs.count > 0; ++i) {
-    CefDoMessageLoopWork();
-    [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
-                             beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
-  }
-
+  // Cancel and drop any tracked download callbacks before closing browsers.
   {
     std::lock_guard<std::mutex> lock(_downloadMutex);
     _downloads.clear();
   }
 
+  // Initiate forced close on every open tab, then drop strong tab references so no
+  // CefRefPtr<SXBrowserClient> or host NSView stays pinned across shutdown.
+  {
+    NSArray<SXBrowserTab *> *tabs = [self.mutableTabs copy];
+    for (SXBrowserTab *tab in tabs) {
+      [tab closeTab];
+    }
+  }
+
+  // Shut down extension popups, popout windows, and hidden admin loader browsers.
+  [[SXExtensionManager sharedManager] shutdown];
+
+  // Release any off-the-record CefRequestContext before CefShutdown so CEF never hits
+  // a live-object DCHECK on exit.
+  _incognitoRequestContext = nullptr;
+
+  // Pump the CEF message loop + NSRunLoop until EVERY tracked CefBrowser has completed
+  // OnBeforeClose (up to 2.5s ceiling; exits immediately once liveBrowserCount reaches 0).
+  for (int i = 0; i < 250 && (self.mutableTabs.count > 0 || [self liveBrowserCount] > 0); ++i) {
+    CefDoMessageLoopWork();
+    [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                             beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+  }
+
+  // Drain a few extra iterations so deferred UI-thread browser teardown tasks complete cleanly.
+  for (int i = 0; i < 5; ++i) {
+    CefDoMessageLoopWork();
+    [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                             beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.005]];
+  }
+
+  [self.mutableTabs removeAllObjects];
   self.initialized = NO;
   _contextInitialized = NO;
-  CefShutdown();
-  _app = nullptr;
 
-  if (_cefLoaded) {
-    cef_unload_library();
-    _cefLoaded = NO;
+  // Only invoke CefShutdown() when every CefBrowser has cleanly reached OnBeforeClose;
+  // calling CefShutdown() with a wedged browser still alive triggers a fatal CEF SIGTRAP.
+  if ([self liveBrowserCount] <= 0) {
+    CefShutdown();
+    _app = nullptr;
+    if (_cefLoaded) {
+      cef_unload_library();
+      _cefLoaded = NO;
+    }
+  } else {
+    fprintf(stderr, "[BrowserCore] Skipping CefShutdown with %ld live browser(s) remaining after timeout\n",
+            (long)[self liveBrowserCount]);
+    fflush(stderr);
+    _app = nullptr;
   }
 }
 

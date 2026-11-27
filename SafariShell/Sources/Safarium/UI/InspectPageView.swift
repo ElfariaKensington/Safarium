@@ -47,7 +47,7 @@ struct InspectEndpointDiscoveryResult: Equatable {
     let isReachable: Bool
 }
 
-/// Native macOS AppKit implementation of `chrome://inspect` and `chrome://inspect/#remote-debugging`
+/// Native macOS AppKit implementation of `safarium://inspect` and `safarium://inspect/#remote-debugging`
 /// hosted directly inside a Safarium tab (matching Chromium 156's Inspect UI & Remote Debugging workflow).
 final class InspectPageView: NSView, NSTextFieldDelegate {
 
@@ -459,7 +459,7 @@ final class InspectPageView: NSView, NSTextFieldDelegate {
         }
     }
 
-    // MARK: - 1. Remote Debugging (`chrome://inspect/#remote-debugging`)
+    // MARK: - 1. Remote Debugging (`safarium://inspect/#remote-debugging`)
 
     private func buildRemoteDebuggingSection() {
         let settings = BrowserSettings.shared
@@ -600,7 +600,7 @@ final class InspectPageView: NSView, NSTextFieldDelegate {
         addCardToContent(statusCard)
     }
 
-    // MARK: - 2. Devices (`chrome://inspect` / `chrome://inspect/#devices`)
+    // MARK: - 2. Devices (`safarium://inspect` / `safarium://inspect/#devices`)
 
     private func buildDevicesSection() {
         addSectionHeader(
@@ -710,7 +710,7 @@ final class InspectPageView: NSView, NSTextFieldDelegate {
         }
     }
 
-    // MARK: - 3. Pages (`chrome://inspect/#pages`)
+    // MARK: - 3. Pages (`safarium://inspect/#pages`)
 
     private func buildPagesSection() {
         addSectionHeader(
@@ -791,7 +791,7 @@ final class InspectPageView: NSView, NSTextFieldDelegate {
         addCardToContent(card)
     }
 
-    // MARK: - 4. Extensions (`chrome://inspect/#extensions`)
+    // MARK: - 4. Extensions (`safarium://inspect/#extensions`)
 
     private func buildExtensionsSection() {
         addSectionHeader(

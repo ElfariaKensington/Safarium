@@ -8,9 +8,17 @@ import UniformTypeIdentifiers
 /// (`23 pt` pitch), exact `52.0 pt` unified titlebar chrome, and artifact-free `26 pt` continuous corners.
 final class SafariWindow: NSWindow, NSDraggingDestination {
     var onDropURL: ((URL, Bool) -> Void)?
+    var onPerformKeyEquivalent: ((NSEvent) -> Bool)?
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if onPerformKeyEquivalent?(event) == true {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 
     func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         return Self.extractDroppedURL(from: sender.draggingPasteboard) != nil ? .copy : []
@@ -359,6 +367,19 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         guard let url = activeTab?.currentURL,
               url.isWebURL else { return nil }
         return url.absoluteString
+    }
+
+    var canSaveActiveTab: Bool {
+        guard let tab = activeTab else { return false }
+        return !tab.isNativeInternalPage && tabLoadErrors[tab.tabID] == nil
+    }
+
+    func dismissExtensionPopover(restoreParentKey: Bool = true) {
+        extensionPopoverController.close(restoreParentKey: restoreParentKey)
+    }
+
+    private func visibleExtensionsForWindow(_ extensions: [BrowserExtensionItem]) -> [BrowserExtensionItem] {
+        isPrivate ? extensions.filter(\.allowInPrivate) : extensions
     }
 
     func openWebsitesSummary() -> [(host: String, favicon: NSImage?)] {
@@ -745,16 +766,26 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         // Left Group 2: `[ < ]` / `[ < | > ]` — completely hidden (width 0) when no Back/Forward history (`#56`)
         backForwardCluster.addArrangedView(backForwardCapsule)
         backForwardCluster.isHidden = true
+        backForwardCluster.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        backForwardCapsule.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         toolbarBarView.addSubview(backForwardCluster)
+        backForwardCapsule.setHidden(true, for: "back", animated: false)
         backForwardCapsule.setHidden(true, for: "forward", animated: false)
 
         // Left Privacy Shield button (shows live per-site Privacy Popover)
         privacyShieldCluster.addArrangedView(privacyShieldCapsule)
+        privacyShieldCluster.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        privacyShieldCapsule.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         toolbarBarView.addSubview(privacyShieldCluster)
 
         // Left Custom Actions Group (optional/moved buttons placed on the left side via Customize Toolbar…)
         leftCustomActionCluster.addArrangedView(leftCustomActionCapsule)
         leftCustomActionCluster.isHidden = true
+        leftCustomActionCluster.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        leftCustomActionCapsule.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        for actionID in CustomizableToolbarItemID.allMovableActions {
+            leftCustomActionCapsule.setHidden(true, for: actionID.rawValue, animated: false)
+        }
         toolbarBarView.addSubview(leftCustomActionCluster)
 
         // Extension Zone 1 (leftOfAddressBar): default zone between Back/Forward and Address/Tab bar
@@ -892,6 +923,9 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             safariWin.onDropURL = { [weak self] url, openInNewTab in
                 guard let self else { return }
                 self.openURLInActiveOrNewTab(url, newTab: openInNewTab)
+            }
+            safariWin.onPerformKeyEquivalent = { [weak self] event in
+                self?.handleWindowKeyEquivalent(event) ?? false
             }
         }
         tabAddressBar.onDropURL = { [weak self] url, targetTabID, openInNewTab in
@@ -1477,7 +1511,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
                 self?.refreshExtensionsUI(exts)
             }
         }
-        refreshExtensionsUI(engine.installedExtensions())
+        refreshExtensionsUI(engine.installedExtensions(), animated: false)
 
         settingsObserver = NotificationCenter.default.addObserver(
             forName: .safariumSettingsDidChange,
@@ -1782,11 +1816,15 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         //    Cmd+Opt+Left/Right tab cycling, Cmd+Left/Right Back/Forward, Cmd+= Zoom In, Esc dismissal,
         //    and Start Page Space/Arrow/PageUp/PageDown/Home/End scrolling.
         keyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, event.window === self.window else { return event }
+            guard let self, let win = self.window else { return event }
+            let isSameOrChildWindow = (event.window === win)
+                || (event.window == nil && win.isKeyWindow)
+                || (win.childWindows?.contains(where: { $0 === event.window }) == true)
+            guard isSameOrChildWindow else { return event }
             // Strip `.numericPad` & `.function` (always set on macOS arrow/page/home/end keys!)
             let primaryMods = event.modifierFlags.intersection([.command, .shift, .option, .control])
-            let isEditingAppKitText = (self.window?.firstResponder is NSTextView)
-            let frClassName = self.window?.firstResponder.map { NSStringFromClass(type(of: $0)) } ?? ""
+            let isEditingAppKitText = (win.firstResponder is NSTextView)
+            let frClassName = win.firstResponder.map { NSStringFromClass(type(of: $0)) } ?? ""
             let isWebViewFocused = frClassName.contains("RenderWidgetHostView")
 
             if self.tabOverviewView.isPresented && !self.tabAddressBar.isCurrentlyEditingAddress {
@@ -1857,13 +1895,8 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
                 }
             }
 
-            // Cmd+1..9 -> Switch to tab 1..8, Cmd+9 -> last tab (Chrome/Safari standard)
-            if primaryMods == .command, BrowserSettings.shared.cmdNumberSwitchesTabs {
-                let chIgn = event.charactersIgnoringModifiers ?? ""
-                if let digit = Int(chIgn), digit >= 1 && digit <= 9 {
-                    self.selectTabShortcut(tag: digit - 1)
-                    return nil
-                }
+            if self.handleWindowKeyEquivalent(event) {
+                return nil
             }
 
             // Cmd+Shift+[ / Cmd+Shift+] (also `{` / `}` on US, `Ğ` / `Ü` physical keys kc=33/30) -> Prev / Next Tab
@@ -2098,6 +2131,43 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         }
     }
 
+    private static func tabShortcutDigit(for event: NSEvent) -> Int? {
+        if let chIgn = event.charactersIgnoringModifiers, let digit = Int(chIgn), (1...9).contains(digit) {
+            return digit
+        }
+        switch event.keyCode {
+        case 18, 83: return 1
+        case 19, 84: return 2
+        case 20, 85: return 3
+        case 21, 86: return 4
+        case 23, 87: return 5
+        case 22, 88: return 6
+        case 26, 89: return 7
+        case 28, 91: return 8
+        case 25, 92: return 9
+        default: return nil
+        }
+    }
+
+    private func handleWindowKeyEquivalent(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return false }
+        let primaryMods = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        guard primaryMods == .command else { return false }
+
+        if BrowserSettings.shared.cmdNumberSwitchesTabs, let digit = Self.tabShortcutDigit(for: event) {
+            selectTabShortcut(tag: digit - 1)
+            return true
+        }
+        let chIgn = (event.charactersIgnoringModifiers ?? "").lowercased()
+        let isCmdS = (chIgn == "s")
+            || (event.keyCode == 1 && (chIgn.isEmpty || !chIgn.unicodeScalars.allSatisfy(\.isASCII)))
+        if isCmdS {
+            saveActiveTab()
+            return true
+        }
+        return false
+    }
+
     private func findRenderWidgetHostView(in root: NSView) -> NSView? {
         for sub in root.subviews {
             let name = NSStringFromClass(type(of: sub))
@@ -2210,6 +2280,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
     }
 
     private func performActiveTabNavigation(to url: URL) {
+        extensionPopoverController.close()
         if tabOverviewView.isPresented || overviewOpenTarget {
             overviewOpenTarget = false
             tabOverviewView.closeAnimated()
@@ -2370,8 +2441,9 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             }
             selectTab(at: newIndex)
             if tab.isStartPage {
-                DispatchQueue.main.async { [weak self] in
-                    self?.tabAddressBar.focusAddressBar()
+                DispatchQueue.main.async { [weak self, weak tab] in
+                    guard let self, let tab, self.activeTab === tab else { return }
+                    self.tabAddressBar.focusAddressBar()
                 }
             }
         } else {
@@ -2715,6 +2787,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
     }
 
     func navigateBackInActiveTab() {
+        extensionPopoverController.close()
         guard let tab = activeTab, tab.canGoBack else { return }
         let fromSwipeCommit = swipeNavigationController.isHoldingCommittedSnapshot
         let outgoing = fromSwipeCommit ? nil : captureOutgoingTransitionPayload(for: tab)
@@ -2736,6 +2809,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
     }
 
     func navigateForwardInActiveTab() {
+        extensionPopoverController.close()
         guard let tab = activeTab, tab.canGoForward else { return }
         let fromSwipeCommit = swipeNavigationController.isHoldingCommittedSnapshot
         let outgoing = fromSwipeCommit ? nil : captureOutgoingTransitionPayload(for: tab)
@@ -2758,6 +2832,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
 
     func selectTab(at index: Int, animatedTabBar: Bool? = nil, skipOverviewClose: Bool = false) {
         guard index >= 0 && index < tabs.count else { return }
+        extensionPopoverController.close()
         if !skipOverviewClose && (tabOverviewView.isPresented || overviewOpenTarget) {
             overviewOpenTarget = false
             tabOverviewView.closeAnimated()
@@ -2773,6 +2848,12 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         deferredRevealWebToolbarSyncTabID = nil
         pinchCoordinator.reset()
         dismissAddressBarPopover()
+        if tabAddressBar.isAddressBarEditing {
+            tabAddressBar.endAddressEditing(restoreURL: true)
+            if let win = window, win.firstResponder is NSTextView {
+                win.makeFirstResponder(win)
+            }
+        }
         activeTabIndex = index
         syncElasticMetrics(for: tabs[index])
 
@@ -2859,14 +2940,23 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             let startColor = startPageView.effectiveTopColor
             chromeController.apply(sample: TopEdgeColorSample(color: startColor), animated: false)
             toolbarFrostView.apply(prefersLightInk: chromeController.currentTheme.prefersLightInk, customVeilColor: startColor, animated: false)
+            if let win = window, let frView = win.firstResponder as? NSView, frView.isDescendant(of: webContentHost) {
+                win.makeFirstResponder(win)
+            }
         } else if tab.isHistoryPage {
             let histColor = historyPageView.effectiveTopColor
             chromeController.apply(sample: TopEdgeColorSample(color: histColor), animated: false)
             toolbarFrostView.apply(prefersLightInk: historyPageView.prefersDarkAppearance, customVeilColor: histColor, animated: false)
+            if let win = window, let frView = win.firstResponder as? NSView, frView.isDescendant(of: webContentHost) {
+                win.makeFirstResponder(win)
+            }
         } else if tab.isInspectPage {
             let inspectColor = inspectPageView.effectiveTopColor
             chromeController.apply(sample: TopEdgeColorSample(color: inspectColor), animated: false)
             toolbarFrostView.apply(prefersLightInk: inspectPageView.prefersDarkAppearance, customVeilColor: inspectColor, animated: false)
+            if let win = window, let frView = win.firstResponder as? NSView, frView.isDescendant(of: webContentHost) {
+                win.makeFirstResponder(win)
+            }
         } else {
             let fixedColor = BrowserSettings.shared.showWebsiteColorInToolbar ? tab.fixedHeaderColor : nil
             if let fixedColor {
@@ -2911,6 +3001,9 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         if !isPrivate, let url = removed.currentURL, !removed.isStartPage, url.isWebURL {
             closedTabURLs.append(url)
             if closedTabURLs.count > 50 { closedTabURLs.removeFirst(closedTabURLs.count - 50) }
+        }
+        if let win = window, let frView = win.firstResponder as? NSView, frView.isDescendant(of: removed.contentView) {
+            win.makeFirstResponder(win)
         }
         removed.closeTab()
         pruneOrphanedTabSnapshots()
@@ -2974,9 +3067,17 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         dismissAddressBarPopover()
         extensionPopoverController.close()
 
-        let initialSnap = tab.isStartPage
-            ? captureStartPageSnapshot()
-            : (captureCurrentDisplaySnapshot(for: tab) ?? tab.cachedSnapshot)
+        let liveSurface = tab.isStartPage ? nil : tab.currentFrameSurface
+        let hasOtherWindows = (NSApp.delegate as? AppDelegate)?.hasOtherCompatibleWindow(besides: self) ?? false
+
+        let initialSnap: NSImage?
+        if tab.isStartPage {
+            initialSnap = captureStartPageSnapshot(allowCached: true)
+        } else if liveSurface != nil {
+            initialSnap = nil
+        } else {
+            initialSnap = captureCurrentDisplaySnapshot(for: tab) ?? tab.cachedSnapshot
+        }
 
         let displayDomain: String
         if tab.currentURL?.scheme == "chrome-extension" && !tab.title.isEmpty {
@@ -2999,10 +3100,12 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             theme: chromeController.currentTheme,
             initialPillRectInScreen: pillRectInScreen,
             cursorOffsetInPill: cursorOffsetInPill,
-            sourceWindowSize: win.frame.size
+            sourceWindowSize: win.frame.size,
+            liveFrameSurface: liveSurface,
+            hasOtherCompatibleWindows: hasOtherWindows
         )
 
-        let liveProvider: ((@escaping (NSImage?) -> Void) -> Void)? = tab.isStartPage
+        let liveProvider: ((@escaping (NSImage?) -> Void) -> Void)? = (tab.isStartPage || liveSurface != nil || (isSingleTab && !hasOtherWindows && initialSnap != nil))
             ? nil
             : { [weak tab] completion in
                 tab?.captureSnapshot(completion: completion)
@@ -3245,8 +3348,12 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         selectTab(at: (activeTabIndex - 1 + tabs.count) % tabs.count)
     }
 
-    func focusAddressBar() { tabAddressBar.focusAddressBar() }
+    func focusAddressBar() {
+        extensionPopoverController.close()
+        tabAddressBar.focusAddressBar()
+    }
     func reloadActiveTab() {
+        extensionPopoverController.close()
         if let tab = activeTab {
             resetTabPrivacyStatsBeforeReload(for: tab)
             refreshPrivacyShieldUI()
@@ -3260,6 +3367,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
     }
 
     func reloadActiveTabIgnoringCache() {
+        extensionPopoverController.close()
         if let tab = activeTab {
             resetTabPrivacyStatsBeforeReload(for: tab)
             refreshPrivacyShieldUI()
@@ -3443,6 +3551,18 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
     func printActiveTab() {
         guard let tab = activeTab, !tab.isStartPage else { return }
         tab.printPage()
+    }
+
+    func saveActiveTab() {
+        extensionPopoverController.close()
+        dismissAddressBarPopover()
+        pageMenuPopover.close()
+        guard let tab = activeTab,
+              !tab.isNativeInternalPage,
+              tabLoadErrors[tab.tabID] == nil else {
+            return
+        }
+        tab.savePageWithPanel(for: window, completion: nil)
     }
 
     func exportActiveTabAsPDF() {
@@ -3861,11 +3981,6 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         tab.resetPageScale()
         BrowserSettings.shared.setPageZoomFactor(1.0, for: tab.currentURL)
         syncPageTopInset(for: tab, zoomOverride: 1.0)
-    }
-
-    func triggerSimulatedDownload() {
-        let origin = lastMouseDownInWindow ?? NSPoint(x: (window?.frame.width ?? 1200) * 0.45, y: (window?.frame.height ?? 800) * 0.48)
-        downloadController.triggerSimulatedDownload(fromOriginInWindow: origin)
     }
 
     func openHistoryPage() {
@@ -4458,14 +4573,6 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         )
     }
 
-    @objc private func menuReloadAction() { reloadActiveTab() }
-    @objc private func menuZoomInAction() { zoomInActiveTab() }
-    @objc private func menuZoomOutAction() { zoomOutActiveTab() }
-    @objc private func menuZoomResetAction() { resetZoomActiveTab() }
-    @objc private func menuToggleOverviewAction() { toggleTabOverview() }
-    @objc private func menuToggleSidebarAction() { toggleSidebar() }
-    @objc private func menuPullToRefreshAction() { elasticScrollEngine.triggerPullToRefreshDemo() }
-    @objc private func menuSimulateDownloadAction() { triggerSimulatedDownload() }
     @objc private func menuCustomizeToolbarAction() { toggleCustomizeToolbarSheet() }
 
     // MARK: - Customize Toolbar Sheet
@@ -4479,7 +4586,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         extensionPopoverController.close()
         pageMenuPopover.close()
 
-        let installed = engine.installedExtensions()
+        let installed = visibleExtensionsForWindow(engine.installedExtensions())
         let hiddenIDs = Set(installed.map(\.id).filter { extensionsCoordinator.isHiddenFromToolbar($0) })
         let isDark = chromeController.currentTheme.prefersLightInk
         // Update toolbar slots FIRST (without refreshing the sheet) so the sheet's opening animation is never interrupted.
@@ -4870,7 +4977,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         updateToolbarExtensionConstraints(animated: animated)
 
         if isCustomizing && refreshSheet {
-            let installed = engine.installedExtensions()
+            let installed = visibleExtensionsForWindow(engine.installedExtensions())
             let hiddenIDs = Set(installed.map(\.id).filter { extensionsCoordinator.isHiddenFromToolbar($0) })
             customizeToolbarSheet.refreshState(
                 extensions: installed,
@@ -4944,7 +5051,8 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
 
     // MARK: - Chrome Web Store Extensions UI
 
-    private func updateToolbarExtensionConstraints(animated: Bool) {
+    private func updateToolbarExtensionConstraints(animated rawAnimated: Bool) {
+        let animated = rawAnimated && (window?.isVisible == true) && toolbarBarView.bounds.width > 1.0
         let store = ToolbarCustomizationStore.shared
         let canBack = activeTab?.canGoBack ?? false
         let canFwd = activeTab?.canGoForward ?? false
@@ -4954,19 +5062,16 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         let hasBackForwardContent = hasHistory || backForwardCapsule.hasMergedExtensions || backForwardCapsule.hasPlaceholder
         let wasBackForwardClusterHidden = backForwardCluster.isHidden
 
-        if animated {
-            toolbarBarView.layoutSubtreeIfNeeded()
-        }
-
+        let animateButtonsInsideCluster = animated && !wasBackForwardClusterHidden && hasBackForwardContent
         if backFwdEnabled && forceShowDisabledArrows {
             backForwardCapsule.setHidden(false, for: "back", animated: false)
             backForwardCapsule.setHidden(false, for: "forward", animated: false)
         } else if !backFwdEnabled {
-            backForwardCapsule.setHidden(true, for: "back", animated: animated)
-            backForwardCapsule.setHidden(true, for: "forward", animated: animated)
+            backForwardCapsule.setHidden(true, for: "back", animated: animateButtonsInsideCluster)
+            backForwardCapsule.setHidden(true, for: "forward", animated: animateButtonsInsideCluster)
         } else {
-            backForwardCapsule.setHidden(!canBack, for: "back", animated: animated)
-            backForwardCapsule.setHidden(!canFwd, for: "forward", animated: animated)
+            backForwardCapsule.setHidden(!canBack, for: "back", animated: animateButtonsInsideCluster)
+            backForwardCapsule.setHidden(!canFwd, for: "forward", animated: animateButtonsInsideCluster)
         }
         let targetBackW: CGFloat = hasBackForwardContent ? backForwardCapsule.currentRequiredWidth : 0.0
         if hasBackForwardContent {
@@ -5192,14 +5297,19 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         return views
     }
 
-    func refreshExtensionsUI(_ extensions: [BrowserExtensionItem]) {
-        extensionsCoordinator.update(extensions: extensions)
+    func refreshExtensionsUI(_ extensions: [BrowserExtensionItem], animated: Bool = true) {
+        let prevWidths = ExtensionToolbarZone.allCases.map { extensionsCoordinator.requiredWidth(for: $0) }
+        let visibleExtensions = visibleExtensionsForWindow(extensions)
+        extensionsCoordinator.update(extensions: visibleExtensions)
         extensionsCoordinator.apply(theme: chromeController.currentTheme, animated: false)
-        updateToolbarExtensionConstraints(animated: true)
+        let newWidths = ExtensionToolbarZone.allCases.map { extensionsCoordinator.requiredWidth(for: $0) }
+        if prevWidths != newWidths {
+            updateToolbarExtensionConstraints(animated: animated)
+        }
         if customizeToolbarSheet.isPresented {
-            let hiddenIDs = Set(extensions.map(\.id).filter { extensionsCoordinator.isHiddenFromToolbar($0) })
+            let hiddenIDs = Set(visibleExtensions.map(\.id).filter { extensionsCoordinator.isHiddenFromToolbar($0) })
             customizeToolbarSheet.refreshState(
-                extensions: extensions,
+                extensions: visibleExtensions,
                 hiddenExtensionIDs: hiddenIDs,
                 isDark: chromeController.currentTheme.prefersLightInk
             )
@@ -5226,7 +5336,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             ?? sidebarCluster
         extensionPopoverController.showManageExtensionsPopover(
             relativeTo: targetAnchor,
-            extensions: engine.installedExtensions(),
+            extensions: visibleExtensionsForWindow(engine.installedExtensions()),
             isDark: chromeController.currentTheme.prefersLightInk,
             isHiddenInToolbar: { [weak self] id in
                 self?.extensionsCoordinator.isHiddenFromToolbar(id) ?? false
@@ -5277,7 +5387,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
     func removeExtension(withID extensionID: String) {
         extensionPopoverController.close()
         _ = engine.uninstallExtension(withID: extensionID)
-        refreshExtensionsUI(engine.installedExtensions())
+        refreshExtensionsUI(engine.installedExtensions(), animated: false)
     }
 
     private func applyAdaptiveTheme(_ theme: AdaptiveChromeTheme, animated: Bool) {
@@ -5331,7 +5441,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             findBarView.apply(isDark: effectiveTheme.prefersLightInk)
         }
         if customizeToolbarSheet.isPresented {
-            let installed = engine.installedExtensions()
+            let installed = visibleExtensionsForWindow(engine.installedExtensions())
             let hiddenIDs = Set(installed.map(\.id).filter { extensionsCoordinator.isHiddenFromToolbar($0) })
             customizeToolbarSheet.refreshState(
                 extensions: installed,
@@ -5650,6 +5760,9 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
     }
 
     func tabEngine(_ tab: BrowserTabEngine, didChangeURL url: URL?) {
+        if tab === activeTab, url != nil {
+            extensionPopoverController.close()
+        }
         if url?.scheme != "chrome-error" && url != tabLoadErrors[tab.tabID]?.failedURL {
             tabLoadErrors.removeValue(forKey: tab.tabID)
             reloadingErrorTabIDs.remove(tab.tabID)
