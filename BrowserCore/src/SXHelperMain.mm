@@ -3048,15 +3048,22 @@ class SXHelperApp : public CefApp,
               const probeYs = [barTop + 2, barTop + 14];
               let matchedRGB = null;
 
-              const collectStack = function(root, x, y, depth, out) {
-                if (!root || depth > 4 || !root.elementsFromPoint) return;
+              // A shadow root's elementsFromPoint also returns the outer tree's elements (its own host and every
+              // other host above it), so without the visited set each host's shadow root was hit-tested again from
+              // every nested level: ~hosts^4 hit tests per point, every scroll frame. On Reddit's nested shadow DOM
+              // that blocked the main thread for most of each fling (no scroll telemetry -> no fling overshoot).
+              const collectStack = function(root, x, y, depth, out, visited) {
+                if (!root || depth > 4 || !root.elementsFromPoint || visited.has(root)) return;
+                visited.add(root);
                 let hits;
                 try { hits = root.elementsFromPoint(x, y); } catch (_) { return; }
                 for (let a = 0; a < hits.length && a < 20; a++) {
                   const el = hits[a];
+                  if (!el || visited.has(el)) continue;
+                  visited.add(el);
                   out.push(el);
-                  if (el && el.shadowRoot) {
-                    collectStack(el.shadowRoot, x, y, depth + 1, out);
+                  if (el.shadowRoot) {
+                    collectStack(el.shadowRoot, x, y, depth + 1, out, visited);
                   }
                 }
               };
@@ -3070,7 +3077,7 @@ class SXHelperApp : public CefApp,
               for (let yi = 0; yi < probeYs.length && !failed; yi++) {
                 for (let xi = 0; xi < probeXs.length && !failed; xi++) {
                   const stack = [];
-                  collectStack(document, probeXs[xi], probeYs[yi], 0, stack);
+                  collectStack(document, probeXs[xi], probeYs[yi], 0, stack, new Set());
                   let hitRGB = null;
                   const seen = new Set();
                   for (let j = 0; j < stack.length && j < 40; j++) {
@@ -3211,8 +3218,22 @@ class SXHelperApp : public CefApp,
               probeFixedHeader();
             });
           }
+          // Hit-testing 10 points (plus every shadow root under them) costs milliseconds on big pages; doing it every
+          // scroll frame starved the main thread. While scrolling, probe at most every 100 ms (trailing call kept).
+          let lastScrollProbeAt = -1e9;
+          let scrollThrottleTimer = 0;
           function scheduleScrollProbe() {
-            scheduleProbe();
+            const sinceLast = performance.now() - lastScrollProbeAt;
+            if (sinceLast >= 100) {
+              lastScrollProbeAt = performance.now();
+              scheduleProbe();
+            } else if (!scrollThrottleTimer) {
+              scrollThrottleTimer = setTimeout(function() {
+                scrollThrottleTimer = 0;
+                lastScrollProbeAt = performance.now();
+                scheduleProbe();
+              }, 100 - sinceLast);
+            }
             if (scrollSettleTimer) clearTimeout(scrollSettleTimer);
             // Catch CSS-transitioned auto-hiding headers after scroll settles.
             scrollSettleTimer = setTimeout(function() {
@@ -4846,8 +4867,6 @@ class SXHelperApp : public CefApp,
           lastSurfaceConsumesPinch = consumes;
         }
 
-        let lastWheelTarget = null;
-        let lastWheelCheckAt = -1e9;
         let metricsRafPending = false;
         function scheduleMetrics() {
           if (metricsRafPending) return;
@@ -4873,17 +4892,14 @@ class SXHelperApp : public CefApp,
         window.addEventListener('wheel', function(e) {
           lastPtrX = e.clientX;
           lastPtrY = e.clientY;
-          const now = performance.now();
           if (e.ctrlKey) {
             updatePinchSurface(e.target);
             emitMetrics(false, false);
             return;
           }
-          if (e.target !== lastWheelTarget || (now - lastWheelCheckAt > 150)) {
-            lastWheelTarget = e.target;
-            lastWheelCheckAt = now;
-            computeInnerScrollState(e.target);
-          }
+          // Inner-scroll state decides whether the shell may rubber-band / fling-overshoot this event, so it must
+          // be fresh for every event (a stale "inner scroller can still scroll up" swallowed the top overshoot).
+          computeInnerScrollState(e.target);
           scheduleMetrics();
         }, { passive: true, capture: true });
 
@@ -4900,13 +4916,8 @@ class SXHelperApp : public CefApp,
 
         window.addEventListener('scroll', function(e) {
           if (e.target && e.target !== document && e.target !== window) {
-            const now = performance.now();
-            if (e.target !== lastWheelTarget || (now - lastWheelCheckAt > 150)) {
-              lastWheelTarget = e.target;
-              lastWheelCheckAt = now;
-              maybeAdoptPageScroller(e.target);
-              computeInnerScrollState(e.target);
-            }
+            maybeAdoptPageScroller(e.target);
+            computeInnerScrollState(e.target);
           }
           scheduleMetrics();
         }, { passive: true, capture: true });

@@ -14,3 +14,7 @@ Pasted *.heic
 /spinner/
 scripts/flicker/.wrec
 scripts/flicker/.toggle-overview
+scripts/flicker/.fling
+scripts/flicker/.fling.swift
+scripts/flicker/.order
+scripts/flicker/.order.swift

@@ -2049,7 +2049,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             guard !tab.isStartPage, self.tabLoadErrors[tab.tabID] == nil else {
                 return event
             }
-            self.syncElasticMetrics(for: tab)
+            self.syncElasticMetrics(for: tab, isFreshTelemetry: false)
             let phase = event.phase
             let momPhase = event.momentumPhase
             let trackpadActive =
@@ -2128,7 +2128,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
                   !self.addressBarPopover.isShown else { return }
             let dir = (note.userInfo?["direction"] as? NSNumber)?.intValue ?? -1
             let isRepeat = (note.userInfo?["isRepeat"] as? NSNumber)?.boolValue ?? false
-            self.syncElasticMetrics(for: tab)
+            self.syncElasticMetrics(for: tab, isFreshTelemetry: false)
             self.elasticScrollEngine.triggerSpaceScroll(direction: dir, isRepeat: isRepeat, isStartPage: false)
         }
     }
@@ -5973,7 +5973,8 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func syncElasticMetrics(for tab: BrowserTabEngine) {
+    /// `isFreshTelemetry: false` for the pre-event sync of cached values (see `ElasticScrollEngine.updateMetrics`).
+    private func syncElasticMetrics(for tab: BrowserTabEngine, isFreshTelemetry: Bool = true) {
         let vh = tab.viewportHeight > 1.0 ? tab.viewportHeight : webContentHost.bounds.height
         elasticScrollEngine.updateMetrics(
             scrollY: tab.scrollY,
@@ -5982,7 +5983,8 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             canInnerScrollUp: tab.canInnerScrollUp,
             canInnerScrollDown: tab.canInnerScrollDown,
             isReloadableWebPage: !tab.isStartPage,
-            isPageLoading: tab.isLoading
+            isPageLoading: tab.isLoading,
+            resyncEstimate: isFreshTelemetry
         )
     }
 

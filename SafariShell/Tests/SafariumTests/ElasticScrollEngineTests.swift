@@ -662,7 +662,7 @@ final class ElasticScrollEngineTests: HermeticTestCase {
         XCTAssertEqual(engine.motionState, .idle)
     }
 
-    func testRepeatedStaleUpdateMetricsDoesNotClobberPredictiveFlingOvershoot() {
+    func testPreEventCachedSyncDoesNotClobberPredictiveFlingOvershoot() {
         let engine = makeEngine(scrollY: 100)
         // Simulate pre-event syncElasticMetrics() reporting unchanged stale scrollY=100
         // across consecutive 120Hz upward momentum frames while approaching y=0.
@@ -673,8 +673,8 @@ final class ElasticScrollEngineTests: HermeticTestCase {
 
         engine.updateMetrics(scrollY: 100, contentHeight: 3000, viewportHeight: 800,
                              canInnerScrollUp: false, canInnerScrollDown: false,
-                             isReloadableWebPage: true, isPageLoading: false)
-        XCTAssertEqual(engine.estimatedScrollY, 60, accuracy: 0.01, "stale scrollY must not reset predictive estimate")
+                             isReloadableWebPage: true, isPageLoading: false, resyncEstimate: false)
+        XCTAssertEqual(engine.estimatedScrollY, 60, accuracy: 0.01, "cached pre-event sync must not reset predictive estimate")
 
         engine.updateVelocityEstimate(deltaY: 40, timestamp: 1.016, isBegin: false)
         _ = engine.handleMomentumEvent(momentum: .changed, deltaY: 40)
@@ -682,7 +682,7 @@ final class ElasticScrollEngineTests: HermeticTestCase {
 
         engine.updateMetrics(scrollY: 100, contentHeight: 3000, viewportHeight: 800,
                              canInnerScrollUp: false, canInnerScrollDown: false,
-                             isReloadableWebPage: true, isPageLoading: false)
+                             isReloadableWebPage: true, isPageLoading: false, resyncEstimate: false)
         engine.updateVelocityEstimate(deltaY: 40, timestamp: 1.024, isBegin: false)
         _ = engine.handleMomentumEvent(momentum: .changed, deltaY: 40)
         if case .criticallyDamped = engine.motionState {
@@ -690,5 +690,17 @@ final class ElasticScrollEngineTests: HermeticTestCase {
         } else {
             XCTFail("expected criticallyDamped fling overshoot on boundary crossing, got \(engine.motionState)")
         }
+    }
+
+    func testFreshTelemetryResyncsPredictiveEstimate() {
+        let engine = makeEngine(scrollY: 100)
+        engine.updateVelocityEstimate(deltaY: 40, timestamp: 1.000, isBegin: true)
+        _ = engine.handleMomentumEvent(momentum: .began, deltaY: 40)
+        XCTAssertEqual(engine.estimatedScrollY, 60, accuracy: 0.01)
+        // A real renderer report is ground truth even when it lags the prediction.
+        engine.updateMetrics(scrollY: 90, contentHeight: 3000, viewportHeight: 800,
+                             canInnerScrollUp: false, canInnerScrollDown: false,
+                             isReloadableWebPage: true, isPageLoading: false)
+        XCTAssertEqual(engine.estimatedScrollY, 90, accuracy: 0.01)
     }
 }

@@ -239,6 +239,11 @@ final class ElasticScrollEngine: NSObject {
 
     // MARK: - Telemetry & External Lifecycle Hooks
 
+    /// `resyncEstimate`: true when this is fresh renderer telemetry (or a tab/page change), false for the cached-value
+    /// sync the scroll monitor runs before every event. The renderer reports scroll a frame or more after it applied
+    /// a delta, so the predictive `estimatedScrollY` (last report minus every delta forwarded since) must only be
+    /// reset when a new report arrives; resetting it from the cached value on every event threw the prediction away
+    /// and the top/bottom fling overshoot fired late or not at all.
     func updateMetrics(
         scrollY: CGFloat,
         contentHeight: CGFloat,
@@ -246,11 +251,10 @@ final class ElasticScrollEngine: NSObject {
         canInnerScrollUp: Bool,
         canInnerScrollDown: Bool,
         isReloadableWebPage: Bool,
-        isPageLoading: Bool
+        isPageLoading: Bool,
+        resyncEstimate: Bool = true
     ) {
-        let clampedScrollY = max(0.0, scrollY)
-        let scrollYChanged = abs(clampedScrollY - metrics.scrollY) > 0.01
-        metrics.scrollY = clampedScrollY
+        metrics.scrollY = max(0.0, scrollY)
         metrics.contentHeight = max(0.0, contentHeight)
         metrics.viewportHeight = max(1.0, viewportHeight)
         metrics.canInnerScrollUp = canInnerScrollUp
@@ -258,10 +262,8 @@ final class ElasticScrollEngine: NSObject {
         metrics.isReloadableWebPage = isReloadableWebPage
         metrics.isPageLoading = isPageLoading
 
-        // Only re-sync predictive scroll position when renderer telemetry actually updated,
-        // so repeated pre-event syncs with unchanged stale scrollY never clobber 120Hz prediction.
-        if scrollYChanged || abs(estimatedScrollY - clampedScrollY) > 240.0 {
-            estimatedScrollY = clampedScrollY
+        if resyncEstimate {
+            estimatedScrollY = metrics.scrollY
         }
     }
 
@@ -342,6 +344,20 @@ final class ElasticScrollEngine: NSObject {
     /// Returns `true` if the event was consumed by elastic overscroll (caller should drop it so
     /// Chromium does not double-scroll or double-bounce), or `false` to pass through to Chromium.
     func handleScrollWheel(_ event: NSEvent) -> Bool {
+        let consumed = handleScrollWheelCore(event)
+        if ScrollDebugLog.isEnabled {
+            let line = String(format: "%.4f ph=%lu mo=%lu dy=%.2f v=%.0f sy=%.1f est=%.1f max=%.0f up=%d dn=%d ov=%.1f st=%@ lock=%@ c=%d\n",
+                              event.timestamp, event.phase.rawValue, event.momentumPhase.rawValue,
+                              event.scrollingDeltaY, smoothedVelocityY, metrics.scrollY, estimatedScrollY,
+                              metrics.maxScrollY, metrics.canInnerScrollUp ? 1 : 0, metrics.canInnerScrollDown ? 1 : 0,
+                              currentOverscrollY, String(describing: motionState).prefix(18).description,
+                              String(describing: momentumLock), consumed ? 1 : 0)
+            ScrollDebugLog.write(line)
+        }
+        return consumed
+    }
+
+    private func handleScrollWheelCore(_ event: NSEvent) -> Bool {
         // Discrete notched mouse wheels do not trigger macOS Safari elastic rubber-banding.
         let isPreciseTrackpad = event.hasPreciseScrollingDeltas
             || !event.phase.isEmpty

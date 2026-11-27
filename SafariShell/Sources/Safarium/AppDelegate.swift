@@ -163,6 +163,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.activeWindowController?.toggleTabOverview()
             }
         }
+        if ProcessInfo.processInfo.environment["SAFARIUM_SCROLL_DEBUG"] != nil {
+            // Debug-only hook for scroll/overshoot measurements (scripts/flicker/fling.sh): replays a 120 Hz trackpad
+            // gesture (finger phase + momentum) through the app's own event queue, so the scroll monitor, the elastic
+            // engine and Chromium all see it exactly like a real trackpad, while the app stays in the background.
+            DistributedNotificationCenter.default().addObserver(
+                forName: Notification.Name("SafariumDebugFling"), object: nil, queue: .main
+            ) { [weak self] note in
+                guard let window = self?.activeWindowController?.window else { return }
+                let spec = (note.object as? String) ?? "40 8 60 0.955"
+                DebugTrackpadReplay.run(spec: spec, in: window)
+            }
+            // "front" lifts the window above other apps without activating it (an occluded window gets almost no
+            // main-thread frames, which distorts scroll telemetry); "back" sends it behind them again.
+            DistributedNotificationCenter.default().addObserver(
+                forName: Notification.Name("SafariumDebugOrderWindow"), object: nil, queue: .main
+            ) { [weak self] note in
+                guard let window = self?.activeWindowController?.window else { return }
+                if (note.object as? String) == "back" { window.orderBack(nil) } else { window.orderFrontRegardless() }
+            }
+        }
         NotificationCenter.default.addObserver(
             forName: Notification.Name("SXEngineRuntimeRequestNewWindowNotification"),
             object: nil,
