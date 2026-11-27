@@ -221,7 +221,7 @@ final class ElasticScrollEngine: NSObject {
     // visible height - 40)), with velocity decaying exponentially like trackpad momentum, delivered to Chromium as a
     // momentum-phase scroll stream. Momentum builds up: each quick press in the same direction adds a bigger impulse
     // on top of the current velocity and lowers the friction, so a burst of presses keeps getting faster; a held key
-    // accelerates from 3 to 10 pages/s over a second. Reaching an edge lands the page exactly on it and hands the
+    // accelerates from 4 to 13 pages/s over a second. Reaching an edge lands the page exactly on it and hands the
     // remaining velocity to the same overshoot spring a trackpad fling uses.
     /// pt/s, + = up. Remaining travel of the current glide is `spaceVelocityY / spaceDecayRate`.
     var spaceVelocityY: CGFloat = 0.0
@@ -231,7 +231,7 @@ final class ElasticScrollEngine: NSObject {
     private(set) var spaceStreamOpen: Bool = false
     /// Set when the glide began while the page already sat on the edge it moves toward (no bounce, like Safari).
     private var spaceStartedAtEdge: Bool = false
-    static let spaceDecayRate: CGFloat = 8.0
+    static let spaceDecayRate: CGFloat = 10.0
     /// Friction of the current glide (lowered while a press streak builds momentum).
     private(set) var spaceFriction: CGFloat = ElasticScrollEngine.spaceDecayRate
     /// Consecutive same-direction presses less than `spaceStreakWindow` apart.
@@ -240,7 +240,7 @@ final class ElasticScrollEngine: NSObject {
     private var spaceHoldStartTime: CFTimeInterval = 0.0
     static let spaceStreakWindow: CFTimeInterval = 0.6
     /// Fastest glide, in visible pages per second.
-    static let spaceMaxPagesPerSecond: CGFloat = 30.0
+    static let spaceMaxPagesPerSecond: CGFloat = 36.0
     static let spaceMaxImpactVelocity: CGFloat = 9000.0
     /// Glide ends once less than this much travel remains (the remainder is sent in the last frame).
     private static let spaceStopDistance: CGFloat = 1.0
@@ -357,10 +357,10 @@ final class ElasticScrollEngine: NSObject {
         }
 
         if isRepeat {
-            // Held key: speed ramps from 3 to 10 visible pages/s over the first second of auto-repeat, never down.
+            // Held key: speed ramps from 4 to 13 visible pages/s over the first second of auto-repeat, never down.
             if spaceHoldStartTime <= 0.0 { spaceHoldStartTime = now }
             let held = CGFloat(min(1.0, (now - spaceHoldStartTime) / 1.0))
-            let target = visible * (3.0 + 7.0 * held)
+            let target = visible * (4.0 + 9.0 * held)
             if abs(spaceVelocityY) < target { spaceVelocityY = sign * target }
         } else {
             spaceHoldStartTime = 0.0

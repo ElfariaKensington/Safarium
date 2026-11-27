@@ -590,7 +590,7 @@ final class ElasticScrollEngineTests: HermeticTestCase {
             engine.triggerSpaceScroll(direction: -1, isRepeat: true, isStartPage: false, now: t)
             speeds.append(abs(engine.spaceVelocityY))
         }
-        XCTAssertEqual(speeds.last!, 752 * 10, accuracy: 1.0, "held key tops out at 10 pages/s")
+        XCTAssertEqual(speeds.last!, 752 * 13, accuracy: 1.0, "held key tops out at 13 pages/s")
         XCTAssertGreaterThan(speeds[20], speeds[5] + 1000, "held key keeps speeding up")
     }
 
@@ -608,7 +608,7 @@ final class ElasticScrollEngineTests: HermeticTestCase {
         let (engine, _) = makeSpaceEngine()
         for _ in 0..<20 { engine.triggerSpaceScroll(direction: 1, isRepeat: false, isStartPage: false) }
         XCTAssertLessThanOrEqual(engine.spaceVelocityY, 752 * ElasticScrollEngine.spaceMaxPagesPerSecond + 1e-6)
-        XCTAssertGreaterThan(engine.spaceVelocityY, 752 * 25)
+        XCTAssertGreaterThan(engine.spaceVelocityY, 752 * 30)
     }
 
     func testStartPageUsesFullViewport() {
