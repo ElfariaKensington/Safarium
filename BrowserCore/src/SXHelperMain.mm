@@ -4846,24 +4846,45 @@ class SXHelperApp : public CefApp,
           lastSurfaceConsumesPinch = consumes;
         }
 
+        let lastWheelTarget = null;
+        let lastWheelCheckAt = -1e9;
+        let metricsRafPending = false;
+        function scheduleMetrics() {
+          if (metricsRafPending) return;
+          metricsRafPending = true;
+          requestAnimationFrame(function() {
+            metricsRafPending = false;
+            emitMetrics(false, false);
+          });
+        }
+
         window.addEventListener('pointermove', function(e) {
           lastPtrX = e.clientX;
           lastPtrY = e.clientY;
           const now = performance.now();
-          if (now - lastInnerCheck > 40) {
+          if (now - lastInnerCheck > 150) {
             lastInnerCheck = now;
             computeInnerScrollState(e.target);
             updatePinchSurface(e.target);
-            emitMetrics(false, false);
+            scheduleMetrics();
           }
         }, { passive: true, capture: true });
 
         window.addEventListener('wheel', function(e) {
           lastPtrX = e.clientX;
           lastPtrY = e.clientY;
-          computeInnerScrollState(e.target);
-          updatePinchSurface(e.target);
-          emitMetrics(false, false);
+          const now = performance.now();
+          if (e.ctrlKey) {
+            updatePinchSurface(e.target);
+            emitMetrics(false, false);
+            return;
+          }
+          if (e.target !== lastWheelTarget || (now - lastWheelCheckAt > 150)) {
+            lastWheelTarget = e.target;
+            lastWheelCheckAt = now;
+            computeInnerScrollState(e.target);
+          }
+          scheduleMetrics();
         }, { passive: true, capture: true });
 
         window.addEventListener('wheel', function(e) {
@@ -4874,19 +4895,24 @@ class SXHelperApp : public CefApp,
         }, { passive: true, capture: false });
 
         if (window.visualViewport) {
-          window.visualViewport.addEventListener('scroll', function() { emitMetrics(false, false); }, { passive: true });
+          window.visualViewport.addEventListener('scroll', function() { scheduleMetrics(); }, { passive: true });
         }
 
         window.addEventListener('scroll', function(e) {
           if (e.target && e.target !== document && e.target !== window) {
-            maybeAdoptPageScroller(e.target);
-            computeInnerScrollState(e.target);
+            const now = performance.now();
+            if (e.target !== lastWheelTarget || (now - lastWheelCheckAt > 150)) {
+              lastWheelTarget = e.target;
+              lastWheelCheckAt = now;
+              maybeAdoptPageScroller(e.target);
+              computeInnerScrollState(e.target);
+            }
           }
-          emitMetrics(false, false);
+          scheduleMetrics();
         }, { passive: true, capture: true });
 
         window.addEventListener('resize', function() {
-          emitMetrics(false, false);
+          scheduleMetrics();
         }, { passive: true });
 
         if (window.visualViewport) {
@@ -4898,9 +4924,6 @@ class SXHelperApp : public CefApp,
               clearTimeout(pinchEndTimer);
               pinchEndTimer = setTimeout(function() { emitMetrics(false, true); }, 140);
             }
-          }, { passive: true });
-          window.visualViewport.addEventListener('scroll', function() {
-            emitMetrics(false, false);
           }, { passive: true });
         }
 
