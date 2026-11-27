@@ -3,6 +3,7 @@
 // and native AppKit message-pump integration.
 
 #import "SXApp.h"
+#import "SXExtensionManager.h"
 #import "SXInternal.h"
 #import "SXMediaTranscodeServer.h"
 #import "SXPrivacyEngine.h"
@@ -23,7 +24,19 @@
 #include <unordered_set>
 
 static const void *kSXStealthHiddenWindowKey = &kSXStealthHiddenWindowKey;
+static const void *kSXNativeDialogProbingKey = &kSXNativeDialogProbingKey;
+static const void *kSXNativeDialogReplacedKey = &kSXNativeDialogReplacedKey;
 static std::atomic<int> gSXHiddenChromeWindowCreationDepth{0};
+
+static BOOL SXIsWindowNativeDialogReplaced(NSWindow * _Nullable w) {
+  if (!w) return NO;
+  return [objc_getAssociatedObject(w, kSXNativeDialogReplacedKey) boolValue];
+}
+
+static BOOL SXIsWindowNativeDialogProbing(NSWindow * _Nullable w) {
+  if (!w) return NO;
+  return [objc_getAssociatedObject(w, kSXNativeDialogProbingKey) boolValue];
+}
 
 static BOOL SXIsChromiumNativeWindow(NSWindow * _Nullable w) {
   if (!w) return NO;
@@ -69,10 +82,278 @@ static BOOL SXShouldStealthBlockWindow(NSWindow * _Nullable w) {
 - (void)sx_orderFrontRegardless;
 - (void)sx_deminiaturize:(nullable id)sender;
 - (void)sx_setAlphaValue:(CGFloat)alphaValue;
+- (NSRect)sx_constrainFrameRect:(NSRect)frameRect toScreen:(nullable NSScreen *)screen;
 - (BOOL)sx_canBecomeKeyWindow;
 - (BOOL)sx_canBecomeMainWindow;
 - (BOOL)sx_isExcludedFromWindowsMenu;
 @end
+
+static NSString * _Nullable SXAXStringAttribute(id el, SEL sel) {
+  if (!el || ![el respondsToSelector:sel]) return nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+  id val = [el performSelector:sel];
+#pragma clang diagnostic pop
+  if ([val isKindOfClass:[NSString class]]) {
+    NSString *trimmed = [(NSString *)val stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return trimmed.length > 0 ? trimmed : nil;
+  }
+  return nil;
+}
+
+static void SXCollectChromiumDialogAX(id _Nullable el,
+                                      int depth,
+                                      NSHashTable *visited,
+                                      NSMutableArray<NSString *> *texts,
+                                      NSMutableSet<NSString *> *seenTexts,
+                                      NSMutableArray<NSDictionary *> *buttons) {
+  if (!el || depth > 14 || [visited containsObject:el]) return;
+  [visited addObject:el];
+
+  NSString *role = SXAXStringAttribute(el, @selector(accessibilityRole));
+  if ([role isEqualToString:NSAccessibilityStaticTextRole] ||
+      [role isEqualToString:@"AXHeading"]) {
+    NSString *txt = SXAXStringAttribute(el, @selector(accessibilityValue))
+                 ?: SXAXStringAttribute(el, @selector(accessibilityTitle))
+                 ?: SXAXStringAttribute(el, @selector(accessibilityLabel));
+    if (txt.length > 0 && ![seenTexts containsObject:txt]) {
+      [seenTexts addObject:txt];
+      [texts addObject:txt];
+    }
+  } else if ([role isEqualToString:NSAccessibilityButtonRole]) {
+    NSString *title = SXAXStringAttribute(el, @selector(accessibilityTitle))
+                   ?: SXAXStringAttribute(el, @selector(accessibilityLabel));
+    if (title.length > 0) {
+      [buttons addObject:@{@"title": title, @"element": el}];
+    }
+  }
+
+  if ([el respondsToSelector:@selector(accessibilityChildren)]) {
+    NSArray *children = [el accessibilityChildren];
+    if ([children isKindOfClass:[NSArray class]]) {
+      for (id child in children) {
+        SXCollectChromiumDialogAX(child, depth + 1, visited, texts, seenTexts, buttons);
+      }
+    }
+  }
+}
+
+static BOOL SXIsCancelLikeButtonTitle(NSString *title) {
+  NSString *low = title.lowercaseString;
+  return [low isEqualToString:@"deny"] ||
+         [low isEqualToString:@"cancel"] ||
+         [low isEqualToString:@"don't allow"] ||
+         [low isEqualToString:@"do not allow"] ||
+         [low isEqualToString:@"block"] ||
+         [low isEqualToString:@"close"] ||
+         [low isEqualToString:@"no"];
+}
+
+static NSImage * _Nullable SXLoadHighResManifestIcon(NSString * _Nullable installPath) {
+  if (installPath.length == 0) return nil;
+  NSString *manifestPath = [installPath stringByAppendingPathComponent:@"manifest.json"];
+  NSData *data = [NSData dataWithContentsOfFile:manifestPath];
+  if (!data) return nil;
+  NSDictionary *manifest = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+  if (![manifest isKindOfClass:[NSDictionary class]]) return nil;
+  id iconsObj = manifest[@"icons"];
+  NSString *bestRel = nil;
+  if ([iconsObj isKindOfClass:[NSString class]]) {
+    bestRel = iconsObj;
+  } else if ([iconsObj isKindOfClass:[NSDictionary class]]) {
+    NSDictionary *icons = (NSDictionary *)iconsObj;
+    // Prefer high-resolution icons for 64pt (128px @2x) NSAlert display.
+    for (NSString *sizeKey in @[ @"256", @"128", @"96", @"64", @"48" ]) {
+      NSString *cand = icons[sizeKey];
+      if ([cand isKindOfClass:[NSString class]] && cand.length > 0) {
+        bestRel = cand;
+        break;
+      }
+    }
+    if (!bestRel) {
+      NSInteger maxSz = -1;
+      for (id k in icons) {
+        NSString *cand = icons[k];
+        if (![cand isKindOfClass:[NSString class]] || cand.length == 0) continue;
+        NSInteger sz = [k respondsToSelector:@selector(integerValue)] ? [k integerValue] : 0;
+        if (sz > maxSz) {
+          maxSz = sz;
+          bestRel = cand;
+        }
+      }
+    }
+  }
+  if (bestRel.length == 0) return nil;
+  NSString *cleanRel = [bestRel stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]];
+  NSString *fullPath = [installPath stringByAppendingPathComponent:cleanRel];
+  NSImage *img = [[NSImage alloc] initWithContentsOfFile:fullPath];
+  if (img) {
+    img.size = NSMakeSize(64, 64);
+  }
+  return img;
+}
+
+static NSImage * _Nullable SXLookupExtensionIconForMessage(NSString *message) {
+  if (message.length == 0) return nil;
+  NSArray<SXExtensionItem *> *items = [[SXExtensionManager sharedManager] installedExtensions];
+  for (SXExtensionItem *item in items) {
+    if (item.name.length > 0 &&
+        [message rangeOfString:item.name options:NSCaseInsensitiveSearch].location != NSNotFound) {
+      NSImage *hiRes = SXLoadHighResManifestIcon(item.installPath);
+      if (hiRes) return hiRes;
+      if (item.icon) return item.icon;
+    }
+  }
+  return nil;
+}
+
+static BOOL SXIsCandidateChromiumModalDialog(NSWindow * _Nullable w) {
+  if (!w) return NO;
+  if (!SXIsChromiumNativeWindow(w) || SXIsDevToolsChromeWindow(w)) return NO;
+  if (SXIsWindowStealthLocked(w) || SXIsWindowNativeDialogReplaced(w) || SXIsWindowNativeDialogProbing(w)) return NO;
+  NSSize sz = w.frame.size;
+  BOOL dialogSized = (sz.width >= 160 && sz.width <= 720 && sz.height >= 90 && sz.height <= 640);
+  BOOL attached = (w.parentWindow != nil || w.sheetParent != nil);
+  return attached || dialogSized;
+}
+
+static void SXTryReplaceChromiumDialogWithNativeAlert(NSWindow *chromeWin, int attempt) {
+  if (!chromeWin || !chromeWin.isVisible) {
+    objc_setAssociatedObject(chromeWin, kSXNativeDialogProbingKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    return;
+  }
+
+  NSMutableArray<NSString *> *texts = [NSMutableArray array];
+  NSMutableSet<NSString *> *seenTexts = [NSMutableSet set];
+  NSMutableArray<NSDictionary *> *rawButtons = [NSMutableArray array];
+  NSHashTable *visited = [NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality];
+  SXCollectChromiumDialogAX(chromeWin, 0, visited, texts, seenTexts, rawButtons);
+
+  // Filter out window chrome "Close" buttons when real dialog action buttons exist.
+  NSMutableArray<NSDictionary *> *actionButtons = [NSMutableArray array];
+  for (NSDictionary *b in rawButtons) {
+    NSString *t = b[@"title"];
+    if (![t.lowercaseString isEqualToString:@"close"]) {
+      [actionButtons addObject:b];
+    }
+  }
+  if (actionButtons.count == 0) {
+    actionButtons = rawButtons;
+  }
+
+  if ((texts.count == 0 || actionButtons.count == 0) && attempt < 4) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(40 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+      SXTryReplaceChromiumDialogWithNativeAlert(chromeWin, attempt + 1);
+    });
+    return;
+  }
+
+  objc_setAssociatedObject(chromeWin, kSXNativeDialogProbingKey, nil, OBJC_ASSOCIATION_ASSIGN);
+
+  if (texts.count == 0 || actionButtons.count == 0) {
+    // Not a standard button dialog — restore visibility cleanly.
+    [chromeWin sx_setAlphaValue:1.0];
+    [chromeWin setIgnoresMouseEvents:NO];
+    return;
+  }
+
+  // Order the ugly clipped Chromium dialog completely out of WindowServer and park it
+  // offscreen (unconstrained) so zero pixels can ever appear at the bottom-left screen edge,
+  // while keeping its widget alive until our native NSAlert button invokes Chromium's callback.
+  objc_setAssociatedObject(chromeWin, kSXNativeDialogReplacedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  [chromeWin sx_setAlphaValue:0.0];
+  [chromeWin setIgnoresMouseEvents:YES];
+  [chromeWin setExcludedFromWindowsMenu:YES];
+  [chromeWin setCollectionBehavior:NSWindowCollectionBehaviorTransient |
+                                   NSWindowCollectionBehaviorIgnoresCycle |
+                                   NSWindowCollectionBehaviorStationary];
+  [chromeWin setSharingType:NSWindowSharingNone];
+  [chromeWin setFrame:NSMakeRect(-30000, -30000, 1, 1) display:NO];
+  [chromeWin sx_orderWindow:NSWindowOut relativeTo:0];
+  [NSApp removeWindowsItem:chromeWin];
+
+  NSString *headline = texts[0];
+  NSMutableArray<NSString *> *bodyLines = [NSMutableArray array];
+  BOOL inBulletList = NO;
+  for (NSUInteger i = 1; i < texts.count; ++i) {
+    NSString *line = texts[i];
+    if ([line hasSuffix:@":"]) {
+      inBulletList = YES;
+      [bodyLines addObject:line];
+    } else if (inBulletList) {
+      [bodyLines addObject:[NSString stringWithFormat:@"• %@", line]];
+    } else {
+      [bodyLines addObject:line];
+    }
+  }
+
+  // Put positive/primary action first (accented Liquid Glass default button on right in NSAlert),
+  // and Deny/Cancel second (Escape key).
+  NSMutableArray<NSDictionary *> *primaryBtns = [NSMutableArray array];
+  NSMutableArray<NSDictionary *> *cancelBtns = [NSMutableArray array];
+  for (NSDictionary *b in actionButtons) {
+    if (SXIsCancelLikeButtonTitle(b[@"title"])) {
+      [cancelBtns addObject:b];
+    } else {
+      [primaryBtns addObject:b];
+    }
+  }
+  NSMutableArray<NSDictionary *> *orderedButtons = [NSMutableArray arrayWithArray:primaryBtns];
+  [orderedButtons addObjectsFromArray:cancelBtns];
+
+  NSAlert *alert = [[NSAlert alloc] init];
+  alert.alertStyle = NSAlertStyleInformational;
+  alert.messageText = headline;
+  alert.informativeText = [bodyLines componentsJoinedByString:@"\n"];
+  NSImage *extIcon = SXLookupExtensionIconForMessage(headline);
+  if (extIcon) {
+    alert.icon = extIcon;
+  }
+  for (NSDictionary *b in orderedButtons) {
+    NSButton *nsBtn = [alert addButtonWithTitle:b[@"title"]];
+    if (SXIsCancelLikeButtonTitle(b[@"title"])) {
+      nsBtn.keyEquivalent = @"\033";
+    }
+  }
+
+  NSWindow *hostWindow = chromeWin.parentWindow ?: chromeWin.sheetParent;
+  if (!hostWindow || SXIsChromiumNativeWindow(hostWindow)) {
+    hostWindow = NSApp.mainWindow ?: NSApp.keyWindow;
+    if (SXIsChromiumNativeWindow(hostWindow)) {
+      hostWindow = nil;
+      for (NSWindow *cand in NSApp.windows) {
+        if (cand.isVisible && !SXIsChromiumNativeWindow(cand)) {
+          hostWindow = cand;
+          break;
+        }
+      }
+    }
+  }
+
+  void (^handleResponse)(NSModalResponse) = ^(NSModalResponse response) {
+    NSInteger idx = (NSInteger)(response - NSAlertFirstButtonReturn);
+    id axBtn = (idx >= 0 && idx < (NSInteger)orderedButtons.count) ? orderedButtons[idx][@"element"] : nil;
+    if (axBtn && [axBtn respondsToSelector:@selector(accessibilityPerformPress)]) {
+      [axBtn accessibilityPerformPress];
+    } else if (chromeWin.isVisible) {
+      [chromeWin close];
+    }
+  };
+
+  if (getenv("SAFARIUM_CEF_DEBUG")) {
+    fprintf(stderr, "[NativeDialog] Intercepted Chromium dialog: headline='%s' bodyLines=%lu buttons=%lu sheetParent=%p parent=%p\n",
+            headline.UTF8String, (unsigned long)bodyLines.count, (unsigned long)orderedButtons.count,
+            (__bridge void *)chromeWin.sheetParent, (__bridge void *)chromeWin.parentWindow);
+    fflush(stderr);
+  }
+
+  if (hostWindow && hostWindow.attachedSheet == nil) {
+    [alert beginSheetModalForWindow:hostWindow completionHandler:handleResponse];
+  } else {
+    handleResponse([alert runModal]);
+  }
+}
 
 @implementation NSWindow (SXStealthBlocker)
 
@@ -80,6 +361,20 @@ static BOOL SXShouldStealthBlockWindow(NSWindow * _Nullable w) {
   if (place != NSWindowOut && SXShouldStealthBlockWindow(self)) {
     [self sx_setAlphaValue:0.0];
     [self sx_orderWindow:NSWindowOut relativeTo:0];
+    return;
+  }
+  if (place != NSWindowOut && SXIsWindowNativeDialogReplaced(self)) {
+    [self sx_setAlphaValue:0.0];
+    return;
+  }
+  if (place != NSWindowOut && SXIsCandidateChromiumModalDialog(self)) {
+    objc_setAssociatedObject(self, kSXNativeDialogProbingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self sx_setAlphaValue:0.0];
+    [self setIgnoresMouseEvents:YES];
+    [self sx_orderWindow:place relativeTo:otherWin];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      SXTryReplaceChromiumDialogWithNativeAlert(self, 0);
+    });
     return;
   }
   [self sx_orderWindow:place relativeTo:otherWin];
@@ -117,25 +412,32 @@ static BOOL SXShouldStealthBlockWindow(NSWindow * _Nullable w) {
 }
 
 - (void)sx_setAlphaValue:(CGFloat)alphaValue {
-  if (SXShouldStealthBlockWindow(self)) {
+  if (SXShouldStealthBlockWindow(self) || SXIsWindowNativeDialogReplaced(self) || SXIsWindowNativeDialogProbing(self)) {
     [self sx_setAlphaValue:0.0];
     return;
   }
   [self sx_setAlphaValue:alphaValue];
 }
 
+- (NSRect)sx_constrainFrameRect:(NSRect)frameRect toScreen:(nullable NSScreen *)screen {
+  if (SXShouldStealthBlockWindow(self) || SXIsWindowNativeDialogReplaced(self)) {
+    return frameRect;
+  }
+  return [self sx_constrainFrameRect:frameRect toScreen:screen];
+}
+
 - (BOOL)sx_canBecomeKeyWindow {
-  if (SXShouldStealthBlockWindow(self)) return NO;
+  if (SXShouldStealthBlockWindow(self) || SXIsWindowNativeDialogReplaced(self)) return NO;
   return [self sx_canBecomeKeyWindow];
 }
 
 - (BOOL)sx_canBecomeMainWindow {
-  if (SXShouldStealthBlockWindow(self)) return NO;
+  if (SXShouldStealthBlockWindow(self) || SXIsWindowNativeDialogReplaced(self)) return NO;
   return [self sx_canBecomeMainWindow];
 }
 
 - (BOOL)sx_isExcludedFromWindowsMenu {
-  if (SXShouldStealthBlockWindow(self)) return YES;
+  if (SXShouldStealthBlockWindow(self) || SXIsWindowNativeDialogReplaced(self)) return YES;
   return [self sx_isExcludedFromWindowsMenu];
 }
 
@@ -159,6 +461,7 @@ void SXInstallStealthWindowBlocker(void) {
     SXSwizzleNSWindowMethod(@selector(orderFrontRegardless), @selector(sx_orderFrontRegardless));
     SXSwizzleNSWindowMethod(@selector(deminiaturize:), @selector(sx_deminiaturize:));
     SXSwizzleNSWindowMethod(@selector(setAlphaValue:), @selector(sx_setAlphaValue:));
+    SXSwizzleNSWindowMethod(@selector(constrainFrameRect:toScreen:), @selector(sx_constrainFrameRect:toScreen:));
     SXSwizzleNSWindowMethod(@selector(canBecomeKeyWindow), @selector(sx_canBecomeKeyWindow));
     SXSwizzleNSWindowMethod(@selector(canBecomeMainWindow), @selector(sx_canBecomeMainWindow));
     SXSwizzleNSWindowMethod(@selector(isExcludedFromWindowsMenu), @selector(sx_isExcludedFromWindowsMenu));
