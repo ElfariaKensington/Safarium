@@ -8,6 +8,8 @@
 #import "SXMediaTranscodeServer.h"
 #import "SXPrivacyEngine.h"
 
+#include <unordered_map>
+
 #include "include/base/cef_callback.h"
 #include "include/cef_client.h"
 #include "include/cef_display_handler.h"
@@ -546,6 +548,17 @@ class SXRogueChromeWindowTrapClient : public CefClient,
       fflush(stderr);
     }
 
+    // Remember the size Chrome gave the window (chrome.windows.create width/height) before hiding moves it
+    // offscreen at 100x100: an extension popout is re-created at that size.
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (!window_sizes_.count(bid) && browser->GetHost()) {
+        NSView *v = CAST_CEF_WINDOW_HANDLE_TO_NSVIEW(browser->GetHost()->GetWindowHandle());
+        NSSize size = v.window ? [v.window contentRectForFrameRect:v.window.frame].size : NSZeroSize;
+        if (size.width > 120 && size.height > 120) window_sizes_[bid] = size;
+      }
+    }
+
     // Hide the rogue NSWindow immediately so zero raw Chrome frames ever flash on screen.
     SXHideRogueWindow(browser);
 
@@ -560,7 +573,34 @@ class SXRogueChromeWindowTrapClient : public CefClient,
     if (shouldForward) {
       NSString *nsStr = [NSString stringWithUTF8String:urlStr.c_str()];
       NSURL *url = nsStr.length > 0 ? [NSURL URLWithString:nsStr] : nil;
-      if (url) {
+      // An extension's own page in a small window is `chrome.windows.create({type: 'popup'})` (Bitwarden's item
+      // pop-out, password generator, ...): open it as Safarium's native extension popout window. It used to be
+      // forwarded as a tab request, which never showed up, so the extension's pop-out buttons did nothing.
+      NSSize size = NSZeroSize;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = window_sizes_.find(bid);
+        if (it != window_sizes_.end()) size = it->second;
+      }
+      bool isExtensionPage = [url.scheme isEqualToString:@"chrome-extension"] && url.host.length > 0;
+      bool looksLikePopout = size.width > 0 && size.width <= 900;
+      if (getenv("SAFARIUM_CEF_DEBUG")) {
+        fprintf(stderr, "[RogueChromeTrap] forward bid=%d ext=%d size=%.0fx%.0f\n", bid, isExtensionPage ? 1 : 0,
+                size.width, size.height);
+        fflush(stderr);
+      }
+      if (url && isExtensionPage && looksLikePopout) {
+        NSString *extId = url.host;
+        CGFloat w = size.width, h = size.height;
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [[SXExtensionManager sharedManager] openPopoutWindowForExtensionID:extId
+                                                                         url:url
+                                                                       width:w
+                                                                      height:h
+                                                                        left:-1
+                                                                         top:-1];
+        });
+      } else if (url) {
         dispatch_async(dispatch_get_main_queue(), ^{
           [[SXEngineRuntime sharedRuntime] postNewTabRequestForURL:url];
         });
@@ -670,11 +710,13 @@ class SXRogueChromeWindowTrapClient : public CefClient,
     if (!browser) return;
     std::lock_guard<std::mutex> lock(mu_);
     forwarded_ids_.erase(browser->GetIdentifier());
+    window_sizes_.erase(browser->GetIdentifier());
   }
 
  private:
   std::mutex mu_;
   std::unordered_set<int> forwarded_ids_;
+  std::unordered_map<int, NSSize> window_sizes_;
   IMPLEMENT_REFCOUNTING(SXRogueChromeWindowTrapClient);
 };
 
