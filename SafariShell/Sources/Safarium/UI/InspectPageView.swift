@@ -343,8 +343,10 @@ final class InspectPageView: NSView, NSTextFieldDelegate {
             contentStack.bottomAnchor.constraint(equalTo: contentDocView.bottomAnchor, constant: -40)
         ])
 
+        // Stay below NSLayoutPriority.dragThatCannotResizeWindow (490) and .windowSizeStayPut (500):
+        // above 500, combined with `contentStack.width <= 820`, this capped the entire browser window at 1101pt!
         let minWidth = contentStack.widthAnchor.constraint(equalTo: contentDocView.widthAnchor, constant: -64)
-        minWidth.priority = .defaultHigh
+        minWidth.priority = .init(450)
         minWidth.isActive = true
 
         updateSidebarSelection()

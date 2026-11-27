@@ -183,4 +183,11 @@ class SXBrowserClient;
 CefRefPtr<CefDictionaryValue> SXBuildPrivacyExtraInfoDictionary(bool isPrivate);
 CefRefPtr<CefDictionaryValue> SXBuildPrivacyConfigUpdateDictionary(bool isPrivate = false);
 
+// Stealth blocker for internal/rogue Chromium windows (e.g. chrome://extensions admin loader).
+// Ensures they can never be ordered on screen, shown in the Window menu, Mission Control, or Exposé.
+void SXInstallStealthWindowBlocker(void);
+void SXLockWindowPermanentlyHidden(NSWindow * _Nullable window);
+void SXBeginHiddenChromeWindowCreation(void);
+void SXEndHiddenChromeWindowCreation(void);
+
 NS_ASSUME_NONNULL_END

@@ -201,7 +201,7 @@ final class AssetLoaderTests: HermeticTestCase {
         XCTAssertEqual(counter.count, 0)
     }
 
-    func testMergeImportedFavoritesPrependsNewURLsOnlyOnce() {
+    func testMergeImportedFavoritesAppendsNewURLsOnlyOnce() {
         let before = loader.favorites()
         let duplicateOfExisting = AssetLoader.BookmarkEntry(id: "dupe", title: "Dupe", url: before[0].url, color: nil)
         let newA = AssetLoader.BookmarkEntry(id: "new-a", title: "A", url: "https://a-new.example/", color: nil)
@@ -212,7 +212,7 @@ final class AssetLoaderTests: HermeticTestCase {
         XCTAssertEqual(added, 1)
         let after = loader.favorites()
         XCTAssertEqual(after.count, before.count + 1)
-        XCTAssertEqual(after.first?.id, "new-a")
+        XCTAssertEqual(after.last?.id, "new-a")
     }
 
     func testMergeImportedFavoritesAppendsWhenPrependIsFalse() {

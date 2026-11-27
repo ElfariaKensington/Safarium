@@ -1291,7 +1291,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let handler: (NSApplication.ModalResponse) -> Void = { response in
             guard response == .OK, let url = panel.url else { return }
             let parsed = BrowserDataImporter.shared.parseNetscapeBookmarksHTML(at: url)
-            _ = AssetLoader.shared.mergeImportedFavorites(parsed, prepend: true)
+            _ = AssetLoader.shared.mergeImportedFavorites(parsed, prepend: false)
         }
         if let win = activeWindowController?.window {
             panel.beginSheetModal(for: win, completionHandler: handler)

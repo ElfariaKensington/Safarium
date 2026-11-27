@@ -121,12 +121,13 @@ final class StartPageViewTests: HermeticTestCase {
 
     // MARK: - Recent entries value type
 
-    func testNarrowWindowScalesContentToFitInsteadOfClipping() {
+    func testStartPageEnforcesMinimumWidthWithoutShrinking() {
         let v = StartPageView(frame: NSRect(x: 0, y: 0, width: 680, height: 600))
         v.layoutSubtreeIfNeeded()
         let sv = v.subviews.compactMap { $0 as? NSScrollView }.first
         XCTAssertNotNil(sv)
-        XCTAssertEqual(sv!.magnification, 680.0 / 834.0, accuracy: 0.001)
+        XCTAssertEqual(sv!.magnification, 1.0, accuracy: 0.001, "StartPage must never shrink via magnification")
+        XCTAssertGreaterThanOrEqual(v.fittingSize.width, StartPageView.minWidth)
         v.setFrameSize(NSSize(width: 1000, height: 600))
         v.layoutSubtreeIfNeeded()
         XCTAssertEqual(sv!.magnification, 1.0, accuracy: 0.001)

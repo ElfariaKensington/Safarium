@@ -7,7 +7,7 @@ enum SafariMetrics {
     static let windowCornerRadius: CGFloat = 26.0
     static let defaultWindowWidth: CGFloat = 1200.0
     static let defaultWindowHeight: CGFloat = 800.0
-    static let minWindowWidth: CGFloat = 680.0
+    static let minWindowWidth: CGFloat = 834.0
     static let minWindowHeight: CGFloat = 460.0
 
     /// Exact native macOS 27.3 unified NSToolbar height (`y = 0..52 pt`) + 0.5pt bottom hairline.

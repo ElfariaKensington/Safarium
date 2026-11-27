@@ -422,6 +422,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         window.isMovableByWindowBackground = false
         window.acceptsMouseMovedEvents = true
         window.minSize = NSSize(width: SafariMetrics.minWindowWidth, height: SafariMetrics.minWindowHeight)
+        window.contentMinSize = NSSize(width: SafariMetrics.minWindowWidth, height: SafariMetrics.minWindowHeight)
         window.collectionBehavior = [.fullScreenPrimary]
         window.backgroundColor = .white
         // Native opaque window prevents corner pixel clipping artifacts around the 26pt macOS 27 window curve!
@@ -524,6 +525,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         rootView.addSubview(sidebarView)
 
         NSLayoutConstraint.activate([
+            rootView.widthAnchor.constraint(greaterThanOrEqualToConstant: SafariMetrics.minWindowWidth),
             mplc,
             mainPaneView.trailingAnchor.constraint(equalTo: rootView.trailingAnchor),
             mainPaneView.topAnchor.constraint(equalTo: rootView.topAnchor),
@@ -3456,7 +3458,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             url: url.absoluteString,
             color: nil
         )
-        _ = AssetLoader.shared.mergeImportedFavorites([entry], prepend: true)
+        _ = AssetLoader.shared.mergeImportedFavorites([entry], prepend: false)
     }
 
     func bookmarkAllOpenTabs() {
@@ -3473,7 +3475,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             )
         }
         guard !entries.isEmpty else { return }
-        _ = AssetLoader.shared.mergeImportedFavorites(entries, prepend: true)
+        _ = AssetLoader.shared.mergeImportedFavorites(entries, prepend: false)
     }
 
     func addCurrentPageToReadingList() {

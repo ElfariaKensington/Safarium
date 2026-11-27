@@ -9,7 +9,7 @@ final class SafariMetricsTests: HermeticTestCase {
         XCTAssertEqual(SafariMetrics.windowCornerRadius, 26)
         XCTAssertEqual(SafariMetrics.defaultWindowWidth, 1200)
         XCTAssertEqual(SafariMetrics.defaultWindowHeight, 800)
-        XCTAssertEqual(SafariMetrics.minWindowWidth, 680)
+        XCTAssertEqual(SafariMetrics.minWindowWidth, 834)
         XCTAssertEqual(SafariMetrics.minWindowHeight, 460)
     }
 

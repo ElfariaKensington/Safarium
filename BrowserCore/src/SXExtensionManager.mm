@@ -1175,6 +1175,7 @@ class SXLiveExtensionLoader : public CefClient,
     }
     ready_ = false;
     creating_ = false;
+    EndCreationGuard();
   }
 
   bool OnFileDialog(CefRefPtr<CefBrowser> browser,
@@ -1211,22 +1212,19 @@ class SXLiveExtensionLoader : public CefClient,
     int bid = browser->GetIdentifier();
     open_browsers_.push_back(browser);
 
-    // Keep ANY Chrome-style window owned by the extension loader completely invisible.
+    // Keep ANY Chrome-style window owned by the extension loader permanently invisible
+    // and completely absent from the Window menu, Mission Control, Exposé, and Cmd+`.
     if (browser->GetHost()) {
       NSView *v = CAST_CEF_WINDOW_HANDLE_TO_NSVIEW(browser->GetHost()->GetWindowHandle());
       if (v && v.window) {
         NSWindow *w = v.window;
-        [w setAlphaValue:0.0];
-        [w setIgnoresMouseEvents:YES];
-        [w orderOut:nil];
+        SXLockWindowPermanentlyHidden(w);
         dispatch_async(dispatch_get_main_queue(), ^{
-          if (w.isVisible) {
-            [w setAlphaValue:0.0];
-            [w orderOut:nil];
-          }
+          SXLockWindowPermanentlyHidden(w);
         });
       }
     }
+    EndCreationGuard();
 
     if (shutting_down_) {
       if (browser->GetHost()) browser->GetHost()->CloseBrowser(true);
@@ -1349,6 +1347,7 @@ class SXLiveExtensionLoader : public CefClient,
     t.arg = arg;
     t.boolVal = boolVal;
     t.callback = std::move(cb);
+    ++idle_generation_;
     queue_.push_back(std::move(t));
     if (getenv("SAFARIUM_CEF_DEBUG")) {
       fprintf(stderr, "[ExtLoader] Enqueue op=%d arg=%s\n", (int)op, arg.c_str());
@@ -1356,6 +1355,36 @@ class SXLiveExtensionLoader : public CefClient,
     }
     EnsureBrowserCreated();
     DrainQueue();
+  }
+
+  void EndCreationGuard() {
+    if (creation_guard_active_) {
+      creation_guard_active_ = false;
+      SXEndHiddenChromeWindowCreation();
+    }
+  }
+
+  void ScheduleIdleClose() {
+    CEF_REQUIRE_UI_THREAD();
+    if (shutting_down_ || active_task_ || !queue_.empty() || !browser_) return;
+    int gen = ++idle_generation_;
+    CefRefPtr<SXLiveExtensionLoader> selfRef(this);
+    CefPostDelayedTask(
+        TID_UI,
+        CefCreateClosureTask(base::BindOnce(&SXLiveExtensionLoader::CloseIfIdle, selfRef, gen)),
+        2000);
+  }
+
+  void CloseIfIdle(int gen) {
+    CEF_REQUIRE_UI_THREAD();
+    if (shutting_down_ || gen != idle_generation_ || active_task_ || !queue_.empty()) return;
+    if (browser_ && browser_->GetHost()) {
+      if (getenv("SAFARIUM_CEF_DEBUG")) {
+        fprintf(stderr, "[ExtLoader] Closing idle hidden admin browser id=%d\n", admin_browser_id_);
+        fflush(stderr);
+      }
+      browser_->GetHost()->CloseBrowser(true);
+    }
   }
 
   void EnsureBrowserCreated() {
@@ -1374,10 +1403,20 @@ class SXLiveExtensionLoader : public CefClient,
 
     // Create a hidden offscreen Chrome-style browser (parent_view == nullptr so CEF
     // selects CEF_RUNTIME_STYLE_CHROME, enabling chrome://extensions/ and developerPrivate).
+    // Guard creation with the NSWindow stealth blocker so zero Chromium frames ever reach screen.
+    if (!creation_guard_active_) {
+      creation_guard_active_ = true;
+      SXBeginHiddenChromeWindowCreation();
+      CefRefPtr<SXLiveExtensionLoader> selfRef(this);
+      CefPostDelayedTask(
+          TID_UI,
+          CefCreateClosureTask(base::BindOnce(&SXLiveExtensionLoader::EndCreationGuard, selfRef)),
+          5000);
+    }
     CefWindowInfo windowInfo;
     windowInfo.parent_view = nullptr;
     windowInfo.hidden = true;
-    windowInfo.bounds = CefRect(-10000, -10000, 400, 300);
+    windowInfo.bounds = CefRect(-30000, -30000, 100, 100);
     windowInfo.runtime_style = CEF_RUNTIME_STYLE_CHROME;
     CefBrowserSettings settings;
     CefBrowserHost::CreateBrowser(windowInfo, this, CefString("chrome://extensions/"),
@@ -1477,6 +1516,7 @@ class SXLiveExtensionLoader : public CefClient,
     active_task_.reset();
     if (cb) cb(false, "");
     DrainQueue();
+    ScheduleIdleClose();
   }
 
   void HandleResultJSON(const std::string& jsonStr) {
@@ -1519,15 +1559,18 @@ class SXLiveExtensionLoader : public CefClient,
     active_task_.reset();
     if (cb) cb(ok && !matchedId.empty(), matchedId);
     DrainQueue();
+    ScheduleIdleClose();
   }
 
   int admin_browser_id_ = -1;
   CefRefPtr<CefBrowser> browser_;
   std::vector<CefRefPtr<CefBrowser>> open_browsers_;
   bool creating_ = false;
+  bool creation_guard_active_ = false;
   bool ready_ = false;
   bool shutting_down_ = false;
   int next_req_id_ = 0;
+  int idle_generation_ = 0;
   std::string pending_dialog_dir_;
   std::unique_ptr<Task> active_task_;
   std::deque<Task> queue_;

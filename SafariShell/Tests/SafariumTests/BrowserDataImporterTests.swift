@@ -1205,4 +1205,39 @@ final class BrowserDataImporterTests: HermeticTestCase {
         let url = try netscapeFile("<DL><p><DT>Folder</DT></DL><p>plain text https://not-a-link.example.test/")
         XCTAssertTrue(importer.parseNetscapeBookmarksHTML(at: url).isEmpty)
     }
+
+    func testChromiumScanMergesAccountBookmarksAndDeduplicates() throws {
+        let dir = try root().appendingPathComponent("ChromeDefault", isDirectory: true)
+        try ImporterFixtures.makeDirectory(dir)
+        let localJSON: [String: Any] = [
+            "roots": [
+                "bookmark_bar": [
+                    "type": "folder",
+                    "name": "Bookmarks Bar",
+                    "children": [
+                        ["type": "url", "name": "Local Site", "url": "https://local.example.test/"]
+                    ]
+                ]
+            ]
+        ]
+        let accountJSON: [String: Any] = [
+            "roots": [
+                "bookmark_bar": [
+                    "type": "folder",
+                    "name": "Bookmarks Bar",
+                    "children": [
+                        ["type": "url", "name": "Local Dup", "url": "https://local.example.test"],
+                        ["type": "url", "name": "Account Site", "url": "https://account.example.test/"]
+                    ]
+                ]
+            ]
+        ]
+        try ImporterFixtures.writeJSON(localJSON, to: dir.appendingPathComponent("Bookmarks"))
+        try ImporterFixtures.writeJSON(accountJSON, to: dir.appendingPathComponent("AccountBookmarks"))
+
+        XCTAssertTrue(importer.hasChromiumProfileData(in: dir))
+        let profile = DetectedBrowserProfile(browser: .chrome, profileName: "Default", directory: dir, requiresPermissionGrant: false)
+        let scan = importer.scan(profile: profile, installedExtensionIDs: [], installedExtensionNames: [])
+        XCTAssertEqual(scan.bookmarks.map(\.url), ["https://local.example.test/", "https://account.example.test/"])
+    }
 }

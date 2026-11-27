@@ -17,8 +17,192 @@
 #include "include/wrapper/cef_helpers.h"
 
 #import <AppKit/AppKit.h>
+#import <objc/runtime.h>
+#include <atomic>
 #include <mutex>
 #include <unordered_set>
+
+static const void *kSXStealthHiddenWindowKey = &kSXStealthHiddenWindowKey;
+static std::atomic<int> gSXHiddenChromeWindowCreationDepth{0};
+
+static BOOL SXIsChromiumNativeWindow(NSWindow * _Nullable w) {
+  if (!w) return NO;
+  NSString *cls = NSStringFromClass([w class]);
+  return [cls containsString:@"NativeWidgetMacNSWindow"] ||
+         [cls containsString:@"BrowserNativeWidget"] ||
+         [cls containsString:@"ChromeBrowser"];
+}
+
+static BOOL SXIsDevToolsChromeWindow(NSWindow * _Nullable w) {
+  if (!w) return NO;
+  NSString *title = w.title ?: @"";
+  return [title rangeOfString:@"DevTools" options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static BOOL SXIsWindowStealthLocked(NSWindow * _Nullable w) {
+  if (!w) return NO;
+  return [objc_getAssociatedObject(w, kSXStealthHiddenWindowKey) boolValue];
+}
+
+static BOOL SXShouldStealthBlockWindow(NSWindow * _Nullable w) {
+  if (!w) return NO;
+  if (SXIsWindowStealthLocked(w)) return YES;
+  if (!SXIsChromiumNativeWindow(w) || SXIsDevToolsChromeWindow(w)) return NO;
+
+  if (gSXHiddenChromeWindowCreationDepth.load(std::memory_order_acquire) > 0) {
+    SXLockWindowPermanentlyHidden(w);
+    return YES;
+  }
+  NSString *title = w.title ?: @"";
+  if ([title rangeOfString:@"Extensions" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+      [title rangeOfString:@"Chromium" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+    SXLockWindowPermanentlyHidden(w);
+    return YES;
+  }
+  return NO;
+}
+
+@interface NSWindow (SXStealthBlocker)
+- (void)sx_orderWindow:(NSWindowOrderingMode)place relativeTo:(NSInteger)otherWin;
+- (void)sx_makeKeyAndOrderFront:(nullable id)sender;
+- (void)sx_orderFront:(nullable id)sender;
+- (void)sx_orderFrontRegardless;
+- (void)sx_deminiaturize:(nullable id)sender;
+- (void)sx_setAlphaValue:(CGFloat)alphaValue;
+- (BOOL)sx_canBecomeKeyWindow;
+- (BOOL)sx_canBecomeMainWindow;
+- (BOOL)sx_isExcludedFromWindowsMenu;
+@end
+
+@implementation NSWindow (SXStealthBlocker)
+
+- (void)sx_orderWindow:(NSWindowOrderingMode)place relativeTo:(NSInteger)otherWin {
+  if (place != NSWindowOut && SXShouldStealthBlockWindow(self)) {
+    [self sx_setAlphaValue:0.0];
+    [self sx_orderWindow:NSWindowOut relativeTo:0];
+    return;
+  }
+  [self sx_orderWindow:place relativeTo:otherWin];
+}
+
+- (void)sx_makeKeyAndOrderFront:(nullable id)sender {
+  if (SXShouldStealthBlockWindow(self)) {
+    [self sx_orderWindow:NSWindowOut relativeTo:0];
+    return;
+  }
+  [self sx_makeKeyAndOrderFront:sender];
+}
+
+- (void)sx_orderFront:(nullable id)sender {
+  if (SXShouldStealthBlockWindow(self)) {
+    [self sx_orderWindow:NSWindowOut relativeTo:0];
+    return;
+  }
+  [self sx_orderFront:sender];
+}
+
+- (void)sx_orderFrontRegardless {
+  if (SXShouldStealthBlockWindow(self)) {
+    [self sx_orderWindow:NSWindowOut relativeTo:0];
+    return;
+  }
+  [self sx_orderFrontRegardless];
+}
+
+- (void)sx_deminiaturize:(nullable id)sender {
+  if (SXShouldStealthBlockWindow(self)) {
+    return;
+  }
+  [self sx_deminiaturize:sender];
+}
+
+- (void)sx_setAlphaValue:(CGFloat)alphaValue {
+  if (SXShouldStealthBlockWindow(self)) {
+    [self sx_setAlphaValue:0.0];
+    return;
+  }
+  [self sx_setAlphaValue:alphaValue];
+}
+
+- (BOOL)sx_canBecomeKeyWindow {
+  if (SXShouldStealthBlockWindow(self)) return NO;
+  return [self sx_canBecomeKeyWindow];
+}
+
+- (BOOL)sx_canBecomeMainWindow {
+  if (SXShouldStealthBlockWindow(self)) return NO;
+  return [self sx_canBecomeMainWindow];
+}
+
+- (BOOL)sx_isExcludedFromWindowsMenu {
+  if (SXShouldStealthBlockWindow(self)) return YES;
+  return [self sx_isExcludedFromWindowsMenu];
+}
+
+@end
+
+static void SXSwizzleNSWindowMethod(SEL origSel, SEL swizzledSel) {
+  Class cls = [NSWindow class];
+  Method orig = class_getInstanceMethod(cls, origSel);
+  Method swizzled = class_getInstanceMethod(cls, swizzledSel);
+  if (orig && swizzled) {
+    method_exchangeImplementations(orig, swizzled);
+  }
+}
+
+void SXInstallStealthWindowBlocker(void) {
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    SXSwizzleNSWindowMethod(@selector(orderWindow:relativeTo:), @selector(sx_orderWindow:relativeTo:));
+    SXSwizzleNSWindowMethod(@selector(makeKeyAndOrderFront:), @selector(sx_makeKeyAndOrderFront:));
+    SXSwizzleNSWindowMethod(@selector(orderFront:), @selector(sx_orderFront:));
+    SXSwizzleNSWindowMethod(@selector(orderFrontRegardless), @selector(sx_orderFrontRegardless));
+    SXSwizzleNSWindowMethod(@selector(deminiaturize:), @selector(sx_deminiaturize:));
+    SXSwizzleNSWindowMethod(@selector(setAlphaValue:), @selector(sx_setAlphaValue:));
+    SXSwizzleNSWindowMethod(@selector(canBecomeKeyWindow), @selector(sx_canBecomeKeyWindow));
+    SXSwizzleNSWindowMethod(@selector(canBecomeMainWindow), @selector(sx_canBecomeMainWindow));
+    SXSwizzleNSWindowMethod(@selector(isExcludedFromWindowsMenu), @selector(sx_isExcludedFromWindowsMenu));
+  });
+}
+
+void SXLockWindowPermanentlyHidden(NSWindow * _Nullable window) {
+  if (!window) return;
+  SXInstallStealthWindowBlocker();
+  BOOL alreadyLocked = SXIsWindowStealthLocked(window);
+  objc_setAssociatedObject(window, kSXStealthHiddenWindowKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  if (alreadyLocked) {
+    [window sx_setAlphaValue:0.0];
+    [window sx_orderWindow:NSWindowOut relativeTo:0];
+    return;
+  }
+  [window setExcludedFromWindowsMenu:YES];
+  [window setCollectionBehavior:NSWindowCollectionBehaviorTransient |
+                                NSWindowCollectionBehaviorIgnoresCycle |
+                                NSWindowCollectionBehaviorStationary];
+  [window setSharingType:NSWindowSharingNone];
+  [window setIgnoresMouseEvents:YES];
+  [window setCanHide:NO];
+  [window setHidesOnDeactivate:NO];
+  if ([window respondsToSelector:@selector(setAccessibilityElement:)]) {
+    [window setAccessibilityElement:NO];
+  }
+  [window setFrame:NSMakeRect(-30000, -30000, 100, 100) display:NO];
+  [window sx_setAlphaValue:0.0];
+  [window sx_orderWindow:NSWindowOut relativeTo:0];
+  [NSApp removeWindowsItem:window];
+}
+
+void SXBeginHiddenChromeWindowCreation(void) {
+  SXInstallStealthWindowBlocker();
+  gSXHiddenChromeWindowCreationDepth.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void SXEndHiddenChromeWindowCreation(void) {
+  int prev = gSXHiddenChromeWindowCreationDepth.fetch_sub(1, std::memory_order_acq_rel);
+  if (prev <= 0) {
+    gSXHiddenChromeWindowCreationDepth.store(0, std::memory_order_release);
+  }
+}
 
 namespace {
 
@@ -27,13 +211,9 @@ static void SXHideRogueWindow(CefRefPtr<CefBrowser> browser) {
   NSView *v = CAST_CEF_WINDOW_HANDLE_TO_NSVIEW(browser->GetHost()->GetWindowHandle());
   if (v && v.window) {
     NSWindow *w = v.window;
-    [w setAlphaValue:0.0];
-    [w orderOut:nil];
+    SXLockWindowPermanentlyHidden(w);
     dispatch_async(dispatch_get_main_queue(), ^{
-      if (w.isVisible) {
-        [w setAlphaValue:0.0];
-        [w orderOut:nil];
-      }
+      SXLockWindowPermanentlyHidden(w);
     });
   }
 }
@@ -251,6 +431,7 @@ void SXBrowserApp::OnBeforeCommandLineProcessing(
 }
 
 void SXBrowserApp::OnContextInitialized() {
+  SXInstallStealthWindowBlocker();
   SXMediaTranscodeServer::Shared().Start();
   if (NSThread.isMainThread) {
     [[SXEngineRuntime sharedRuntime] markContextInitialized];

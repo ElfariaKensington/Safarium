@@ -356,6 +356,7 @@ final class BrowserDataImporter {
     func hasChromiumProfileData(in dir: URL) -> Bool {
         let fm = FileManager.default
         return fm.fileExists(atPath: dir.appendingPathComponent("Bookmarks").path) ||
+               fm.fileExists(atPath: dir.appendingPathComponent("AccountBookmarks").path) ||
                fm.fileExists(atPath: dir.appendingPathComponent("History").path) ||
                fm.fileExists(atPath: dir.appendingPathComponent("Extensions").path)
     }
@@ -455,7 +456,12 @@ final class BrowserDataImporter {
             }
         }
 
-        let (bookmarks, readingList) = parseChromiumBookmarks(fileURL: profile.directory.appendingPathComponent("Bookmarks"))
+        let (localBookmarks, localReadingList) = parseChromiumBookmarks(fileURL: profile.directory.appendingPathComponent("Bookmarks"))
+        let (accountBookmarks, accountReadingList) = parseChromiumBookmarks(fileURL: profile.directory.appendingPathComponent("AccountBookmarks"))
+        let (bookmarks, readingList) = Self.mergeChromiumBookmarks(
+            local: (localBookmarks, localReadingList),
+            account: (accountBookmarks, accountReadingList)
+        )
         let history = parseChromiumHistory(dbURL: profile.directory.appendingPathComponent("History"))
         let extensions = scanChromiumExtensions(
             profileDir: profile.directory,
@@ -521,6 +527,29 @@ final class BrowserDataImporter {
         for rootKey in ["bookmark_bar", "other", "synced"] {
             if let node = roots[rootKey] as? [String: Any] {
                 walk(node: node, isReadingList: false)
+            }
+        }
+        return (bookmarks, readingList)
+    }
+
+    static func mergeChromiumBookmarks(
+        local: ([AssetLoader.BookmarkEntry], [AssetLoader.ReadingListItem]),
+        account: ([AssetLoader.BookmarkEntry], [AssetLoader.ReadingListItem])
+    ) -> ([AssetLoader.BookmarkEntry], [AssetLoader.ReadingListItem]) {
+        var bookmarks = local.0
+        var seenBM = Set(local.0.map { AssetLoader.normalizedURLKey($0.url) })
+        for entry in account.0 {
+            let key = AssetLoader.normalizedURLKey(entry.url)
+            if seenBM.insert(key).inserted {
+                bookmarks.append(entry)
+            }
+        }
+        var readingList = local.1
+        var seenRL = Set(local.1.map { AssetLoader.normalizedURLKey($0.url) })
+        for item in account.1 {
+            let key = AssetLoader.normalizedURLKey(item.url)
+            if seenRL.insert(key).inserted {
+                readingList.append(item)
             }
         }
         return (bookmarks, readingList)
@@ -1106,7 +1135,7 @@ final class BrowserDataImporter {
 
         if selection.importBookmarks {
             onProgress("Importing bookmarks…", Double(completedSteps) / denom)
-            result.bookmarksImported = AssetLoader.shared.mergeImportedFavorites(scan.bookmarks, prepend: true)
+            result.bookmarksImported = AssetLoader.shared.mergeImportedFavorites(scan.bookmarks, prepend: false)
             completedSteps += 1
         }
 

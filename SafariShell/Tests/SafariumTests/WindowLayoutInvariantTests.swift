@@ -27,7 +27,7 @@ final class WindowLayoutInvariantTests: T8WindowTestCase {
         let (wc, _) = makeWindow()
         XCTAssertEqual(win(wc).minSize.width, SafariMetrics.minWindowWidth)
         XCTAssertGreaterThanOrEqual(win(wc).minSize.height, SafariMetrics.minWindowHeight, "frame minimum includes the titlebar strip")
-        XCTAssertEqual(SafariMetrics.minWindowWidth, 680)
+        XCTAssertEqual(SafariMetrics.minWindowWidth, 834)
         XCTAssertEqual(SafariMetrics.minWindowHeight, 460)
     }
 
@@ -92,11 +92,20 @@ final class WindowLayoutInvariantTests: T8WindowTestCase {
         XCTAssertEqual(contentSize(wc).height, 700, accuracy: 0.5)
     }
 
+    func testResizeCanWidenPastDefaultWidth() {
+        let (wc, _) = makeWindow()
+        let w = win(wc)
+        w.setFrameOrigin(NSPoint(x: -30000, y: -30000))
+        w.orderBack(nil)
+        setContent(wc, 2000, 900)
+        XCTAssertEqual(contentSize(wc).width, 2000, accuracy: 0.5, "window must widen freely without hidden width caps")
+        w.close()
+    }
+
     func testResizeBelowDeclaredMinimumWidthClampsToDeclaredWidth() {
         let (wc, _) = makeWindow()
         setContent(wc, 700, 600)
-        XCTAssertEqual(contentSize(wc).width, 700, accuracy: 1.0)
-    
+        XCTAssertEqual(contentSize(wc).width, SafariMetrics.minWindowWidth, accuracy: 1.0)
     }
 
     func testResizeWithCurrentMinimumWidthLeavesWindowUsable() {

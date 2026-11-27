@@ -125,12 +125,12 @@ final class ImportAndClearHistoryTests: HermeticTestCase {
         XCTAssertEqual(log.fractions, [1.0])
     }
 
-    func testBookmarksImportPrependsNewEntriesAndCountsUniqueOnes() {
+    func testBookmarksImportAppendsNewEntriesAndCountsUniqueOnes() {
         let a = url("a"), b = url("b")
         let entries = [bookmark("First", a), bookmark("Dup", a + "/"), bookmark("Second", b)]
         let (result, log) = runImport(scan(bookmarks: entries), selection(bookmarks: true), engine: ScriptedImportEngine())
         XCTAssertEqual(result?.bookmarksImported, 2)
-        XCTAssertEqual(AssetLoader.shared.favorites().prefix(2).map(\.url), [a, b])
+        XCTAssertEqual(AssetLoader.shared.favorites().suffix(2).map(\.url), [a, b])
         XCTAssertEqual(log.statuses.first, "Importing bookmarks…")
         XCTAssertEqual(log.statuses.last, "Import complete")
     }
@@ -141,6 +141,22 @@ final class ImportAndClearHistoryTests: HermeticTestCase {
         let (second, _) = runImport(scan(bookmarks: [bookmark("Again", existing)]), selection(bookmarks: true), engine: ScriptedImportEngine())
         XCTAssertEqual(second?.bookmarksImported, 0)
         XCTAssertEqual(AssetLoader.shared.favorites().filter { $0.url == existing }.count, 1)
+    }
+
+    func testLocalizedHomepageBookmarksReplaceBuiltInDefaultsWithoutDuplicates() {
+        let imported = [
+            bookmark("Apple", "https://www.apple.com/tr"),
+            bookmark("Google", "https://www.google.com.tr/?client=safari&channel=iphone_bm"),
+            bookmark("Wallpaper A", "https://wallpaperaccess.com/download/mountain-forest-381417"),
+            bookmark("Wallpaper B", "https://wallpaperaccess.com/mountain-forest")
+        ]
+        _ = runImport(scan(bookmarks: imported), selection(bookmarks: true), engine: ScriptedImportEngine())
+        let favs = AssetLoader.shared.favorites()
+        XCTAssertEqual(favs.filter { $0.title == "Apple" }.count, 1, "apple.com/tr must not duplicate built-in apple.com/")
+        XCTAssertEqual(favs.first(where: { $0.title == "Apple" })?.url, "https://www.apple.com/tr")
+        XCTAssertEqual(favs.filter { $0.title == "Google" }.count, 1, "google.com.tr must not duplicate built-in google.com")
+        XCTAssertEqual(favs.first(where: { $0.title == "Google" })?.url, "https://www.google.com.tr/?client=safari&channel=iphone_bm")
+        XCTAssertEqual(favs.filter { $0.url.contains("wallpaperaccess.com") }.count, 2, "distinct deep links on same host must remain")
     }
 
     func testReadingListImportAddsAtFrontAndDedupes() {

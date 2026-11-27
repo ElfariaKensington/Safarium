@@ -19,6 +19,7 @@ final class ImportDataWindowController: NSWindowController {
     private var currentScan: BrowserProfileScan?
     private var isImporting: Bool = false
     private var isShowingDiskAccessPrompt: Bool = false
+    private var needsAccessRescan: Bool = false
     private var appActiveObserver: NSObjectProtocol?
 
     // Compact sheet layout views
@@ -34,6 +35,7 @@ final class ImportDataWindowController: NSWindowController {
     private let extensionsCheck = NSButton(checkboxWithTitle: "Extensions", target: nil, action: nil)
 
     private let detailLabel = NSTextField(wrappingLabelWithString: "")
+    private let grantAccessButton = NSButton(title: "Grant Disk Access…", target: nil, action: nil)
     private let progressBar = NSProgressIndicator()
 
     private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
@@ -74,7 +76,7 @@ final class ImportDataWindowController: NSWindowController {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self, self.isShowingDiskAccessPrompt, !self.isImporting else { return }
+            guard let self, (self.isShowingDiskAccessPrompt || self.needsAccessRescan), !self.isImporting else { return }
             self.scanBrowser()
         }
 
@@ -148,6 +150,18 @@ final class ImportDataWindowController: NSWindowController {
         detailLabel.stringValue = "Checking \(browser.rawValue)…"
         contentStack.addArrangedSubview(detailLabel)
         contentStack.setCustomSpacing(10, after: extensionsCheck)
+
+        grantAccessButton.translatesAutoresizingMaskIntoConstraints = false
+        grantAccessButton.controlSize = .small
+        grantAccessButton.target = self
+        grantAccessButton.action = #selector(openDiskAccessSettingsClicked)
+        if #available(macOS 26.0, *) {
+            grantAccessButton.bezelStyle = .glass
+        } else {
+            grantAccessButton.bezelStyle = .rounded
+        }
+        grantAccessButton.isHidden = true
+        contentStack.addArrangedSubview(grantAccessButton)
 
         progressBar.translatesAutoresizingMaskIntoConstraints = false
         progressBar.style = .bar
@@ -241,6 +255,8 @@ final class ImportDataWindowController: NSWindowController {
 
     private func applyNoDataState() {
         isShowingDiskAccessPrompt = false
+        needsAccessRescan = false
+        grantAccessButton.isHidden = true
         headingLabel.stringValue = "No Data Found"
         profileRow.isHidden = true
         bookmarksCheck.isHidden = true
@@ -262,6 +278,8 @@ final class ImportDataWindowController: NSWindowController {
 
         if scan.accessBlocked && !hasAnyData {
             isShowingDiskAccessPrompt = true
+            needsAccessRescan = true
+            grantAccessButton.isHidden = true
             headingLabel.stringValue = "Disk Access Required"
             profileRow.isHidden = true
             bookmarksCheck.isHidden = true
@@ -278,6 +296,7 @@ final class ImportDataWindowController: NSWindowController {
         }
 
         isShowingDiskAccessPrompt = false
+        needsAccessRescan = scan.accessBlocked
         headingLabel.stringValue = "Select the items to import:"
 
         // Profile selector (only when >1 profile exists)
@@ -292,17 +311,55 @@ final class ImportDataWindowController: NSWindowController {
             profileRow.isHidden = true
         }
 
-        bookmarksCheck.title = scan.bookmarks.isEmpty ? "Bookmarks" : "Bookmarks (\(scan.bookmarks.count))"
-        bookmarksCheck.isHidden = scan.bookmarks.isEmpty
-        bookmarksCheck.state = scan.bookmarks.isEmpty ? .off : .on
+        if !scan.bookmarks.isEmpty {
+            bookmarksCheck.title = "Bookmarks (\(scan.bookmarks.count))"
+            bookmarksCheck.isHidden = false
+            bookmarksCheck.isEnabled = true
+            bookmarksCheck.state = .on
+        } else if scan.accessBlocked {
+            bookmarksCheck.title = "Bookmarks (Requires Disk Access)"
+            bookmarksCheck.isHidden = false
+            bookmarksCheck.isEnabled = false
+            bookmarksCheck.state = .off
+        } else {
+            bookmarksCheck.title = "Bookmarks (None)"
+            bookmarksCheck.isHidden = false
+            bookmarksCheck.isEnabled = false
+            bookmarksCheck.state = .off
+        }
 
-        historyCheck.title = scan.history.isEmpty ? "History" : "History (\(scan.history.count))"
-        historyCheck.isHidden = scan.history.isEmpty
-        historyCheck.state = scan.history.isEmpty ? .off : .on
+        if !scan.history.isEmpty {
+            historyCheck.title = "History (\(scan.history.count))"
+            historyCheck.isHidden = false
+            historyCheck.isEnabled = true
+            historyCheck.state = .on
+        } else if scan.accessBlocked {
+            historyCheck.title = "History (Requires Disk Access)"
+            historyCheck.isHidden = false
+            historyCheck.isEnabled = false
+            historyCheck.state = .off
+        } else {
+            historyCheck.title = "History (None)"
+            historyCheck.isHidden = false
+            historyCheck.isEnabled = false
+            historyCheck.state = .off
+        }
 
-        readingListCheck.title = scan.readingList.isEmpty ? "Reading List" : "Reading List (\(scan.readingList.count))"
-        readingListCheck.isHidden = scan.readingList.isEmpty
-        readingListCheck.state = scan.readingList.isEmpty ? .off : .on
+        if !scan.readingList.isEmpty {
+            readingListCheck.title = "Reading List (\(scan.readingList.count))"
+            readingListCheck.isHidden = false
+            readingListCheck.isEnabled = true
+            readingListCheck.state = .on
+        } else if scan.accessBlocked && browser == .safari {
+            readingListCheck.title = "Reading List (Requires Disk Access)"
+            readingListCheck.isHidden = false
+            readingListCheck.isEnabled = false
+            readingListCheck.state = .off
+        } else {
+            readingListCheck.isHidden = true
+            readingListCheck.isEnabled = false
+            readingListCheck.state = .off
+        }
 
         if !importableExts.isEmpty {
             let convertibleCount = importableExts.filter {
@@ -314,29 +371,35 @@ final class ImportDataWindowController: NSWindowController {
                 ? "\(convertibleCount) extension(s) will be automatically converted to Chromium MV3."
                 : nil
             extensionsCheck.isHidden = false
+            extensionsCheck.isEnabled = true
             extensionsCheck.state = .on
         } else {
             extensionsCheck.isHidden = true
+            extensionsCheck.isEnabled = false
             extensionsCheck.state = .off
         }
 
         let incompatibleExts = scan.extensions.filter { !$0.compatibility.isImportable }
         if scan.accessBlocked {
-            // Safari extensions found even though Bookmarks/History require Full Disk Access
+            // Safari extensions found even though Bookmarks/History/Reading List require Full Disk Access
             detailLabel.isHidden = false
             detailLabel.textColor = .secondaryLabelColor
-            detailLabel.stringValue = "Grant Full Disk Access in System Settings to also import Safari bookmarks and history."
+            detailLabel.stringValue = "Allow Full Disk Access for Safarium in System Settings to also import \(browser.rawValue) bookmarks, history, and reading list."
+            grantAccessButton.isHidden = false
         } else if !hasAnyData {
+            grantAccessButton.isHidden = true
             detailLabel.isHidden = false
             detailLabel.textColor = .secondaryLabelColor
             detailLabel.stringValue = "Everything in \(browser.rawValue) is already imported or empty."
         } else if !incompatibleExts.isEmpty {
+            grantAccessButton.isHidden = true
             detailLabel.isHidden = false
             detailLabel.textColor = .secondaryLabelColor
             let names = incompatibleExts.prefix(2).map(\.name).joined(separator: ", ")
             let more = incompatibleExts.count > 2 ? " +\(incompatibleExts.count - 2) more" : ""
             detailLabel.stringValue = "Incompatible extensions skipped: \(names)\(more)."
         } else {
+            grantAccessButton.isHidden = true
             detailLabel.isHidden = true
         }
 
@@ -355,10 +418,10 @@ final class ImportDataWindowController: NSWindowController {
             return
         }
         let anyChecked =
-            (!bookmarksCheck.isHidden && bookmarksCheck.state == .on) ||
-            (!historyCheck.isHidden && historyCheck.state == .on) ||
-            (!readingListCheck.isHidden && readingListCheck.state == .on) ||
-            (!extensionsCheck.isHidden && extensionsCheck.state == .on)
+            (!bookmarksCheck.isHidden && bookmarksCheck.isEnabled && bookmarksCheck.state == .on) ||
+            (!historyCheck.isHidden && historyCheck.isEnabled && historyCheck.state == .on) ||
+            (!readingListCheck.isHidden && readingListCheck.isEnabled && readingListCheck.state == .on) ||
+            (!extensionsCheck.isHidden && extensionsCheck.isEnabled && extensionsCheck.state == .on)
         actionButton.isEnabled = anyChecked
     }
 
@@ -404,18 +467,40 @@ final class ImportDataWindowController: NSWindowController {
         syncActionButtonEnabled()
     }
 
+    @objc private func openDiskAccessSettingsClicked() {
+        needsAccessRescan = true
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     @objc private func actionClicked() {
         if isShowingDiskAccessPrompt {
-            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
-                NSWorkspace.shared.open(url)
-            }
+            openDiskAccessSettingsClicked()
             return
         }
 
         guard !isImporting, let scan = currentScan else { return }
+
+        let importableExtIDs = Set(
+            scan.extensions
+                .filter { !$0.isAlreadyInstalled && $0.compatibility.isImportable }
+                .map(\.id)
+        )
+
+        // Capture selection BEFORE disabling checkboxes for the in-progress UI state.
+        let selection = Self.makeSelection(
+            bookmarks: !bookmarksCheck.isHidden && bookmarksCheck.isEnabled && bookmarksCheck.state == .on,
+            history: !historyCheck.isHidden && historyCheck.isEnabled && historyCheck.state == .on,
+            readingList: !readingListCheck.isHidden && readingListCheck.isEnabled && readingListCheck.state == .on,
+            extensions: !extensionsCheck.isHidden && extensionsCheck.isEnabled && extensionsCheck.state == .on,
+            importableExtensionIDs: importableExtIDs
+        )
+
         isImporting = true
         actionButton.isEnabled = false
         cancelButton.isEnabled = false
+        grantAccessButton.isEnabled = false
         profilePopup.isEnabled = false
         for cb in [bookmarksCheck, historyCheck, readingListCheck, extensionsCheck] {
             cb.isEnabled = false
@@ -427,20 +512,6 @@ final class ImportDataWindowController: NSWindowController {
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.stringValue = "Importing from \(browser.rawValue)…"
         resizeSheetToFit()
-
-        let importableExtIDs = Set(
-            scan.extensions
-                .filter { !$0.isAlreadyInstalled && $0.compatibility.isImportable }
-                .map(\.id)
-        )
-
-        let selection = Self.makeSelection(
-            bookmarks: !bookmarksCheck.isHidden && bookmarksCheck.state == .on,
-            history: !historyCheck.isHidden && historyCheck.state == .on,
-            readingList: !readingListCheck.isHidden && readingListCheck.state == .on,
-            extensions: !extensionsCheck.isHidden && extensionsCheck.state == .on,
-            importableExtensionIDs: importableExtIDs
-        )
 
         BrowserDataImporter.shared.performImport(
             scan: scan,

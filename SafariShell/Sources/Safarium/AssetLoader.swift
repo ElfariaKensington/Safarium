@@ -192,8 +192,15 @@ final class AssetLoader {
         }
         if let savedData = UserDefaults.standard.data(forKey: Self.customFavoritesDefaultsKey),
            let decoded = try? JSONDecoder().decode([BookmarkEntry].self, from: savedData) {
-            cachedFavorites = decoded
-            return decoded
+            let deduped = Self.deduplicateFavorites(decoded)
+            cachedFavorites = deduped
+            if deduped.count != decoded.count {
+                UserDefaults.standard.set(deduped.map(\.url), forKey: Self.favoritesOrderDefaultsKey)
+                if let encoded = try? JSONEncoder().encode(deduped) {
+                    UserDefaults.standard.set(encoded, forKey: Self.customFavoritesDefaultsKey)
+                }
+            }
+            return deduped
         }
 
         let fileURL = referenceRootURL
@@ -271,25 +278,168 @@ final class AssetLoader {
     }
 
     @discardableResult
-    func mergeImportedFavorites(_ imported: [BookmarkEntry], prepend: Bool = true) -> Int {
+    func mergeImportedFavorites(_ imported: [BookmarkEntry], prepend: Bool = false) -> Int {
         guard !imported.isEmpty else { return 0 }
         var existing = favorites()
-        var seen = Set(existing.map { Self.normalizedURLKey($0.url) })
+
+        // Track exact URL keys and canonical homepage keys (e.g. apple.com/tr vs apple.com/,
+        // google.com.tr/?client=safari&channel=iphone_bm vs google.com/?client=safari&channel=mac_bm).
+        var existingExactKeys = Set(existing.map { Self.normalizedURLKey($0.url) })
+        var seenImportKeys = Set<String>()
+        var seenImportHomeKeys = Set<String>()
         var additions: [BookmarkEntry] = []
+        var replacedCount = 0
+
         for entry in imported {
-            let key = Self.normalizedURLKey(entry.url)
-            guard !key.isEmpty, !seen.contains(key) else { continue }
-            seen.insert(key)
+            let exactKey = Self.normalizedURLKey(entry.url)
+            guard !exactKey.isEmpty, !seenImportKeys.contains(exactKey) else { continue }
+            let homeKeys = Self.canonicalFavoriteHomepageKeys(url: entry.url, title: entry.title)
+            if !homeKeys.isDisjoint(with: seenImportHomeKeys) {
+                continue
+            }
+            if existingExactKeys.contains(exactKey) {
+                seenImportKeys.insert(exactKey)
+                seenImportHomeKeys.formUnion(homeKeys)
+                continue
+            }
+
+            // If an existing built-in entry matches the same canonical homepage (e.g. built-in US
+            // Apple/Google vs imported localized apple.com/tr or google.com.tr), replace it in place
+            // so the user's localized bookmark wins without creating a duplicate or shifting order.
+            if !homeKeys.isEmpty {
+                let matchingIndices = existing.indices.filter { idx in
+                    let existingHomeKeys = Self.canonicalFavoriteHomepageKeys(
+                        url: existing[idx].url,
+                        title: existing[idx].title
+                    )
+                    return !homeKeys.isDisjoint(with: existingHomeKeys)
+                }
+                if !matchingIndices.isEmpty {
+                    let existingIsOnlyBuiltIn = matchingIndices.allSatisfy { idx in
+                        !existing[idx].id.hasPrefix("imp-")
+                    }
+                    if existingIsOnlyBuiltIn {
+                        let firstIdx = matchingIndices[0]
+                        for idx in matchingIndices.reversed() {
+                            existingExactKeys.remove(Self.normalizedURLKey(existing[idx].url))
+                            if idx != firstIdx {
+                                existing.remove(at: idx)
+                            }
+                        }
+                        existing[firstIdx] = entry
+                        existingExactKeys.insert(exactKey)
+                        seenImportKeys.insert(exactKey)
+                        seenImportHomeKeys.formUnion(homeKeys)
+                        replacedCount += 1
+                        continue
+                    } else {
+                        seenImportKeys.insert(exactKey)
+                        seenImportHomeKeys.formUnion(homeKeys)
+                        continue
+                    }
+                }
+            }
+
+            seenImportKeys.insert(exactKey)
+            seenImportHomeKeys.formUnion(homeKeys)
+            existingExactKeys.insert(exactKey)
             additions.append(entry)
         }
-        guard !additions.isEmpty else { return 0 }
+
+        guard !additions.isEmpty || replacedCount > 0 else { return 0 }
         if prepend {
             existing.insert(contentsOf: additions, at: 0)
         } else {
             existing.append(contentsOf: additions)
         }
-        saveFavoritesOrder(existing)
-        return additions.count
+        saveFavoritesOrder(Self.deduplicateFavorites(existing))
+        return additions.count + replacedCount
+    }
+
+    static func deduplicateFavorites(_ entries: [BookmarkEntry]) -> [BookmarkEntry] {
+        var result: [BookmarkEntry] = []
+        var seenExact = Set<String>()
+        var seenHome = Set<String>()
+        for entry in entries {
+            let exact = normalizedURLKey(entry.url)
+            guard !exact.isEmpty, !seenExact.contains(exact) else { continue }
+            let homeKeys = canonicalFavoriteHomepageKeys(url: entry.url, title: entry.title)
+            if !homeKeys.isDisjoint(with: seenHome) {
+                continue
+            }
+            seenExact.insert(exact)
+            seenHome.formUnion(homeKeys)
+            result.append(entry)
+        }
+        return result
+    }
+
+    /// Returns canonical deduplication keys for homepage / localized-root bookmarks so regional
+    /// variants (`apple.com/tr` vs `apple.com/`, `google.com.tr/?client=safari&channel=iphone_bm`
+    /// vs `google.com/?client=safari&channel=mac_bm`) never duplicate on the Start Page.
+    /// Non-homepage deep links return an empty set so distinct pages on the same host stay separate.
+    static func canonicalFavoriteHomepageKeys(url rawURL: String, title: String) -> Set<String> {
+        let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let comps = URLComponents(string: trimmed),
+              var host = comps.host?.lowercased(), !host.isEmpty else {
+            return []
+        }
+        if host.hasPrefix("www.") && host.count > 4 {
+            host = String(host.dropFirst(4))
+        } else if host.hasPrefix("m.") && host.count > 2 {
+            host = String(host.dropFirst(2))
+        }
+
+        // Only treat empty path, "/", or a single locale segment ("/tr", "/en-us", "/uk") as a homepage.
+        let pathSegments = comps.path.split(separator: "/").map(String.init)
+        let isHomepagePath: Bool
+        if pathSegments.isEmpty {
+            isHomepagePath = true
+        } else if pathSegments.count == 1 {
+            let seg = pathSegments[0].lowercased()
+            let parts = seg.split(separator: "-")
+            let isLocaleSeg = (parts.count == 1 && seg.count == 2 && seg.allSatisfy(\.isLetter)) ||
+                              (parts.count == 2 && parts[0].count == 2 && parts[1].count == 2 &&
+                               parts[0].allSatisfy(\.isLetter) && parts[1].allSatisfy(\.isLetter))
+            isHomepagePath = isLocaleSeg
+        } else {
+            isHomepagePath = false
+        }
+        guard isHomepagePath else { return [] }
+
+        // Allow empty query or purely bookmark/referral/locale query parameters.
+        let ignoredQueryKeys: Set<String> = [
+            "client", "channel", "source", "ref", "hl", "gl",
+            "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"
+        ]
+        if let queryItems = comps.queryItems, !queryItems.isEmpty {
+            let hasMeaningfulQuery = queryItems.contains { !ignoredQueryKeys.contains($0.name.lowercased()) }
+            if hasMeaningfulQuery { return [] }
+        }
+
+        var keys: Set<String> = ["host-home:\(host)"]
+
+        // Extract brand label before TLD / multi-part ccTLD (e.g. google.com.tr -> google, yahoo.co.uk -> yahoo).
+        let hostLabels = host.split(separator: ".").map(String.init)
+        if hostLabels.count >= 2 {
+            let last = hostLabels[hostLabels.count - 1]
+            let secondLast = hostLabels[hostLabels.count - 2]
+            let multiPartSecondLevels: Set<String> = ["com", "co", "org", "net", "gov", "edu"]
+            let brandIndex: Int
+            if hostLabels.count >= 3 && last.count == 2 && multiPartSecondLevels.contains(secondLast) {
+                brandIndex = hostLabels.count - 3
+            } else {
+                brandIndex = hostLabels.count - 2
+            }
+            if brandIndex >= 0 {
+                let brand = hostLabels[brandIndex]
+                let normTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !brand.isEmpty && !normTitle.isEmpty {
+                    keys.insert("brand-home:\(brand)|\(normTitle)")
+                }
+            }
+        }
+        return keys
     }
 
     // MARK: - Reading List Persistence

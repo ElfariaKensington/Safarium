@@ -45,6 +45,18 @@ final class WindowGrowthTests: HermeticTestCase {
         w.close()
     }
 
+    func testSidebarToggleAt1024WidthDoesNotWidenTheWindow() {
+        let (wc, w) = make()
+        w.setContentSize(NSSize(width: 1024, height: 768))
+        w.contentView?.layoutSubtreeIfNeeded()
+        let start = w.frame.width
+        wc.toggleSidebar(); spinRunLoop(0.5); w.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertEqual(w.frame.width, start, accuracy: 0.5, "window widened on 1024pt display when opening sidebar")
+        wc.toggleSidebar(); spinRunLoop(0.5); w.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertEqual(w.frame.width, start, accuracy: 0.5, "window widened on 1024pt display when closing sidebar")
+        w.close()
+    }
+
     func testTabStripNeverOverlapsRightActionsWhenSidebarIsOpen() {
         let (wc, w) = make()
         for i in 0..<4 { _ = wc.createNewTab(url: URL(string: "https://site\(i).example.com/")!) }

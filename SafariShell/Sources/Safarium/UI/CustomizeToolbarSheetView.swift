@@ -588,10 +588,12 @@ final class CustomizeToolbarSheetView: NSView {
         self.sheetHeightConstraint = heightC
         self.paletteHeightConstraint = palH
 
+        // Stay below NSLayoutPriority.dragThatCannotResizeWindow (490) and .windowSizeStayPut (500):
+        // above 500, combined with `sheetCard.width <= 1360`, this capped the entire browser window at 1372pt!
         let cardLeading = sheetCard.leadingAnchor.constraint(equalTo: sheetClipContainer.leadingAnchor, constant: 6)
-        cardLeading.priority = .defaultHigh
+        cardLeading.priority = .init(450)
         let cardTrailing = sheetCard.trailingAnchor.constraint(equalTo: sheetClipContainer.trailingAnchor, constant: -6)
-        cardTrailing.priority = .defaultHigh
+        cardTrailing.priority = .init(450)
 
         NSLayoutConstraint.activate([
             backdropHitCatcher.leadingAnchor.constraint(equalTo: leadingAnchor),

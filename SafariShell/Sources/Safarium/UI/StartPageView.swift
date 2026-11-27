@@ -177,16 +177,8 @@ final class StartPageView: NSView {
         fatalError("init(coder:) not supported")
     }
 
-    /// Narrower than the 738 pt content + margins: scale the whole page down to fit instead of clipping it.
-    private static let fitWidth: CGFloat = 834
-
-    override func layout() {
-        super.layout()
-        let mag = min(1.0, max(0.1, bounds.width / Self.fitWidth))
-        if abs(scrollView.magnification - mag) > 0.0005 {
-            scrollView.magnification = mag
-        }
-    }
+    /// Minimum width that fits the 738 pt Start Page content + 48 pt side margins without shrinking or clipping.
+    static let minWidth: CGFloat = 834
 
     var effectiveTopColor: NSColor {
         guard isBackgroundEnabled else {
@@ -435,7 +427,23 @@ final class StartPageView: NSView {
 
         let topC = contentStack.topAnchor.constraint(equalTo: documentView.topAnchor, constant: SafariMetrics.toolbarHeight + 42)
         self.contentTopConstraint = topC
+        // Keep StartPage's 834pt minimum below NSLayoutPriority.windowSizeStayPut (500) so opening the
+        // 240pt sidebar in a 1024pt window never auto-widens the window, while window.minSize (834pt)
+        // still prevents drag-resizing the window narrower than StartPage.
+        let minStartWidth = widthAnchor.constraint(greaterThanOrEqualToConstant: Self.minWidth)
+        minStartWidth.priority = .init(495)
+        let docMinWidth = documentView.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.minWidth)
+        docMinWidth.priority = .init(495)
+        let docTrailing = documentView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor)
+        docTrailing.priority = .init(490)
+        let stackLead = contentStack.leadingAnchor.constraint(greaterThanOrEqualTo: documentView.leadingAnchor, constant: 48)
+        stackLead.priority = .init(495)
+        let stackTrail = contentStack.trailingAnchor.constraint(lessThanOrEqualTo: documentView.trailingAnchor, constant: -48)
+        stackTrail.priority = .init(495)
+
         NSLayoutConstraint.activate([
+            minStartWidth,
+
             wallpaperView.leadingAnchor.constraint(equalTo: leadingAnchor),
             wallpaperView.trailingAnchor.constraint(equalTo: trailingAnchor),
             wallpaperView.topAnchor.constraint(equalTo: topAnchor),
@@ -452,35 +460,14 @@ final class StartPageView: NSView {
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
             documentView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
-            // Anchors read the clip's *frame*, so under magnification the document would stay window-wide while the
-            // clip bounds grow. Keep the document at least `fitWidth` wide (the clip's magnified bounds width).
-            {
-                let c = documentView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor)
-                c.priority = .init(400) // below the width pin and the window's stay-put priority (510)
-                return c
-            }(),
-            {
-                let c = documentView.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.fitWidth)
-                c.priority = .init(500) // below the window's stay-put priority (510), so it never grows the window
-                return c
-            }(),
+            docTrailing,
+            docMinWidth,
             documentView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
 
             contentStack.centerXAnchor.constraint(equalTo: documentView.centerXAnchor),
             contentStack.widthAnchor.constraint(lessThanOrEqualToConstant: 744),
-            // Side margins are only a preference: as required constraints they made the 738 pt content set the whole
-            // window's minimum width (834 pt, above SafariMetrics.minWindowWidth). Below the drag-resize priority they
-            // let the window shrink to its declared minimum and the centred content clips instead.
-            {
-                let c = contentStack.leadingAnchor.constraint(greaterThanOrEqualTo: documentView.leadingAnchor, constant: 48)
-                c.priority = .init(480)
-                return c
-            }(),
-            {
-                let c = contentStack.trailingAnchor.constraint(lessThanOrEqualTo: documentView.trailingAnchor, constant: -48)
-                c.priority = .init(480)
-                return c
-            }(),
+            stackLead,
+            stackTrail,
             topC,
             contentStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -64),
 
