@@ -477,42 +477,222 @@ final class ElasticScrollEngineTests: HermeticTestCase {
         XCTAssertEqual(engine.momentumLock, .none)
     }
 
-    // MARK: Space-bar inertia
+    // MARK: Space-bar momentum
 
-    func testSpaceScrollImpulseFromRestUsesViewportAndDecayRate() {
-        let engine = makeEngine(viewport: 800)
-        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: true)
-        // tap = 800 * 0.82 = 656 pt; v0 = -656 * 6.2 = -4067.2
-        XCTAssertEqual(engine.spaceVelocityY, -4067.2, accuracy: 0.01)
-        XCTAssertTrue(engine.spaceIsStartPage)
+    /// viewport 800 - 48 pt chrome = 752 visible; WebKit page step = max(752 * 0.875, 752 - 40) = 712.
+    private func makeSpaceEngine(scrollY: CGFloat = 1000, content: CGFloat = 5000, startPage: Bool = false)
+        -> (ElasticScrollEngine, SpaceRecorder) {
+        let engine = makeEngine(scrollY: scrollY, content: content, viewport: 800)
+        engine.obscuredTopInset = startPage ? 0 : 48
+        let rec = SpaceRecorder()
+        engine.onSyntheticScroll = { d, phase in rec.events.append((d, phase)) }
+        return (engine, rec)
     }
 
-    func testRepeatedSpaceTapStacksWithDecayedVelocity() {
-        let engine = makeEngine(viewport: 800)
-        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false)
-        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false)
-        XCTAssertEqual(engine.spaceVelocityY, -4067.2 * 0.65 - 4067.2, accuracy: 0.01)
+    final class SpaceRecorder {
+        var events: [(CGFloat, ElasticScrollEngine.SyntheticScrollPhase)] = []
+        var total: CGFloat { events.reduce(0) { $0 + $1.0 } }
     }
 
-    func testRepeatTapUsesShorterDistance() {
-        let engine = makeEngine(viewport: 800)
-        engine.triggerSpaceScroll(direction: 1, isRepeat: true, isStartPage: false)
-        XCTAssertEqual(engine.spaceVelocityY, 800 * 0.56 * 6.2, accuracy: 0.01)
-    }
-
-    func testReversingSpaceDirectionCancelsOpposingInertia() {
-        let engine = makeEngine(viewport: 800)
-        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false)
-        engine.triggerSpaceScroll(direction: 1, isRepeat: false, isStartPage: false)
-        XCTAssertEqual(engine.spaceVelocityY, 4067.2, accuracy: 0.01)
-    }
-
-    func testSpaceVelocityIsCappedAtEightPointFiveViewports() {
-        let engine = makeEngine(viewport: 800)
-        for _ in 0..<10 {
-            engine.triggerSpaceScroll(direction: 1, isRepeat: false, isStartPage: false)
+    /// Runs the glide at 120 Hz until it stops (or `maxFrames`). With `pageFrom`, the page applies every sent delta
+    /// (clamped to its range) and reports its offset back two frames late, like the renderer.
+    private func runGlide(_ engine: ElasticScrollEngine, rec: SpaceRecorder? = nil, pageFrom start: CGFloat? = nil,
+                          maxFrames: Int = 600) {
+        var t = engine.spaceLastTickTime
+        var page = start ?? 0
+        var sent = 0
+        var history: [CGFloat] = []
+        for _ in 0..<maxFrames where engine.spaceVelocityY != 0.0 || engine.spaceStreamOpen {
+            t += 1.0 / 120.0
+            if start != nil, let rec {
+                while sent < rec.events.count {
+                    page = max(0, min(engine.metrics.maxScrollY, page - rec.events[sent].0)); sent += 1
+                }
+                history.append(page)
+                let reported = history.count > 2 ? history[history.count - 3] : start!
+                engine.updateMetrics(scrollY: reported, contentHeight: engine.metrics.contentHeight,
+                                     viewportHeight: engine.metrics.viewportHeight, canInnerScrollUp: false,
+                                     canInnerScrollDown: false, isReloadableWebPage: true, isPageLoading: false)
+            }
+            engine.stepSpaceGlide(now: t)
         }
-        XCTAssertLessThanOrEqual(engine.spaceVelocityY, 800 * 8.5 + 1e-6)
+    }
+
+    func testSpacePressGlidesExactlyOnePageStepAsMomentumStream() {
+        let (engine, rec) = makeSpaceEngine()
+        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false)
+        XCTAssertEqual(engine.spaceVelocityY, -712 * ElasticScrollEngine.spaceDecayRate, accuracy: 0.01)
+        runGlide(engine, rec: rec, pageFrom: 1000)
+        XCTAssertEqual(rec.total, -712, accuracy: 0.01)
+        XCTAssertEqual(rec.events.first?.1, .began)
+        XCTAssertEqual(rec.events.last?.1, .ended)
+        XCTAssertEqual(rec.events.filter { $0.1 == .began }.count, 1)
+        XCTAssertEqual(engine.estimatedScrollY, 1712, accuracy: 2.0)
+        XCTAssertFalse(engine.spaceStreamOpen)
+        // Momentum feel: the first frame is the fastest, and it decelerates monotonically.
+        let moves = rec.events.filter { $0.1 != .ended }.map { abs($0.0) }
+        XCTAssertGreaterThan(moves.first ?? 0, 40)
+        XCTAssertTrue(zip(moves, moves.dropFirst()).dropLast().allSatisfy { $0 >= $1 - 0.001 })
+        XCTAssertLessThan(rec.events.count, 102, "glide should finish in well under a second")
+    }
+
+    func testMissedFramesKeepExactDistance() {
+        let (engine, rec) = makeSpaceEngine()
+        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false)
+        var t = engine.spaceLastTickTime
+        for i in 0..<400 where engine.spaceVelocityY != 0.0 || engine.spaceStreamOpen {
+            t += (i % 3 == 0) ? 1.0 / 40.0 : 1.0 / 120.0
+            engine.stepSpaceGlide(now: t)
+        }
+        XCTAssertEqual(rec.total, -712, accuracy: 0.01)
+    }
+
+    func testQuickPressesBuildMomentum() {
+        let (engine, rec) = makeSpaceEngine(content: 100_000)
+        let k = ElasticScrollEngine.spaceDecayRate
+        var now: CFTimeInterval = 100.0
+        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false, now: now)
+        var speedsAfterPress: [CGFloat] = [abs(engine.spaceVelocityY)]
+        for _ in 0..<4 {
+            for _ in 0..<18 { now += 1.0 / 120.0; engine.stepSpaceGlide(now: now) }   // 150 ms between presses
+            engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false, now: now)
+            speedsAfterPress.append(abs(engine.spaceVelocityY))
+        }
+        XCTAssertEqual(speedsAfterPress[0], 712 * k, accuracy: 0.01)
+        XCTAssertTrue(zip(speedsAfterPress, speedsAfterPress.dropFirst()).allSatisfy { $0 < $1 },
+                      "every quick press must leave the glide faster than the one before: \(speedsAfterPress)")
+        XCTAssertGreaterThan(speedsAfterPress.last!, speedsAfterPress[0] * 2.5)
+        XCTAssertEqual(engine.spaceStreak, 5)
+        XCTAssertLessThan(engine.spaceFriction, k)
+        XCTAssertEqual(rec.events.filter { $0.1 == .began }.count, 1, "one stream across chained presses")
+        var t = now
+        for _ in 0..<2000 where engine.spaceVelocityY != 0 || engine.spaceStreamOpen { t += 1.0 / 120.0; engine.stepSpaceGlide(now: t) }
+        XCTAssertEqual(engine.spaceFriction, k, "friction is back to normal once the glide ends")
+        XCTAssertLessThan(rec.total, -5 * 712, "five quick presses travel further than five separate pages")
+    }
+
+    func testSlowPressesDoNotStreak() {
+        let (engine, _) = makeSpaceEngine()
+        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false, now: 100.0)
+        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false, now: 101.0)
+        XCTAssertEqual(engine.spaceStreak, 1)
+    }
+
+    func testHeldKeyAcceleratesOverASecond() {
+        let (engine, _) = makeSpaceEngine(content: 100_000)
+        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false, now: 100.0)
+        engine.triggerSpaceScroll(direction: -1, isRepeat: true, isStartPage: false, now: 100.5)
+        var t = 100.5
+        var speeds: [CGFloat] = []
+        while t < 101.6 {
+            t += 0.033
+            engine.stepSpaceGlide(now: t)
+            engine.triggerSpaceScroll(direction: -1, isRepeat: true, isStartPage: false, now: t)
+            speeds.append(abs(engine.spaceVelocityY))
+        }
+        XCTAssertEqual(speeds.last!, 752 * 10, accuracy: 1.0, "held key tops out at 10 pages/s")
+        XCTAssertGreaterThan(speeds[20], speeds[5] + 1000, "held key keeps speeding up")
+    }
+
+    func testReversingDirectionDropsOpposingGlideAndRestartsStream() {
+        let (engine, rec) = makeSpaceEngine()
+        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false)
+        var t = engine.spaceLastTickTime
+        for _ in 0..<5 { t += 1.0 / 120.0; engine.stepSpaceGlide(now: t) }
+        engine.triggerSpaceScroll(direction: 1, isRepeat: false, isStartPage: false)
+        XCTAssertEqual(engine.spaceVelocityY, 712 * ElasticScrollEngine.spaceDecayRate, accuracy: 0.01)
+        XCTAssertEqual(rec.events.last?.1, .ended)
+    }
+
+    func testQueuedTravelIsCapped() {
+        let (engine, _) = makeSpaceEngine()
+        for _ in 0..<20 { engine.triggerSpaceScroll(direction: 1, isRepeat: false, isStartPage: false) }
+        XCTAssertLessThanOrEqual(engine.spaceVelocityY, 752 * ElasticScrollEngine.spaceMaxPagesPerSecond + 1e-6)
+        XCTAssertGreaterThan(engine.spaceVelocityY, 752 * 25)
+    }
+
+    func testStartPageUsesFullViewport() {
+        let (engine, rec) = makeSpaceEngine(startPage: true)
+        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: true)
+        runGlide(engine)
+        XCTAssertEqual(rec.total, -max(800 * 0.875, 760), accuracy: 0.01)
+    }
+
+    func testShiftSpaceIntoTopLandsOnEdgeAndOvershootsWithoutRefresh() {
+        let (engine, rec) = makeSpaceEngine(scrollY: 300)
+        engine.triggerSpaceScroll(direction: 1, isRepeat: false, isStartPage: false)
+        runGlide(engine, rec: rec, pageFrom: 300)
+        XCTAssertGreaterThanOrEqual(rec.total, 300 - 0.01, "page must be sent at least all the way to the top")
+        XCTAssertEqual(rec.events.last?.1, .ended)
+        XCTAssertEqual(engine.estimatedScrollY, 0)
+        guard case .criticallyDamped(_, _, let v0, _, _) = engine.motionState else {
+            return XCTFail("expected overshoot spring, got \(engine.motionState)")
+        }
+        XCTAssertGreaterThan(v0, 1000, "impact velocity carries into the bounce")
+        XCTAssertEqual(engine.ptrState, .idle, "keyboard overshoot never arms pull-to-refresh")
+    }
+
+    func testFastSpaceBurstBounceIsCapped() {
+        // Four presses in a burst from 1200 pt: arrives at the top far above 9000 pt/s.
+        let (engine, rec) = makeSpaceEngine(scrollY: 1200)
+        for _ in 0..<4 {
+            engine.triggerSpaceScroll(direction: 1, isRepeat: false, isStartPage: false, now: 100.0)
+        }
+        runGlide(engine, rec: rec, pageFrom: 1200)
+        guard case .criticallyDamped(_, _, let v0, _, _) = engine.motionState else {
+            return XCTFail("expected overshoot spring, got \(engine.motionState)")
+        }
+        XCTAssertEqual(v0, engine.compressImpactVelocity(ElasticScrollEngine.spaceMaxImpactVelocity), accuracy: 0.5)
+    }
+
+    func testSpaceIntoBottomOvershootsDown() {
+        let (engine, rec) = makeSpaceEngine(scrollY: 3500, content: 4500)   // max 3700: 200 left
+        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false)
+        runGlide(engine, rec: rec, pageFrom: 3500)
+        guard case .criticallyDamped(_, _, let v0, _, _) = engine.motionState else {
+            return XCTFail("expected overshoot spring, got \(engine.motionState)")
+        }
+        XCTAssertLessThan(v0, -1000)
+        XCTAssertEqual(engine.estimatedScrollY, 3700)
+    }
+
+    func testShiftSpaceAlreadyAtTopDoesNothing() {
+        let (engine, rec) = makeSpaceEngine(scrollY: 0)
+        engine.triggerSpaceScroll(direction: 1, isRepeat: false, isStartPage: false)
+        runGlide(engine)
+        XCTAssertTrue(rec.events.isEmpty)
+        XCTAssertEqual(engine.motionState, .idle)
+    }
+
+    func testInnerScrollerAtPageTopKeepsGliding() {
+        let engine = makeEngine(scrollY: 0, content: 5000, viewport: 800, canUp: true)
+        let rec = SpaceRecorder()
+        engine.onSyntheticScroll = { d, phase in rec.events.append((d, phase)) }
+        engine.triggerSpaceScroll(direction: 1, isRepeat: false, isStartPage: false)
+        runGlide(engine)
+        XCTAssertGreaterThan(rec.total, 600, "an inner scroller under the pointer takes the glide")
+        XCTAssertEqual(engine.motionState, .idle)
+    }
+
+    func testTrackpadInputCancelsGlideAndClosesStream() {
+        let (engine, rec) = makeSpaceEngine()
+        engine.triggerSpaceScroll(direction: -1, isRepeat: false, isStartPage: false)
+        engine.stepSpaceGlide(now: engine.spaceLastTickTime + 1.0 / 120.0)
+        engine.cancelSpaceScroll()
+        XCTAssertEqual(engine.spaceVelocityY, 0)
+        XCTAssertEqual(rec.events.last?.1, .ended)
+    }
+
+    func testMomentumFlingArrivalForwardsFlushToLandOnEdge() {
+        let engine = makeEngine(scrollY: 100)
+        // Renderer report lags: page is really closer to the top than 100.
+        engine.updateVelocityEstimate(deltaY: 40, timestamp: 1.000, isBegin: true)
+        engine.updateVelocityEstimate(deltaY: 40, timestamp: 1.008, isBegin: false)
+        _ = engine.handleMomentumEvent(momentum: .began, deltaY: 40)   // est 60
+        _ = engine.handleMomentumEvent(momentum: .changed, deltaY: 40) // est 20
+        XCTAssertFalse(engine.handleMomentumEvent(momentum: .changed, deltaY: 40), "arrival event goes to the page")
+        XCTAssertEqual(engine.takeResidualForwardDeltaY() ?? 0, 40, accuracy: 0.01)
+        if case .criticallyDamped = engine.motionState {} else { XCTFail("expected overshoot") }
     }
 
     // MARK: Direct touch: rubber band, PTR and hand-off

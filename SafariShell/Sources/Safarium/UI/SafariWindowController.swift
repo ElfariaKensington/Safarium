@@ -1211,8 +1211,8 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         elasticScrollEngine.onTriggerRefresh = { [weak self] in
             self?.activeTab?.reload()
         }
-        elasticScrollEngine.onSyntheticScrollDelta = { [weak self] deltaY in
-            self?.dispatchSyntheticTouchpadScrollDelta(deltaY)
+        elasticScrollEngine.onSyntheticScroll = { [weak self] deltaY, phase in
+            self?.dispatchSyntheticMomentumScroll(deltaY, phase: phase)
         }
         elasticScrollEngine.onElasticInteractionChanged = { [weak self] active in
             guard let self else { return }
@@ -2120,8 +2120,9 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             object: nil,
             queue: .main
         ) { [weak self] note in
+            // SAFARIUM_SCROLL_DEBUG: also accept Space while the app is in the background (CDP-driven measurements).
             guard let self,
-                  let window = self.window, window.isKeyWindow,
+                  let window = self.window, window.isKeyWindow || (ScrollDebugLog.isEnabled && NSApp.keyWindow == nil),
                   let tab = self.activeTab, !tab.isStartPage,
                   self.tabLoadErrors[tab.tabID] == nil,
                   !self.tabOverviewView.isPresented,
@@ -2183,45 +2184,65 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         return nil
     }
 
-    private func dispatchSyntheticTouchpadScrollDelta(_ deltaY: CGFloat) {
+    /// Sub-point travel not yet sent: wheel point deltas are whole points, so each frame sends the rounded running
+    /// total and keeps the rest (no per-frame rounding error, no drift, even pacing at low speed).
+    private var syntheticScrollRemainder: CGFloat = 0.0
+
+    /// Delivers one frame of the Space momentum glide. Web pages get a real momentum-phase scroll stream
+    /// (began / changed / ended) sent straight to the page's view, so Chromium latches one scroller for the whole
+    /// glide and ends it exactly when the glide ends; the start page scrolls natively.
+    private func dispatchSyntheticMomentumScroll(_ deltaY: CGFloat, phase: ElasticScrollEngine.SyntheticScrollPhase) {
         guard let tab = activeTab else { return }
         if tab.isStartPage {
-            startPageView.scrollByDeltaY(deltaY)
+            if deltaY != 0.0 { startPageView.scrollByDeltaY(deltaY) }
             return
         }
         guard let window else { return }
+        if phase == .began { syntheticScrollRemainder = 0.0 }
+        let total = syntheticScrollRemainder + deltaY
+        let points = total.rounded()
+        syntheticScrollRemainder = total - points
+        // Nothing to move this frame: keep the stream quiet (no zero-delta "changed" events).
+        if phase == .changed && points == 0.0 { return }
+        if phase == .ended { syntheticScrollRemainder = 0.0 }
+
         let targetView = findRenderWidgetHostView(in: tab.contentView) ?? tab.contentView
-        let intDelta = Int32(deltaY.rounded())
-        guard intDelta != 0 || abs(deltaY) >= 0.25 else { return }
-        let pxDelta: Int32 = intDelta != 0 ? intDelta : (deltaY > 0 ? 1 : -1)
-
-        guard let cg = CGEvent(
-            scrollWheelEvent2Source: nil,
-            units: .pixel,
-            wheelCount: 1,
-            wheel1: pxDelta,
-            wheel2: 0,
-            wheel3: 0
-        ) else { return }
-
-        // Place synthetic scroll event at current mouse position if over web content (so hovered inner scrollers
-        // like Gemini chat scroll naturally), otherwise center of the web viewport.
-        let mouseScreen = NSEvent.mouseLocation
-        let mouseWin = window.convertPoint(fromScreen: mouseScreen)
-        let mouseInStage = contentStageView.convert(mouseWin, from: nil)
-        let targetScreenPt: NSPoint
-        if contentStageView.bounds.contains(mouseInStage) {
-            targetScreenPt = mouseScreen
-        } else {
-            let centerInWin = webContentHost.convert(NSPoint(x: webContentHost.bounds.midX, y: webContentHost.bounds.midY), to: nil)
-            targetScreenPt = window.convertPoint(toScreen: centerInWin)
+        // Chromium ignores a momentum stream that no gesture opened, so open it like a real trackpad flick:
+        // fingers down (began) and lifted (ended) with no travel, then the momentum phase carries the glide.
+        if phase == .began {
+            sendSyntheticScrollEvent(points: 0, scrollPhase: 1, momentumPhase: 0, to: targetView, in: window)
+            sendSyntheticScrollEvent(points: 0, scrollPhase: 4, momentumPhase: 0, to: targetView, in: window)
         }
-        let primaryH = NSScreen.screens.first?.frame.height ?? 900.0
-        cg.location = CGPoint(x: targetScreenPt.x, y: primaryH - targetScreenPt.y)
-        cg.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-        cg.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(pxDelta))
-        cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Double(deltaY))
+        let momentum: Int64
+        switch phase {
+        case .began: momentum = 1      // kCGMomentumScrollPhaseBegin
+        case .changed: momentum = 2    // kCGMomentumScrollPhaseContinue
+        case .ended: momentum = 3      // kCGMomentumScrollPhaseEnd
+        }
+        sendSyntheticScrollEvent(points: points, scrollPhase: 0, momentumPhase: momentum, to: targetView, in: window)
+    }
 
+    private func sendSyntheticScrollEvent(points: CGFloat, scrollPhase: Int64, momentumPhase: Int64,
+                                          to targetView: NSView, in window: NSWindow) {
+        guard let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
+                               wheel1: Int32(points), wheel2: 0, wheel3: 0) else { return }
+        // Aim at the pointer when it is over the page (a hovered inner scroller scrolls, like a trackpad), else at
+        // the middle of the page.
+        let mouseScreen = NSEvent.mouseLocation
+        let mouseInStage = contentStageView.convert(window.convertPoint(fromScreen: mouseScreen), from: nil)
+        let pointInWindow: NSPoint = contentStageView.bounds.contains(mouseInStage)
+            ? window.convertPoint(fromScreen: mouseScreen)
+            : webContentHost.convert(NSPoint(x: webContentHost.bounds.midX, y: webContentHost.bounds.midY), to: nil)
+        let screenPoint = window.convertPoint(toScreen: pointInWindow)
+        let primaryH = NSScreen.screens.first?.frame.height ?? 900.0
+        cg.location = CGPoint(x: screenPoint.x, y: primaryH - screenPoint.y)
+        cg.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        cg.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(points))
+        cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Double(points) / 10.0)
+        cg.setIntegerValueField(.scrollWheelEventScrollPhase, value: scrollPhase)
+        cg.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentumPhase)
+        cg.timestamp = CGEventTimestamp(ProcessInfo.processInfo.systemUptime * 1e9)
+        SyntheticEventTargeting.target(cg, window: window, pointInWindow: pointInWindow)
         if let scrollEvent = NSEvent(cgEvent: cg) {
             targetView.scrollWheel(with: scrollEvent)
         }
@@ -5976,6 +5997,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
     /// `isFreshTelemetry: false` for the pre-event sync of cached values (see `ElasticScrollEngine.updateMetrics`).
     private func syncElasticMetrics(for tab: BrowserTabEngine, isFreshTelemetry: Bool = true) {
         let vh = tab.viewportHeight > 1.0 ? tab.viewportHeight : webContentHost.bounds.height
+        elasticScrollEngine.obscuredTopInset = toolbarStackHeight
         elasticScrollEngine.updateMetrics(
             scrollY: tab.scrollY,
             contentHeight: tab.contentHeight,

@@ -18,12 +18,6 @@ enum ScrollDebugLog {
 /// Debug-only (SAFARIUM_SCROLL_DEBUG): synthesizes a 120 Hz precise trackpad gesture and posts it to the app's own
 /// event queue. Spec: "<fingerDy> <fingerFrames> <momentumDy0> <decay> [xFrac yFrac]" — fingerDy > 0 scrolls up.
 enum DebugTrackpadReplay {
-    private typealias SetWindowLocation = @convention(c) (CGEvent, CGPoint) -> Void
-    private static let setWindowLocation: SetWindowLocation? = {
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGEventSetWindowLocation") else { return nil }
-        return unsafeBitCast(sym, to: SetWindowLocation.self)
-    }()
-
     static func run(spec: String, in window: NSWindow) {
         let p = spec.split(separator: " ").compactMap { Double($0) }
         let fingerDy = p.count > 0 ? p[0] : 40
@@ -59,13 +53,9 @@ enum DebugTrackpadReplay {
             e.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: dy / 10.0)
             e.setIntegerValueField(.scrollWheelEventScrollPhase, value: ph)
             e.setIntegerValueField(.scrollWheelEventMomentumPhase, value: mo)
-            // Raw field 51 is the event's target window number (NSEvent.windowNumber); without it the event has no window.
-            if let windowField = CGEventField(rawValue: 51) {
-                e.setIntegerValueField(windowField, value: Int64(window.windowNumber))
-            }
             e.timestamp = CGEventTimestamp(ProcessInfo.processInfo.systemUptime * 1e9)
-            // Window-local point (top-left origin) that AppKit turns into locationInWindow for a window-targeted event.
-            setWindowLocation?(e, CGPoint(x: frame.width * xf, y: frame.height * yf))
+            SyntheticEventTargeting.target(e, window: window,
+                                           pointInWindow: NSPoint(x: frame.width * xf, y: frame.height * (1 - yf)))
             if let ev = NSEvent(cgEvent: e) {
                 NSApp.postEvent(ev, atStart: false)
             }

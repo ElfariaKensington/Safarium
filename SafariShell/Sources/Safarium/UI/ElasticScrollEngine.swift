@@ -142,7 +142,12 @@ final class ElasticScrollEngine: NSObject {
     var onTriggerRefresh: (() -> Void)?
     /// Emits 120Hz precise-pixel vertical scroll deltas (`deltaY < 0` scrolls down, `deltaY > 0` scrolls up)
     /// driven by touchpad-style Space / Shift+Space inertia.
-    var onSyntheticScrollDelta: ((CGFloat) -> Void)?
+    /// Space-bar momentum stream: (delta in points, + = scroll up, phase). `.began` opens a momentum scroll,
+    /// `.changed` carries each frame's delta, `.ended` (delta 0) closes it, like a trackpad fling's momentum phase.
+    var onSyntheticScroll: ((CGFloat, SyntheticScrollPhase) -> Void)?
+    enum SyntheticScrollPhase { case began, changed, ended }
+    /// Height of the shell chrome over the top of the page (toolbar + tab strip); Space pages by what is visible.
+    var obscuredTopInset: CGFloat = 0.0
     /// Fires when elastic rubber-band drag or spring animation begins (`true`) or settles back to idle (`false`).
     var onElasticInteractionChanged: ((Bool) -> Void)?
 
@@ -211,11 +216,34 @@ final class ElasticScrollEngine: NSObject {
     /// Timestamp of last macOS momentum delta received during `.ptrMomentumUnwind`.
     private var lastMomentumUnwindTime: CFTimeInterval = 0.0
 
-    /// 120Hz touchpad-inertia Space / Shift+Space scroll state (pt/s; negative = down, positive = up).
+    // MARK: Space / Shift+Space momentum
+    // A press is a momentum fling that travels exactly one page (WebKit's page step: max(87.5% of the visible height,
+    // visible height - 40)), with velocity decaying exponentially like trackpad momentum, delivered to Chromium as a
+    // momentum-phase scroll stream. Momentum builds up: each quick press in the same direction adds a bigger impulse
+    // on top of the current velocity and lowers the friction, so a burst of presses keeps getting faster; a held key
+    // accelerates from 3 to 10 pages/s over a second. Reaching an edge lands the page exactly on it and hands the
+    // remaining velocity to the same overshoot spring a trackpad fling uses.
+    /// pt/s, + = up. Remaining travel of the current glide is `spaceVelocityY / spaceDecayRate`.
     var spaceVelocityY: CGFloat = 0.0
-    private var spaceLastTickTime: CFTimeInterval = 0.0
+    private(set) var spaceLastTickTime: CFTimeInterval = 0.0
     var spaceIsStartPage: Bool = false
-    private static let spaceDecayRate: Double = 6.2
+    /// True between the `.began` and `.ended` of a momentum stream sent to the page.
+    private(set) var spaceStreamOpen: Bool = false
+    /// Set when the glide began while the page already sat on the edge it moves toward (no bounce, like Safari).
+    private var spaceStartedAtEdge: Bool = false
+    static let spaceDecayRate: CGFloat = 8.0
+    /// Friction of the current glide (lowered while a press streak builds momentum).
+    private(set) var spaceFriction: CGFloat = ElasticScrollEngine.spaceDecayRate
+    /// Consecutive same-direction presses less than `spaceStreakWindow` apart.
+    private(set) var spaceStreak: Int = 0
+    private var spaceLastPressTime: CFTimeInterval = -1.0
+    private var spaceHoldStartTime: CFTimeInterval = 0.0
+    static let spaceStreakWindow: CFTimeInterval = 0.6
+    /// Fastest glide, in visible pages per second.
+    static let spaceMaxPagesPerSecond: CGFloat = 30.0
+    static let spaceMaxImpactVelocity: CGFloat = 9000.0
+    /// Glide ends once less than this much travel remains (the remainder is sent in the last frame).
+    private static let spaceStopDistance: CGFloat = 1.0
 
     // MARK: - Lifecycle
 
@@ -294,7 +322,7 @@ final class ElasticScrollEngine: NSObject {
         gestureLockedHorizontal = false
         ptrDismissedByUserScroll = false
         lastMomentumUnwindTime = 0.0
-        spaceVelocityY = 0.0
+        cancelSpaceScroll()
         spaceLastTickTime = 0.0
         spaceIsStartPage = false
         applyVisualOffset(0.0)
@@ -303,27 +331,82 @@ final class ElasticScrollEngine: NSObject {
 
     /// Launches or stacks a 120Hz macOS touchpad-inertia scroll impulse for Space (`direction = -1`)
     /// or Shift+Space (`direction = +1`), unwinding PTR or triggering elastic boundary bounce seamlessly.
-    func triggerSpaceScroll(direction: Int, isRepeat: Bool, isStartPage: Bool) {
-        let sign: CGFloat = direction >= 0 ? 1.0 : -1.0
-        let vh = max(420.0, targetView?.bounds.height ?? metrics.viewportHeight)
-        // Distance = v0 / k; target ~0.82 * viewport per tap (classic Safari Space page step) with exponential glide.
-        let k = CGFloat(Self.spaceDecayRate)
-        let tapDistance = vh * (isRepeat ? 0.56 : 0.82)
-        let impulseV = sign * tapDistance * k
+    /// Visible page height Space steps by (viewport minus the chrome over its top).
+    func spaceVisibleHeight() -> CGFloat {
+        let vh = max(320.0, metrics.viewportHeight > 1.0 ? metrics.viewportHeight : (targetView?.bounds.height ?? 800.0))
+        return max(240.0, vh - (spaceIsStartPage ? 0.0 : obscuredTopInset))
+    }
 
+    /// WebKit's page step for a visible height.
+    static func spacePageStep(visibleHeight h: CGFloat) -> CGFloat {
+        max(h * 0.875, h - 40.0)
+    }
+
+    /// `direction` -1 = Space (down), +1 = Shift+Space (up). `isRepeat` = key auto-repeat while held.
+    func triggerSpaceScroll(direction: Int, isRepeat: Bool, isStartPage: Bool, now: CFTimeInterval = CACurrentMediaTime()) {
+        let sign: CGFloat = direction >= 0 ? 1.0 : -1.0
         spaceIsStartPage = isStartPage
-        if (spaceVelocityY > 0 && sign < 0) || (spaceVelocityY < 0 && sign > 0) {
-            // Reversing direction cancels opposing inertia immediately.
-            spaceVelocityY = impulseV
-        } else {
-            let maxV = max(5400.0, vh * 8.5)
-            spaceVelocityY = max(-maxV, min(maxV, spaceVelocityY * 0.65 + impulseV))
+        let base = Self.spaceDecayRate
+        let visible = spaceVisibleHeight()
+        let reversing = (spaceVelocityY > 0 && sign < 0) || (spaceVelocityY < 0 && sign > 0)
+        if reversing {
+            spaceVelocityY = 0.0
+            spaceStreak = 0
+            spaceFriction = base
+            endSpaceStream()
         }
-        spaceLastTickTime = CACurrentMediaTime()
+
+        if isRepeat {
+            // Held key: speed ramps from 3 to 10 visible pages/s over the first second of auto-repeat, never down.
+            if spaceHoldStartTime <= 0.0 { spaceHoldStartTime = now }
+            let held = CGFloat(min(1.0, (now - spaceHoldStartTime) / 1.0))
+            let target = visible * (3.0 + 7.0 * held)
+            if abs(spaceVelocityY) < target { spaceVelocityY = sign * target }
+        } else {
+            spaceHoldStartTime = 0.0
+            let quick = spaceLastPressTime >= 0.0 && (now - spaceLastPressTime) < Self.spaceStreakWindow
+            spaceStreak = (quick && !reversing && spaceVelocityY != 0.0) ? spaceStreak + 1 : 1
+            spaceLastPressTime = now
+            let n = CGFloat(spaceStreak - 1)
+            // 1st press: exactly one page at base friction. Each quick follow-up adds a bigger kick (x1.35, x1.7, ...
+            // up to x3) on top of the velocity still left, and the glide coasts further (friction down to base/1.8).
+            let boost = min(1.0 + 0.35 * n, 3.0)
+            spaceFriction = base / min(1.8, 1.0 + 0.2 * n)
+            spaceVelocityY = sign * (abs(spaceVelocityY) + Self.spacePageStep(visibleHeight: visible) * base * boost)
+        }
+        let maxV = visible * Self.spaceMaxPagesPerSecond
+        spaceVelocityY = max(-maxV, min(maxV, spaceVelocityY))
+        if !spaceStreamOpen {
+            spaceLastTickTime = now
+            spaceStartedAtEdge = false
+        }
         ensureDisplayLinkRunning()
     }
 
-    /// Triggers a smooth visual Pull-to-Refresh demonstration (used by Page Menu action).
+    /// Stops a Space glide (real trackpad input, reset, edge arrival) and closes its momentum stream.
+    func cancelSpaceScroll() {
+        spaceVelocityY = 0.0
+        spaceStreak = 0
+        spaceHoldStartTime = 0.0
+        spaceFriction = Self.spaceDecayRate
+        endSpaceStream()
+    }
+
+    private func emitSpaceDelta(_ deltaY: CGFloat) {
+        if !spaceStreamOpen {
+            spaceStreamOpen = true
+            onSyntheticScroll?(deltaY, .began)
+        } else {
+            onSyntheticScroll?(deltaY, .changed)
+        }
+    }
+
+    private func endSpaceStream() {
+        guard spaceStreamOpen else { return }
+        spaceStreamOpen = false
+        onSyntheticScroll?(0.0, .ended)
+    }
+
     func triggerPullToRefreshDemo() {
         guard metrics.isReloadableWebPage else { return }
         momentumLock = .none
@@ -374,7 +457,7 @@ final class ElasticScrollEngine: NSObject {
 
         // Any real trackpad input immediately cancels synthetic Space-scroll inertia.
         if !phase.isEmpty || !momentum.isEmpty {
-            spaceVelocityY = 0.0
+            cancelSpaceScroll()
         }
 
         // Update viewport height from live target view if telemetry hasn't reported one yet.
@@ -669,69 +752,41 @@ final class ElasticScrollEngine: NSObject {
             return false
         }
 
-        // Top boundary arrival during upward momentum fling (`deltaY > 0` pulls content DOWN).
-        if deltaY > 0.0 {
-            let nextEstimated = estimatedScrollY - deltaY
-            let alreadyAtTop = metrics.isAtTopBoundary
-            let crossingTopThisFrame = (metrics.scrollY <= max(120.0, abs(deltaY) * 4.5))
-                && (nextEstimated <= 0.0)
-                && !metrics.canInnerScrollUp
-
-            if alreadyAtTop || crossingTopThisFrame {
-                let impactV = smoothedVelocityY
-                if impactV >= Constants.minFlingVelocity {
-                    launchFlingOvershoot(impactVelocity: impactV, lock: .top)
-                } else {
-                    momentumLock = .top
-                }
-                estimatedScrollY = 0.0
-                // If Chromium hasn't quite reached scrollY == 0 yet, let THIS single boundary-crossing
-                // event pass through so Chromium settles cleanly at exact scrollY = 0.0!
-                return alreadyAtTop
+        // Edge arrival during a momentum fling: hand the fling's velocity to the overshoot spring and let this one
+        // event through, resized so the page lands exactly on the edge even when telemetry lags behind it.
+        if deltaY != 0.0, let arrival = edgeArrival(deltaY: deltaY, velocity: smoothedVelocityY) {
+            let lock: ConsumedMomentumLock = deltaY > 0.0 ? .top : .bottom
+            let impactV = smoothedVelocityY
+            if abs(impactV) >= Constants.minFlingVelocity, (impactV > 0.0) == (deltaY > 0.0) {
+                launchFlingOvershoot(impactVelocity: impactV, lock: lock)
+            } else {
+                momentumLock = lock
             }
-
-            estimatedScrollY = clampScrollY(nextEstimated)
+            estimatedScrollY = deltaY > 0.0 ? 0.0 : metrics.maxScrollY
+            if arrival.alreadyAtEdge { return true }
+            residualForwardDeltaY = deltaY > 0.0 ? arrival.flush : -arrival.flush
             return false
         }
 
-        // Bottom boundary arrival during downward momentum fling (`deltaY < 0` pulls content UP).
-        if deltaY < 0.0 {
-            let maxY = metrics.maxScrollY
-            let nextEstimated = estimatedScrollY - deltaY
-            let alreadyAtBottom = metrics.isAtBottomBoundary
-            let crossingBottomThisFrame = (maxY > 2.0)
-                && (metrics.scrollY >= maxY - max(120.0, abs(deltaY) * 4.5))
-                && (nextEstimated >= maxY)
-                && !metrics.canInnerScrollDown
-
-            if alreadyAtBottom || crossingBottomThisFrame {
-                let impactV = smoothedVelocityY
-                if abs(impactV) >= Constants.minFlingVelocity {
-                    launchFlingOvershoot(impactVelocity: impactV, lock: .bottom)
-                } else {
-                    momentumLock = .bottom
-                }
-                estimatedScrollY = maxY
-                return alreadyAtBottom
-            }
-
-            estimatedScrollY = clampScrollY(nextEstimated)
-            return false
-        }
-
+        estimatedScrollY = clampScrollY(estimatedScrollY - deltaY)
         return false
     }
 
     // MARK: - Spring & Recoil Launchers
 
-    private func launchFlingOvershoot(impactVelocity: CGFloat, lock: ConsumedMomentumLock) {
+    private func launchFlingOvershoot(impactVelocity: CGFloat, lock: ConsumedMomentumLock, allowsRefresh: Bool = true) {
         let compressedV = compressImpactVelocity(impactVelocity)
         momentumLock = lock
+        if ScrollDebugLog.isEnabled {
+            // Critically damped from rest at the edge: peak = v0 / (omega * e).
+            ScrollDebugLog.write(String(format: "overshoot lock=%@ impact=%.0f v0=%.0f peak=%.1f", String(describing: lock),
+                                        impactVelocity, compressedV, abs(compressedV) / CGFloat(Constants.flingOmega * M_E)))
+        }
 
         // Top momentum fling overshoot drives the pull-to-refresh spinner visually,
         // using the much harder `ptrFlingTriggerThreshold` (150pt) so normal flings
         // show the spinner cleanly without accidental reloads.
-        if lock == .top && metrics.isReloadableWebPage {
+        if lock == .top && metrics.isReloadableWebPage && allowsRefresh {
             if case .spinning = ptrState {
                 // Keep existing active refresh spinning.
             } else {
@@ -928,6 +983,9 @@ final class ElasticScrollEngine: NSObject {
         }
         guard let hostView = targetView else { return }
         let link = hostView.displayLink(target: self, selector: #selector(handleDisplayLink(_:)))
+        // Ask for the panel's full rate: at a throttled 60 Hz the Space glide fed a 120 Hz page every other frame
+        // (visible judder) and the bounce stepped visibly.
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
         link.add(to: .main, forMode: .common)
         self.displayLink = link
     }
@@ -938,7 +996,7 @@ final class ElasticScrollEngine: NSObject {
     }
 
     private func stopDisplayLinkIfIdle() {
-        if case .idle = motionState, case .idle = ptrState, abs(spaceVelocityY) < 12.0 {
+        if case .idle = motionState, case .idle = ptrState, spaceVelocityY == 0.0, !spaceStreamOpen {
             displayLink?.isPaused = true
         }
     }
@@ -946,26 +1004,8 @@ final class ElasticScrollEngine: NSObject {
     @objc private func handleDisplayLink(_ sender: CADisplayLink) {
         let now = CACurrentMediaTime()
 
-        // 0. Step 120Hz touchpad-inertia Space / Shift+Space scroll impulse.
-        if abs(spaceVelocityY) >= 12.0 {
-            let dt = max(0.001, min(0.032, spaceLastTickTime > 0 ? (now - spaceLastTickTime) : (1.0 / 120.0)))
-            spaceLastTickTime = now
-            let k = Self.spaceDecayRate
-            let decay = exp(-k * dt)
-            let v0 = Double(spaceVelocityY)
-            // Exact integral of v0 * exp(-k*t) over [0, dt]:
-            let deltaY = CGFloat((v0 / k) * (1.0 - decay))
-            let nextV = CGFloat(v0 * decay)
-            spaceVelocityY = abs(nextV) < 12.0 ? 0.0 : nextV
-
-            if spaceIsStartPage {
-                onSyntheticScrollDelta?(deltaY)
-            } else {
-                stepSyntheticSpaceScrollDelta(deltaY: deltaY, velocityY: CGFloat(v0), now: now)
-            }
-        } else if spaceVelocityY != 0.0 {
-            spaceVelocityY = 0.0
-        }
+        // 0. Space / Shift+Space momentum glide.
+        stepSpaceGlide(now: now)
 
         // 1. Check PTR spinning completion / timeout.
         if case .spinning(let triggeredAt, let loadFinished) = ptrState {
@@ -1073,80 +1113,117 @@ final class ElasticScrollEngine: NSObject {
         stopDisplayLinkIfIdle()
     }
 
-    private func stepSyntheticSpaceScrollDelta(deltaY: CGFloat, velocityY: CGFloat, now: CFTimeInterval) {
-        // Unwind active PTR hold smoothly 1:1 when pressing Space to scroll down
+    /// One frame of the Space glide: exact integral of v0*e^(-kt) over the frame, so a missed frame just carries its
+    /// share and the glide always travels exactly its distance.
+    func stepSpaceGlide(now: CFTimeInterval) {
+        if spaceVelocityY != 0.0 {
+            let dt = max(1.0 / 480.0, min(1.0 / 24.0, now - spaceLastTickTime))
+            spaceLastTickTime = now
+            let k = spaceFriction
+            let v0 = spaceVelocityY
+            let decay = CGFloat(exp(-Double(k) * dt))
+            var deltaY = (v0 / k) * (1.0 - decay)
+            var nextV = v0 * decay
+            if abs(nextV) / k < Self.spaceStopDistance {
+                deltaY += nextV / k      // send the last fraction now: the glide ends exactly on its distance
+                nextV = 0.0
+            }
+            spaceVelocityY = nextV
+            if ScrollDebugLog.isEnabled {
+                ScrollDebugLog.write(String(format: "space t=%.4f d=%.2f v=%.0f sy=%.1f est=%.1f ov=%.1f",
+                                            now, deltaY, v0, metrics.scrollY, estimatedScrollY, currentOverscrollY))
+            }
+            if spaceIsStartPage {
+                emitSpaceDelta(deltaY)
+            } else {
+                stepSpaceScroll(deltaY: deltaY, velocityY: v0, now: now)
+            }
+            if spaceVelocityY == 0.0 {
+                endSpaceStream()
+                spaceFriction = Self.spaceDecayRate
+            }
+        } else if spaceStreamOpen {
+            endSpaceStream()
+        }
+    }
+
+    /// One frame of a Space glide on a web page: PTR unwind, edge arrival + overshoot, or plain page scroll.
+    private func stepSpaceScroll(deltaY: CGFloat, velocityY: CGFloat, now: CFTimeInterval) {
+        // Space (down) while pull-to-refresh holds the page open: unwind the hold 1:1, then scroll the page.
         if isPTRRefreshingOrDismissing, currentOverscrollY > 0.25 {
-            if deltaY < 0.0 {
-                ptrDismissedByUserScroll = true
-                if case .spinning(let triggeredAt, _) = ptrState {
-                    ptrState = .dismissing(spinStartedAt: triggeredAt)
-                }
-                let nextY = currentOverscrollY + deltaY
-                if nextY <= 0.0 {
-                    resetToIdleRest()
-                    let remainder = nextY
-                    estimatedScrollY = clampScrollY(estimatedScrollY - remainder)
-                    if abs(remainder) > 0.05 {
-                        onSyntheticScrollDelta?(remainder)
-                    }
-                    return
-                }
-                motionState = .ptrMomentumUnwind
-                lastMomentumUnwindTime = now
-                applyVisualOffset(nextY)
-                updateSpinnerPresentation(now: now)
+            guard deltaY < 0.0 else { return }
+            ptrDismissedByUserScroll = true
+            if case .spinning(let triggeredAt, _) = ptrState {
+                ptrState = .dismissing(spinStartedAt: triggeredAt)
+            }
+            let nextY = currentOverscrollY + deltaY
+            if nextY <= 0.0 {
+                resetToIdleRest()
+                estimatedScrollY = clampScrollY(estimatedScrollY - nextY)
+                if abs(nextY) > 0.05 { emitSpaceDelta(nextY) }
                 return
             }
+            motionState = .ptrMomentumUnwind
+            lastMomentumUnwindTime = now
+            applyVisualOffset(nextY)
+            updateSpinnerPresentation(now: now)
             return
         }
 
-        // Top boundary arrival on Shift+Space (`deltaY > 0` scrolls up)
-        if deltaY > 0.0 && !metrics.canInnerScrollUp {
-            let nextEstimated = estimatedScrollY - deltaY
-            let alreadyAtTop = metrics.isAtTopBoundary
-            let crossingTop = (metrics.scrollY <= max(120.0, abs(deltaY) * 4.5)) && (nextEstimated <= 0.0)
-            if alreadyAtTop || crossingTop {
+        let movingUp = deltaY > 0.0
+        let innerCanScroll = movingUp ? metrics.canInnerScrollUp : metrics.canInnerScrollDown
+        if !innerCanScroll, let arrival = edgeArrival(deltaY: deltaY, velocity: velocityY) {
+            let firstFrame = !spaceStreamOpen
+            if firstFrame && arrival.alreadyAtEdge {
+                // Pressed while already on that edge: nothing to scroll, no bounce (Safari does not bounce here).
+                spaceStartedAtEdge = true
                 spaceVelocityY = 0.0
-                if !alreadyAtTop {
-                    onSyntheticScrollDelta?(deltaY)
-                }
-                estimatedScrollY = 0.0
-                if velocityY >= Constants.minFlingVelocity {
-                    launchFlingOvershoot(impactVelocity: min(velocityY * 0.72, 2600.0), lock: .top)
-                }
                 return
             }
-            estimatedScrollY = clampScrollY(nextEstimated)
-            onSyntheticScrollDelta?(deltaY)
-            return
-        }
-
-        // Bottom boundary arrival on Space (`deltaY < 0` scrolls down)
-        if deltaY < 0.0 && !metrics.canInnerScrollDown {
-            let maxY = metrics.maxScrollY
-            let nextEstimated = estimatedScrollY - deltaY
-            let alreadyAtBottom = metrics.isAtBottomBoundary
-            let crossingBottom = (maxY > 2.0)
-                && (metrics.scrollY >= maxY - max(120.0, abs(deltaY) * 4.5))
-                && (nextEstimated >= maxY)
-            if alreadyAtBottom || crossingBottom {
-                spaceVelocityY = 0.0
-                if !alreadyAtBottom {
-                    onSyntheticScrollDelta?(deltaY)
-                }
-                estimatedScrollY = maxY
-                if abs(velocityY) >= Constants.minFlingVelocity {
-                    launchFlingOvershoot(impactVelocity: max(velocityY * 0.72, -2600.0), lock: .bottom)
-                }
-                return
+            // Land exactly on the edge: `arrival.flush` covers at least the true remaining distance even when
+            // telemetry lags, and Chromium clamps any excess at the edge.
+            if arrival.flush > 0.05 {
+                emitSpaceDelta(movingUp ? arrival.flush : -arrival.flush)
             }
-            estimatedScrollY = clampScrollY(nextEstimated)
-            onSyntheticScrollDelta?(deltaY)
+            estimatedScrollY = movingUp ? 0.0 : metrics.maxScrollY
+            spaceVelocityY = 0.0
+            endSpaceStream()
+            let bouncingSameWay = isOverscrolling && ((currentOverscrollY > 0) == movingUp)
+            if !spaceStartedAtEdge, !bouncingSameWay, abs(velocityY) >= Constants.minFlingVelocity {
+                // A burst of presses reaches speeds a trackpad rarely does; past ~9000 pt/s the bounce would swallow
+                // ~15% of the window, so the keyboard bounce tops out around 100 pt.
+                let impact = max(-Self.spaceMaxImpactVelocity, min(Self.spaceMaxImpactVelocity, velocityY))
+                launchFlingOvershoot(impactVelocity: impact, lock: movingUp ? .top : .bottom, allowsRefresh: false)
+            }
             return
         }
 
         estimatedScrollY = clampScrollY(estimatedScrollY - deltaY)
-        onSyntheticScrollDelta?(deltaY)
+        emitSpaceDelta(deltaY)
+    }
+
+    /// Edge arrival test shared by trackpad momentum and the Space glide. `estimatedScrollY` (last renderer report
+    /// minus every delta sent since) is never ahead of the page, so `next <= edge` means this step reaches the edge.
+    /// The reported offset must also be within the distance telemetry can lag at this speed (~60 ms of travel), which
+    /// keeps a stale estimate (deltas the page swallowed) from bouncing a page that is still far from the edge.
+    /// `flush` = travel that is certain to land the page on the edge.
+    func edgeArrival(deltaY: CGFloat, velocity: CGFloat) -> (alreadyAtEdge: Bool, flush: CGFloat)? {
+        let step = abs(deltaY)
+        let lagAllowance = max(120.0, abs(velocity) * 0.06 + step * 2.0)
+        if deltaY > 0.0 {
+            if metrics.isAtTopBoundary { return (true, 0.0) }
+            let remaining = estimatedScrollY
+            guard remaining - step <= 0.0, metrics.scrollY <= lagAllowance else { return nil }
+            return (false, max(step, remaining))
+        }
+        if deltaY < 0.0 {
+            let maxY = metrics.maxScrollY
+            if metrics.isAtBottomBoundary { return (true, 0.0) }
+            let remaining = maxY - estimatedScrollY
+            guard maxY > 2.0, remaining - step <= 0.0, maxY - metrics.scrollY <= lagAllowance else { return nil }
+            return (false, max(step, remaining))
+        }
+        return nil
     }
 
     private func finishMotionAt(target: CGFloat) {
