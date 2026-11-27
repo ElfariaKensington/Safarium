@@ -78,10 +78,18 @@ final class AppleSignInGatingTests: HermeticTestCase {
 
     func testSavedAppleAccountScansImmediately() {
         guard manager.vaultURL.path.hasPrefix(Self.sandboxRoot.path) else { return XCTFail("vault outside sandbox") }
-        manager.savePasswordToAppleKeychain(host: "idmsa.apple.com", username: "someone@example.com", password: "test-only-value")
+        seedVaultPassword(manager, host: "idmsa.apple.com", username: "someone@example.com", password: "test-only-value")
         manager.handleTabURLChanged(url: authorizeURL, tab: tab)
         XCTAssertEqual(evaluator.calls, 1)
         XCTAssertEqual(driveScripts.count, 1)
         XCTAssertTrue(driveScripts[0].contains("someone@example.com"))
     }
+}
+
+/// Writes a password entry straight into the local vault (Safarium no longer saves passwords itself; only the
+/// Sign in with Apple flow still reads an existing Apple Account entry).
+private func seedVaultPassword(_ manager: ApplePasswordsPasskeyManager, host: String, username: String, password: String) {
+    var vault = manager.loadVault()
+    vault.passwords.insert(.init(host: host.lowercased(), username: username, password: password), at: 0)
+    manager.persistVault(vault)
 }

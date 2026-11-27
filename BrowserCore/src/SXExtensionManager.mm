@@ -1681,6 +1681,9 @@ static NSArray<SXExtensionContextMenuItem *> *SXBuildContextMenuTree(
 @property (nonatomic, strong) NSMutableSet<NSString *> *inFlightStoreIDs;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, SXExtensionPopupView *> *activePopups;
 @property (nonatomic, strong) NSMutableArray<NSWindow *> *popoutWindows;
+/// URL each popout was opened with (its extension id is the host); lets the service-worker bridge list, focus and
+/// close popouts, which chrome.tabs / chrome.windows cannot see.
+@property (nonatomic, strong) NSMapTable<NSWindow *, NSString *> *popoutURLs;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSArray<SXExtensionContextMenuItem *> *> *liveContextMenus;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *liveBadgeColorCache;
 
@@ -1727,6 +1730,7 @@ static BOOL SXBridgeExtIdBelongsToCaller(SXExtensionManager *mgr, NSString *extI
     _inFlightStoreIDs = [NSMutableSet set];
     _activePopups = [NSMutableDictionary dictionary];
     _popoutWindows = [NSMutableArray array];
+    _popoutURLs = [NSMapTable weakToStrongObjectsMapTable];
     _liveContextMenus = [NSMutableDictionary dictionary];
     _liveBadgeColorCache = [NSMutableDictionary dictionary];
     _liveLoader = new SXLiveExtensionLoader();
@@ -2108,6 +2112,48 @@ static std::string SXQueryParam(const std::string &query, const std::string &key
     } else {
       SXSendHTTPResponse(cfd, 500, "Internal Server Error", "{\"ok\":false}");
     }
+    return;
+  }
+
+  // Popouts of the calling extension (chrome.tabs/windows cannot see them): list, focus, close.
+  if ((method == "GET" && path == "/popouts") || (method == "POST" && path == "/popout-action")) {
+    NSString *extId = nil;
+    NSDictionary *dict = nil;
+    if (method == "GET") {
+      extId = [NSString stringWithUTF8String:SXQueryParam(query, "extId").c_str()];
+    } else {
+      NSData *jsonData = [NSData dataWithBytes:body.data() length:body.size()];
+      dict = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil];
+      if ([dict isKindOfClass:[NSDictionary class]] && [dict[@"extId"] isKindOfClass:[NSString class]]) extId = dict[@"extId"];
+    }
+    extId = extId.lowercaseString;
+    if (extId.length == 0 ||
+        !SXBridgeExtIdBelongsToCaller(self, extId, [NSString stringWithUTF8String:bridgeDir.c_str()])) {
+      SXSendHTTPResponse(cfd, 403, "Forbidden", "{\"error\":\"extId does not belong to caller\"}");
+      return;
+    }
+    NSInteger wantId = [dict[@"id"] isKindOfClass:[NSNumber class]] ? [dict[@"id"] integerValue] : -1;
+    NSString *action = [dict[@"action"] isKindOfClass:[NSString class]] ? dict[@"action"] : @"";
+    __block NSMutableArray *list = [NSMutableArray array];
+    void (^work)(void) = ^{
+      for (NSWindow *win in [self.popoutWindows copy]) {
+        NSString *u = [self.popoutURLs objectForKey:win];
+        if (![[NSURL URLWithString:u ?: @""].host.lowercaseString isEqualToString:extId]) continue;
+        if (wantId < 0) {
+          [list addObject:@{@"id" : @(win.windowNumber), @"url" : u ?: @""}];
+        } else if (win.windowNumber == wantId) {
+          if ([action isEqualToString:@"close"]) {
+            [self closePopoutWindow:win];
+          } else if ([action isEqualToString:@"focus"]) {
+            [win makeKeyAndOrderFront:nil];
+          }
+        }
+      }
+    };
+    if (NSThread.isMainThread) work(); else dispatch_sync(dispatch_get_main_queue(), work);
+    NSData *out = [NSJSONSerialization dataWithJSONObject:@{@"popouts" : list} options:0 error:nil];
+    std::string outStr(out ? (const char *)out.bytes : "{}", out ? out.length : 2);
+    SXSendHTTPResponse(cfd, 200, "OK", outStr.c_str());
     return;
   }
 
@@ -3100,7 +3146,8 @@ static BOOL SXURLMatchesContentScriptEntry(NSString *urlString, NSDictionary *en
          @[ @"/*SX_SW_BRIDGE_START_V7*/", @"/*SX_SW_BRIDGE_END_V7*/" ],
          @[ @"/*SX_SW_BRIDGE_START_V8*/", @"/*SX_SW_BRIDGE_END_V8*/" ],
          @[ @"/*SX_SW_BRIDGE_START_V9*/", @"/*SX_SW_BRIDGE_END_V9*/" ],
-         @[ @"/*SX_SW_BRIDGE_START_V10*/", @"/*SX_SW_BRIDGE_END_V10*/" ]
+         @[ @"/*SX_SW_BRIDGE_START_V10*/", @"/*SX_SW_BRIDGE_END_V10*/" ],
+         @[ @"/*SX_SW_BRIDGE_START_V11*/", @"/*SX_SW_BRIDGE_END_V11*/" ]
        ]) {
     NSRange sRange = [cleanBody rangeOfString:pair[0]];
     NSRange eRange = [cleanBody rangeOfString:pair[1]];
@@ -3115,8 +3162,8 @@ static BOOL SXURLMatchesContentScriptEntry(NSString *urlString, NSDictionary *en
     }
   }
 
-  NSString *startMarker = @"/*SX_SW_BRIDGE_START_V10*/";
-  NSString *endMarker = @"/*SX_SW_BRIDGE_END_V10*/";
+  NSString *startMarker = @"/*SX_SW_BRIDGE_START_V11*/";
+  NSString *endMarker = @"/*SX_SW_BRIDGE_END_V11*/";
   NSString *loopbackHost = [NSString stringWithFormat:@"%d.%d.%d.%d", 127, 0, 0, 1];
   NSString *baseURL = [NSString stringWithFormat:@"http://%@:%u", loopbackHost, (unsigned)_bridgePort];
   NSString *canonDir = [[dir stringByStandardizingPath] stringByResolvingSymlinksInPath];
@@ -3604,35 +3651,60 @@ static BOOL SXURLMatchesContentScriptEntry(NSString *urlString, NSDictionary *en
       "};\n"
       "patchContextMenusNs(chrome);\n"
       "if(typeof browser!=='undefined'&&browser&&browser!==chrome)patchContextMenusNs(browser);\n"
-      // Safarium tabs live in no Chrome window (tab.windowId is -1), so chrome.windows.get(tab.windowId),
-      // getCurrent() and getLastFocused() reject. Extensions that place a popout next to the sender's window
-      // (Bitwarden's inline-menu "view item" pop-out) then throw before chrome.windows.create. When the real call
-      // fails for -1 / current / last-focused, answer with a window standing in for the Safarium window.
+      // Safarium tabs belong to no Chrome window (windowId -1) and extension popouts are native windows that
+      // chrome.tabs/windows cannot see. Stand in for both: windows.get(-1)/getCurrent/getLastFocused answer with
+      // the Safarium window; the extension's popouts appear in tabs.query (ids from POP_BASE) and windows.remove /
+      // update({focused}) / tabs.remove on them close or focus the native window (Bitwarden pop-out flows).
+      "const POP_BASE=900000000;\n"
+      "const isPopId=(id)=>typeof id==='number'&&id>=POP_BASE;\n"
+      "const fetchPopouts=()=>fetch(BASE+'/popouts?token='+TOK+'&key='+KEY+'&extId='+encodeURIComponent(EXT_ID)).then(r=>r.json()).then(j=>Array.isArray(j&&j.popouts)?j.popouts:[]).catch(()=>[]);\n"
+      "const popoutAction=(id,action)=>fetch(BASE+'/popout-action?token='+TOK+'&key='+KEY,{method:'POST',headers:{'Content-Type':'text/plain;charset=UTF-8'},body:JSON.stringify({extId:EXT_ID,id:id,action:action})}).catch(()=>{});\n"
+      "const urlMatches=(pattern,url)=>{if(!pattern)return true;return [].concat(pattern).some((pt)=>{pt=String(pt);const i=pt.indexOf('*');return i<0?pt===url:url.startsWith(pt.slice(0,i));});};\n"
+      "const popTab=(p)=>({id:POP_BASE+p.id,windowId:POP_BASE+p.id,index:0,url:p.url,title:'',active:true,highlighted:true,selected:true,pinned:false,audible:false,discarded:false,autoDiscardable:true,incognito:false,status:'complete',groupId:-1});\n"
+      "const popWin=(id,info)=>({id:id,focused:true,alwaysOnTop:false,incognito:false,type:'popup',state:'normal',left:0,top:0,width:380,height:630,tabs:(info&&info.populate)?[]:undefined});\n"
+      "const settle=(p,cb)=>{if(typeof cb==='function'){p.then((v)=>cb(v),()=>cb(undefined));return;}return p;};\n"
       "const patchWindowsNs=(ns)=>{\n"
       "  const w=ns&&ns.windows;if(!w||w.__sxWinPatched)return;\n"
       "  const CUR=typeof w.WINDOW_ID_CURRENT==='number'?w.WINDOW_ID_CURRENT:-2;\n"
       "  const synth=(info)=>{const sw=(globalThis.screen&&screen.availWidth)||1440,sh=(globalThis.screen&&screen.availHeight)||900;\n"
       "    const width=Math.min(1200,sw),height=Math.min(800,sh);\n"
-      "    const win={id:-1,focused:true,alwaysOnTop:false,incognito:false,type:'normal',state:'normal',left:Math.max(0,Math.round((sw-width)/2)),top:Math.max(0,Math.round((sh-height)/2)),width,height};\n"
+      "    const win={id:-1,focused:true,alwaysOnTop:false,incognito:false,type:'normal',state:'normal',left:Math.max(0,Math.round((sw-width)/2)),top:Math.max(0,Math.round((sh-height)/2)),width:width,height:height};\n"
       "    if(info&&info.populate){const t=lastRealTab||sxActiveTab;win.tabs=t?[Object.assign({},t,{windowId:-1,active:true})]:[];}\n"
       "    return win;};\n"
-      "  const wrap=(name,canStandIn)=>{const orig=w[name];if(typeof orig!=='function')return null;\n"
-      "    return function(...args){const cb=typeof args[args.length-1]==='function'?args.pop():null;\n"
-      "      const info=args.find(a=>a&&typeof a==='object')||null;\n"
-      "      const p=new Promise((resolve,reject)=>{try{orig.call(w,...args,(res)=>{const err=chrome.runtime&&chrome.runtime.lastError;\n"
-      "        if(!err)return resolve(res);if(canStandIn(args))return resolve(synth(info));reject(new Error(err.message));});}catch(e){reject(e);}});\n"
-      "      if(cb){p.then(cb,()=>cb(undefined));return;}return p;};};\n"
-      "  const get=wrap('get',(a)=>a[0]===-1||a[0]===CUR),cur=wrap('getCurrent',()=>true),last=wrap('getLastFocused',()=>true);\n"
-      "  const origAll=w.getAll;\n"
-      "  const all=typeof origAll==='function'?function(...args){const cb=typeof args[args.length-1]==='function'?args.pop():null;const info=args.find(a=>a&&typeof a==='object')||null;\n"
-      "    const p=new Promise((resolve)=>{try{origAll.call(w,...args,(res)=>{const list=Array.isArray(res)?res:[];resolve(list.length?list:[synth(info)]);});}catch(_){resolve([synth(info)]);}});\n"
-      "    if(cb){p.then(cb);return;}return p;}:null;\n"
-      "  const prox=new Proxy(w,{get(target,p){if(p==='__sxWinPatched')return true;if(p==='get'&&get)return get;if(p==='getCurrent'&&cur)return cur;if(p==='getLastFocused'&&last)return last;if(p==='getAll'&&all)return all;\n"
-      "    const v=Reflect.get(target,p,target);return typeof v==='function'?v.bind(target):v;}});\n"
+      "  const call=(fn,args)=>new Promise((resolve,reject)=>{try{fn.call(w,...args,(res)=>{const err=chrome.runtime&&chrome.runtime.lastError;if(err)reject(new Error(err.message));else resolve(res);});}catch(e){reject(e);}});\n"
+      "  const split=(args)=>{const a=args.slice();const cb=typeof a[a.length-1]==='function'?a.pop():null;return [a,cb];};\n"
+      "  const get=function(...args){const [a,cb]=split(args);const info=a.find((x)=>x&&typeof x==='object')||null;\n"
+      "    if(isPopId(a[0]))return settle(Promise.resolve(popWin(a[0],info)),cb);\n"
+      "    return settle(call(w.get,a).catch((e)=>{if(a[0]===-1||a[0]===CUR)return synth(info);throw e;}),cb);};\n"
+      "  const cur=function(...args){const [a,cb]=split(args);const info=a.find((x)=>x&&typeof x==='object')||null;return settle(call(w.getCurrent,a).catch(()=>synth(info)),cb);};\n"
+      "  const last=function(...args){const [a,cb]=split(args);const info=a.find((x)=>x&&typeof x==='object')||null;return settle(call(w.getLastFocused,a).catch(()=>synth(info)),cb);};\n"
+      "  const all=function(...args){const [a,cb]=split(args);const info=a.find((x)=>x&&typeof x==='object')||null;return settle(call(w.getAll,a).catch(()=>[]).then((list)=>Array.isArray(list)&&list.length?list:[synth(info)]),cb);};\n"
+      "  const remove=function(...args){const [a,cb]=split(args);if(isPopId(a[0])){popoutAction(a[0]-POP_BASE,'close');return settle(Promise.resolve(),cb);}return settle(call(w.remove,a),cb);};\n"
+      "  const update=function(...args){const [a,cb]=split(args);if(isPopId(a[0])){if(a[1]&&a[1].focused)popoutAction(a[0]-POP_BASE,'focus');return settle(Promise.resolve(popWin(a[0],null)),cb);}return settle(call(w.update,a),cb);};\n"
+      "  const map={get:get,getCurrent:cur,getLastFocused:last,getAll:all,remove:remove,update:update};\n"
+      "  const prox=new Proxy(w,{get(target,p){if(p==='__sxWinPatched')return true;if(Object.prototype.hasOwnProperty.call(map,p))return map[p];const v=Reflect.get(target,p,target);return typeof v==='function'?v.bind(target):v;}});\n"
       "  try{Object.defineProperty(ns,'windows',{value:prox,configurable:true,writable:true});}catch(_){}\n"
       "};\n"
+      "const patchPopoutTabs=(ns)=>{\n"
+      "  const t=ns&&ns.tabs;if(!t||t.__sxPopTabs)return;\n"
+      "  const oq=t.query,orm=t.remove,og=t.get;\n"
+      "  const viaCb=(fn,args)=>new Promise((resolve,reject)=>{try{fn.call(t,...args,(res)=>{const err=chrome.runtime&&chrome.runtime.lastError;if(err)reject(new Error(err.message));else resolve(res);});}catch(e){reject(e);}});\n"
+      "  const query=function(info,cb){const qi=info&&typeof info==='object'?info:{};\n"
+      "    const p=viaCb(oq,[qi]).catch(()=>[]).then((tabs)=>{tabs=Array.isArray(tabs)?tabs:[];\n"
+      "      const wantsOwnPages=qi.url&&[].concat(qi.url).some((u)=>String(u).startsWith('chrome-extension://'+EXT_ID+'/'));\n"
+      "      if(!wantsOwnPages)return tabs;\n"
+      "      return fetchPopouts().then((ps)=>tabs.concat(ps.filter((x)=>urlMatches(qi.url,x.url)).map(popTab)));});\n"
+      "    return settle(p,cb);};\n"
+      "  const remove=function(ids,cb){const arr=[].concat(ids);arr.filter(isPopId).forEach((i)=>popoutAction(i-POP_BASE,'close'));\n"
+      "    const rest=arr.filter((i)=>!isPopId(i));const p=rest.length?viaCb(orm,[rest.length===1?rest[0]:rest]):Promise.resolve();return settle(p,cb);};\n"
+      "  const get=function(id,cb){if(isPopId(id))return settle(fetchPopouts().then((ps)=>{const m=ps.find((x)=>POP_BASE+x.id===id);if(!m)throw new Error('No tab with id: '+id);return popTab(m);}),cb);return settle(viaCb(og,[id]),cb);};\n"
+      "  const map={query:query,remove:remove,get:get};\n"
+      "  const prox=new Proxy(t,{get(target,p){if(p==='__sxPopTabs')return true;if(Object.prototype.hasOwnProperty.call(map,p))return map[p];const v=Reflect.get(target,p,target);return typeof v==='function'?v.bind(target):v;}});\n"
+      "  try{Object.defineProperty(ns,'tabs',{value:prox,configurable:true,writable:true});}catch(_){}\n"
+      "};\n"
       "patchWindowsNs(chrome);\n"
-      "if(typeof browser!=='undefined'&&browser&&browser!==chrome)patchWindowsNs(browser);\n"
+      "patchPopoutTabs(chrome);\n"
+      "if(typeof browser!=='undefined'&&browser&&browser!==chrome){patchWindowsNs(browser);patchPopoutTabs(browser);}\n"
       "startEventPoll();\n"
       "setTimeout(syncAllBadges,800);\n"
       "setInterval(syncAllBadges,3000);\n"
@@ -4191,6 +4263,7 @@ static BOOL SXURLMatchesContentScriptEntry(NSString *urlString, NSDictionary *en
   popupView->_popupClient = client;
 
   [self.popoutWindows addObject:popoutWin];
+  [self.popoutURLs setObject:(url.absoluteString ?: @"") forKey:popoutWin];
 
   CefWindowInfo windowInfo;
   CefRect bounds(0, 0, (int)std::round(w), (int)std::round(h));

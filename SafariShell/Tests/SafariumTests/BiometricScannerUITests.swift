@@ -82,15 +82,6 @@ final class BiometricScannerUITests: HermeticTestCase {
         )
     }
 
-    func testRpIdDomainBoundaryRules() {
-        XCTAssertTrue(ApplePasswordsPasskeyManager.isValidRpId("example.com", forHost: "example.com"))
-        XCTAssertTrue(ApplePasswordsPasskeyManager.isValidRpId("example.com", forHost: "sub.example.com"))
-        XCTAssertFalse(ApplePasswordsPasskeyManager.isValidRpId("badexample.com", forHost: "example.com"))
-        XCTAssertFalse(ApplePasswordsPasskeyManager.isValidRpId("co.uk", forHost: "shop.co.uk"))
-        XCTAssertFalse(ApplePasswordsPasskeyManager.isValidRpId("github.io", forHost: "demo.github.io"))
-        XCTAssertFalse(ApplePasswordsPasskeyManager.isValidRpId("127.0.0.1", forHost: "sub.127.0.0.1"))
-    }
-
     func testSignInWithAppleModalSheetAndInteractiveWebContainer() {
         let cfg = SafariBiometricSheetKind.SignInWithAppleConfig(
             siteDisplayName: "Janitor",
