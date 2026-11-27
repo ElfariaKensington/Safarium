@@ -1,0 +1,11 @@
+module BrowserCore {
+    umbrella header "SafariumEngineBridge.h"
+    export *
+    link "SafariumBrowserCore"
+    link framework "AppKit"
+    link framework "Foundation"
+    link framework "QuartzCore"
+    link framework "IOSurface"
+    link framework "CoreGraphics"
+    link framework "ImageIO"
+}
