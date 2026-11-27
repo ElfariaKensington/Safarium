@@ -3451,7 +3451,32 @@ static NSString *SXSanitizedSaveFileBaseName(NSString * _Nullable title, NSURL *
   }
 }
 
+/// A cross-document commit swaps in a new RenderWidgetHostViewCocoa that is not first responder, so the new page
+/// had no focus (document.hasFocus() false) even with the window key: autofocused fields could not be typed into
+/// until clicked, and Bitwarden skips positioning its inline menu without page focus, leaving its frames as bare
+/// blue boxes at the top-left. Hand focus to the new view when keyboard focus was on the page or nowhere (never
+/// while an AppKit text field such as the address bar is being edited).
+- (void)restoreWebContentFocusAfterCommit {
+  if (_isClosed || self.hostView.isHidden) return;
+  NSWindow *window = self.hostView.window;
+  if (!window || !window.isKeyWindow) return;
+  NSResponder *fr = window.firstResponder;
+  if ([fr isKindOfClass:[NSText class]] || [fr isKindOfClass:[NSTextField class]]) return;
+  BOOL focusOnPageOrNowhere = (fr == nil || fr == window ||
+                               ([fr isKindOfClass:[NSView class]] && [(NSView *)fr isDescendantOf:self.hostView]));
+  if (!focusOnPageOrNowhere) return;
+  NSView *rwhv = SXFindFocusableWebView(self.hostView);
+  if (rwhv && fr != rwhv) [window makeFirstResponder:rwhv];
+  if (_browser && _browser->GetHost()) _browser->GetHost()->SetFocus(true);
+}
+
 - (void)handleMainFrameLoadStart {
+  [self restoreWebContentFocusAfterCommit];
+  // The new view can be attached a turn later; check again once it is in place.
+  __weak SXBrowserTab *weakFocusSelf = self;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    [weakFocusSelf restoreWebContentFocusAfterCommit];
+  });
   [self installFreezeFrameForCommitIfReady];
   _mainFrameLoading = YES;
   [self.runtime notifyNavigationBurst];

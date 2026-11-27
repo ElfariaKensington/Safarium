@@ -3099,7 +3099,8 @@ static BOOL SXURLMatchesContentScriptEntry(NSString *urlString, NSDictionary *en
          @[ @"/*SX_SW_BRIDGE_START_V6*/", @"/*SX_SW_BRIDGE_END_V6*/" ],
          @[ @"/*SX_SW_BRIDGE_START_V7*/", @"/*SX_SW_BRIDGE_END_V7*/" ],
          @[ @"/*SX_SW_BRIDGE_START_V8*/", @"/*SX_SW_BRIDGE_END_V8*/" ],
-         @[ @"/*SX_SW_BRIDGE_START_V9*/", @"/*SX_SW_BRIDGE_END_V9*/" ]
+         @[ @"/*SX_SW_BRIDGE_START_V9*/", @"/*SX_SW_BRIDGE_END_V9*/" ],
+         @[ @"/*SX_SW_BRIDGE_START_V10*/", @"/*SX_SW_BRIDGE_END_V10*/" ]
        ]) {
     NSRange sRange = [cleanBody rangeOfString:pair[0]];
     NSRange eRange = [cleanBody rangeOfString:pair[1]];
@@ -3114,8 +3115,8 @@ static BOOL SXURLMatchesContentScriptEntry(NSString *urlString, NSDictionary *en
     }
   }
 
-  NSString *startMarker = @"/*SX_SW_BRIDGE_START_V9*/";
-  NSString *endMarker = @"/*SX_SW_BRIDGE_END_V9*/";
+  NSString *startMarker = @"/*SX_SW_BRIDGE_START_V10*/";
+  NSString *endMarker = @"/*SX_SW_BRIDGE_END_V10*/";
   NSString *loopbackHost = [NSString stringWithFormat:@"%d.%d.%d.%d", 127, 0, 0, 1];
   NSString *baseURL = [NSString stringWithFormat:@"http://%@:%u", loopbackHost, (unsigned)_bridgePort];
   NSString *canonDir = [[dir stringByStandardizingPath] stringByResolvingSymlinksInPath];
@@ -3603,6 +3604,35 @@ static BOOL SXURLMatchesContentScriptEntry(NSString *urlString, NSDictionary *en
       "};\n"
       "patchContextMenusNs(chrome);\n"
       "if(typeof browser!=='undefined'&&browser&&browser!==chrome)patchContextMenusNs(browser);\n"
+      // Safarium tabs live in no Chrome window (tab.windowId is -1), so chrome.windows.get(tab.windowId),
+      // getCurrent() and getLastFocused() reject. Extensions that place a popout next to the sender's window
+      // (Bitwarden's inline-menu "view item" pop-out) then throw before chrome.windows.create. When the real call
+      // fails for -1 / current / last-focused, answer with a window standing in for the Safarium window.
+      "const patchWindowsNs=(ns)=>{\n"
+      "  const w=ns&&ns.windows;if(!w||w.__sxWinPatched)return;\n"
+      "  const CUR=typeof w.WINDOW_ID_CURRENT==='number'?w.WINDOW_ID_CURRENT:-2;\n"
+      "  const synth=(info)=>{const sw=(globalThis.screen&&screen.availWidth)||1440,sh=(globalThis.screen&&screen.availHeight)||900;\n"
+      "    const width=Math.min(1200,sw),height=Math.min(800,sh);\n"
+      "    const win={id:-1,focused:true,alwaysOnTop:false,incognito:false,type:'normal',state:'normal',left:Math.max(0,Math.round((sw-width)/2)),top:Math.max(0,Math.round((sh-height)/2)),width,height};\n"
+      "    if(info&&info.populate){const t=lastRealTab||sxActiveTab;win.tabs=t?[Object.assign({},t,{windowId:-1,active:true})]:[];}\n"
+      "    return win;};\n"
+      "  const wrap=(name,canStandIn)=>{const orig=w[name];if(typeof orig!=='function')return null;\n"
+      "    return function(...args){const cb=typeof args[args.length-1]==='function'?args.pop():null;\n"
+      "      const info=args.find(a=>a&&typeof a==='object')||null;\n"
+      "      const p=new Promise((resolve,reject)=>{try{orig.call(w,...args,(res)=>{const err=chrome.runtime&&chrome.runtime.lastError;\n"
+      "        if(!err)return resolve(res);if(canStandIn(args))return resolve(synth(info));reject(new Error(err.message));});}catch(e){reject(e);}});\n"
+      "      if(cb){p.then(cb,()=>cb(undefined));return;}return p;};};\n"
+      "  const get=wrap('get',(a)=>a[0]===-1||a[0]===CUR),cur=wrap('getCurrent',()=>true),last=wrap('getLastFocused',()=>true);\n"
+      "  const origAll=w.getAll;\n"
+      "  const all=typeof origAll==='function'?function(...args){const cb=typeof args[args.length-1]==='function'?args.pop():null;const info=args.find(a=>a&&typeof a==='object')||null;\n"
+      "    const p=new Promise((resolve)=>{try{origAll.call(w,...args,(res)=>{const list=Array.isArray(res)?res:[];resolve(list.length?list:[synth(info)]);});}catch(_){resolve([synth(info)]);}});\n"
+      "    if(cb){p.then(cb);return;}return p;}:null;\n"
+      "  const prox=new Proxy(w,{get(target,p){if(p==='__sxWinPatched')return true;if(p==='get'&&get)return get;if(p==='getCurrent'&&cur)return cur;if(p==='getLastFocused'&&last)return last;if(p==='getAll'&&all)return all;\n"
+      "    const v=Reflect.get(target,p,target);return typeof v==='function'?v.bind(target):v;}});\n"
+      "  try{Object.defineProperty(ns,'windows',{value:prox,configurable:true,writable:true});}catch(_){}\n"
+      "};\n"
+      "patchWindowsNs(chrome);\n"
+      "if(typeof browser!=='undefined'&&browser&&browser!==chrome)patchWindowsNs(browser);\n"
       "startEventPoll();\n"
       "setTimeout(syncAllBadges,800);\n"
       "setInterval(syncAllBadges,3000);\n"
