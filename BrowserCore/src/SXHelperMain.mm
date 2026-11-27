@@ -2537,6 +2537,14 @@ class SXHelperApp : public CefApp,
           let edgeColor = 'transparent';
           const shifted = new Map();            // element -> { base, inline, prio } (page's own top + inline top)
           let observer = null;
+          const OBSERVE_OPTS = { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] };
+          const observedRoots = new WeakSet();
+          // Mutations inside a shadow root never reach the document observer; watch each root the probe enters.
+          function observeRoot(root) {
+            if (!observer || observedRoots.has(root)) return;
+            observedRoots.add(root);
+            try { observer.observe(root, OBSERVE_OPTS); } catch (_) {}
+          }
 
           function css() {
             const h = sxTopInset.px;
@@ -2583,7 +2591,8 @@ class SXHelperApp : public CefApp,
           }
 
           function onInitialContainingBlock(el) {
-            for (let p = el.parentElement; p; p = p.parentElement) {
+            for (let p = el.parentElement || (el.parentNode && el.parentNode.host) || null; p;
+                 p = p.parentElement || (p.parentNode && p.parentNode.host) || null) {
               const cs = window.getComputedStyle(p);
               if (cs.position !== 'static' || cs.transform !== 'none' || cs.filter !== 'none' ||
                   cs.contain === 'paint' || cs.contain === 'strict' || cs.contain === 'content') return false;
@@ -2611,9 +2620,37 @@ class SXHelperApp : public CefApp,
             try { cs = window.getComputedStyle(el); } catch (_) { return; }
             const top = qualifies(el, cs);
             if (top === null) return;
-            const rec = { base: top, inline: el.style.getPropertyValue('top'), prio: el.style.getPropertyPriority('top') };
+            const rec = { base: top, inline: el.style.getPropertyValue('top'), prio: el.style.getPropertyPriority('top'),
+                          clamped: null };
             shifted.set(el, rec);
             writeTop(el, (top + sxTopInset.px) + 'px', 'important');
+            clampViewportTallChildren(el, rec, top);
+          }
+
+          // A full-viewport overlay (top 0, inset 0) shrinks once its top moves below the toolbar, but a panel inside
+          // it sized to the viewport (100vh/100dvh, e.g. Reddit's lightbox .dialog-panel) is still centred in it and
+          // spills back under the toolbar by half the inset, with the close button. Cap such direct children
+          // (light DOM and shadow tree) to the overlay's height; restored when the overlay is unshifted.
+          function clampViewportTallChildren(el, rec, top) {
+            if (top > 1) return;
+            const vh = window.innerHeight || 1;
+            const kids = [];
+            try {
+              if (el.shadowRoot) kids.push.apply(kids, el.shadowRoot.children);
+              kids.push.apply(kids, el.children);
+            } catch (_) { return; }
+            for (let i = 0; i < kids.length && i < 24; i++) {
+              const kid = kids[i];
+              if (rec.clamped && rec.clamped.some(function(c) { return c.el === kid; })) continue;
+              let kcs;
+              try { kcs = window.getComputedStyle(kid); } catch (_) { continue; }
+              if (kcs.position === 'fixed' || kcs.position === 'absolute' || kcs.display === 'none') continue;
+              if (kid.getBoundingClientRect().height < vh - 1) continue;
+              if (!rec.clamped) rec.clamped = [];
+              rec.clamped.push({ el: kid, value: kid.style.getPropertyValue('max-height'),
+                                 prio: kid.style.getPropertyPriority('max-height') });
+              kid.style.setProperty('max-height', '100%', 'important');
+            }
           }
 
           function unshift(el) {
@@ -2621,6 +2658,11 @@ class SXHelperApp : public CefApp,
             if (!rec) return;
             shifted.delete(el);
             if (el.isConnected) writeTop(el, rec.inline, rec.prio);
+            if (rec.clamped) {
+              for (const c of rec.clamped) {
+                if (c.value) c.el.style.setProperty('max-height', c.value, c.prio); else c.el.style.removeProperty('max-height');
+              }
+            }
           }
 
           // Re-read a shifted element from the page's own styles (its class/style changed).
@@ -2672,25 +2714,45 @@ class SXHelperApp : public CefApp,
             for (const el of Array.from(shifted.keys())) {
               if (!el.isConnected) { shifted.delete(el); continue; }
               const pos = window.getComputedStyle(el).position;
-              if (pos !== 'fixed' && pos !== 'sticky' && pos !== 'absolute') unshift(el);
+              if (pos !== 'fixed' && pos !== 'sticky' && pos !== 'absolute') { unshift(el); continue; }
+              // Overlays often render their panel a frame or more after the overlay itself appears.
+              const rec = shifted.get(el);
+              if (rec && rec.base <= 1) clampViewportTallChildren(el, rec, rec.base);
             }
             const vw = window.innerWidth || 1;
             const vh = window.innerHeight || 1;
             const seen = new Set();
             const ys = [1, h * 0.5, h - 1, h + 24, h + 96, vh * 0.35, vh * 0.65, vh * 0.92];
+            const TOP_BAND_YS = 5;              // ys[0..4] cover every top a shifted bar can have
+            // document.elementsFromPoint stops at shadow hosts, so bars and overlays inside a shadow root (Reddit's
+            // image lightbox: a fixed inset:0 div in #shreddit-media-lightbox's shadow root) were never shifted and
+            // their controls sat under the toolbar. In the top band, hit-test the shadow roots of the front-most hits
+            // too (each root once per point; a root's own result repeats the outer elements, hence the visited set).
+            const visit = function(stack, x, y, depth, roots, intoShadow) {
+              for (let j = 0; j < stack.length && j < 16; j++) {
+                const hit = stack[j];
+                for (let n = hit, hop = 0; n && n !== document.body && n !== document.documentElement && hop < 10;
+                     n = n.parentElement || (n.parentNode && n.parentNode.host) || null, hop++) {
+                  if (seen.has(n)) continue;
+                  seen.add(n);
+                  shift(n);
+                }
+                const root = hit && hit.shadowRoot;
+                if (intoShadow && root && j < 4 && depth < 3 && !roots.has(root) && root.elementsFromPoint) {
+                  roots.add(root);
+                  observeRoot(root);
+                  let inner;
+                  try { inner = root.elementsFromPoint(x, y); } catch (_) { inner = null; }
+                  if (inner) visit(inner, x, y, depth + 1, roots, true);
+                }
+              }
+            };
             for (let xi = 0; xi < PROBE_XS.length; xi++) {
               const x = Math.min(vw - 1, Math.max(0, vw * PROBE_XS[xi]));
               for (let yi = 0; yi < ys.length; yi++) {
                 let stack;
                 try { stack = document.elementsFromPoint(x, ys[yi]); } catch (_) { continue; }
-                for (let j = 0; j < stack.length && j < 16; j++) {
-                  for (let n = stack[j], hop = 0; n && n !== document.body && n !== document.documentElement && hop < 10;
-                       n = n.parentElement, hop++) {
-                    if (seen.has(n)) continue;
-                    seen.add(n);
-                    shift(n);
-                  }
-                }
+                visit(stack, x, ys[yi], 0, new Set(), yi < TOP_BAND_YS);
               }
             }
             if ((window.scrollY || 0) < h + 2) updateEdgeColor();
@@ -2739,7 +2801,7 @@ class SXHelperApp : public CefApp,
               if (observer) observer.takeRecords();
               if (dirty) schedule();
             });
-            observer.observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+            observer.observe(document, OBSERVE_OPTS);
           } catch (_) {}
           window.addEventListener('scroll', schedule, { passive: true, capture: true });
           window.addEventListener('resize', schedule, { passive: true });
