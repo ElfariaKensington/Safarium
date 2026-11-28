@@ -24,6 +24,7 @@ class HermeticTestCase: XCTestCase {
 
     static func installSandbox() {
         _ = sandboxRoot
+        MotionPreference.overrideForTesting = false
         // The vault key normally lives in the real login Keychain; tests must never touch it.
     }
 

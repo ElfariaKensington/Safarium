@@ -1279,7 +1279,6 @@ final class ElasticScrollEngine: NSObject {
 
         if currentOverscrollY >= Parameters.refreshTriggerOffset {
             refreshState = .refreshing(triggeredAt: now, pageLoadObserved: metrics.isPageLoading)
-            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
             onTriggerRefresh?()
         }
     }
