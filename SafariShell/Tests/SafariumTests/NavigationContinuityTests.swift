@@ -323,4 +323,106 @@ final class NavigationContinuityTests: HermeticTestCase {
         XCTAssertTrue(privateTab.recordedPrewarmedURLs.isEmpty,
                       "Private Browsing must emit zero speculative preconnect hints")
     }
+
+    // MARK: - 7. Regression Tests for Full-Bleed JPEG Swipe Snapshots, Native Scroll & Overview Trim
+
+    func testWarmJPEGSnapshotsPreserveFullBleedBehindToolbarAcrossPrewarmAndDecode() throws {
+        let img = solidImage(color: .systemTeal, size: NSSize(width: 400, height: 300))
+        let tiff = try XCTUnwrap(img.tiffRepresentation)
+        let rep = try XCTUnwrap(NSBitmapImageRep(data: tiff))
+        let jpeg = try XCTUnwrap(rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7]))
+        let tabID = "test-fullbleed-\(UUID().uuidString)"
+        defer { NavigationSnapshotStore.shared.removeTab(tabID) }
+
+        NavigationSnapshotStore.shared.storeJPEG(
+            jpeg,
+            tabID: tabID,
+            entryID: 101,
+            logicalSize: CGSize(width: 1200, height: 800),
+            backingScale: 2.0,
+            backgroundColor: .systemTeal
+        )
+        let decoded = try XCTUnwrap(NavigationSnapshotStore.shared.snapshot(tabID: tabID, entryID: 101))
+        XCTAssertTrue(decoded.isFullBleedBehindToolbar,
+                      "Full-bleed web JPEG snapshots must stay marked full-bleed on synchronous decode")
+
+        let stageRect = NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let snapView = SwipeSnapshotLayerView(frame: stageRect, payload: decoded, topContentInset: 48.0)
+        snapView.layoutSubtreeIfNeeded()
+        XCTAssertEqual(snapView.layer?.sublayers?.first?.frame, CGRect(x: 0, y: 0, width: 1200, height: 800))
+
+        NavigationSnapshotStore.shared.storeJPEG(
+            jpeg,
+            tabID: tabID,
+            entryID: 102,
+            logicalSize: CGSize(width: 1200, height: 800),
+            backingScale: 2.0,
+            backgroundColor: .systemTeal
+        )
+        NavigationSnapshotStore.shared.prewarm(tabID: tabID, entryIDs: [102])
+        spinRunLoop(0.15)
+        let prewarmed = try XCTUnwrap(NavigationSnapshotStore.shared.snapshot(tabID: tabID, entryID: 102))
+        XCTAssertTrue(prewarmed.isFullBleedBehindToolbar,
+                      "Prewarmed hot-cache web JPEG snapshots must preserve isFullBleedBehindToolbar")
+    }
+
+    func testNativeHistoryAndInspectPagesDisableElasticWebOverscroll() throws {
+        let wc = SafariWindowController(engine: MockBrowserEngine())
+        let win = try XCTUnwrap(wc.window)
+        defer { win.close() }
+        wc.openInitialTabsIfNeeded()
+        spinRunLoop(0.15)
+
+        guard let elastic: ElasticScrollEngine = uiPrivate(wc, "elasticScrollEngine") else {
+            return XCTFail("missing elasticScrollEngine")
+        }
+
+        wc.openURLInActiveOrNewTab(URL(string: "safarium://history")!)
+        spinRunLoop(0.10)
+        let historyTab = try XCTUnwrap(currentTab(wc))
+        XCTAssertTrue(historyTab.isNativeInternalPage)
+        XCTAssertEqual(elastic.currentOverscrollY, 0.0, accuracy: 0.001)
+
+        wc.openURLInActiveOrNewTab(InspectPageURL.rootURL)
+        spinRunLoop(0.10)
+        let inspectTab = try XCTUnwrap(currentTab(wc))
+        XCTAssertTrue(inspectTab.isNativeInternalPage)
+        XCTAssertEqual(elastic.currentOverscrollY, 0.0, accuracy: 0.001)
+    }
+
+    func testTabOverviewUpdateSnapshotPreservesLiveLayerAndSeparateStripTrim() throws {
+        let overview = TabOverviewView(frame: NSRect(x: 0, y: 0, width: 1200, height: 800))
+        let live = CALayer()
+        live.bounds = CGRect(x: 0, y: 0, width: 1200, height: 800)
+        let card = TabOverviewView.CardModel(
+            id: "tab-1",
+            title: "Example",
+            url: URL(string: "https://example.com"),
+            favicon: nil,
+            snapshot: solidImage(color: .white, size: NSSize(width: 600, height: 400)),
+            isActive: true,
+            frameSurface: nil,
+            frameSize: CGSize(width: 1200, height: 800),
+            liveLayer: live
+        )
+        overview.update(cards: [card])
+        overview.updateSnapshot(solidImage(color: .black, size: NSSize(width: 600, height: 400)), forTabID: "tab-1")
+
+        let prevLayout = BrowserSettings.shared.tabLayout
+        defer { BrowserSettings.shared.set(prevLayout, forKey: BrowserSettings.Key.tabLayout) }
+        BrowserSettings.shared.set("separate", forKey: BrowserSettings.Key.tabLayout)
+
+        let wc = SafariWindowController(engine: MockBrowserEngine())
+        let win = try XCTUnwrap(wc.window)
+        defer { win.close() }
+        wc.openInitialTabsIfNeeded()
+        _ = wc.createNewTab(url: URL(string: "https://apple.com")!, activate: true)
+        spinRunLoop(0.15)
+        guard let wcOverview: TabOverviewView = uiPrivate(wc, "tabOverviewView") else {
+            return XCTFail("missing tabOverviewView")
+        }
+        XCTAssertEqual(wcOverview.toolbarTopInsetPoints,
+                       SafariMetrics.toolbarHeight + 34.0,
+                       accuracy: 0.5)
+    }
 }

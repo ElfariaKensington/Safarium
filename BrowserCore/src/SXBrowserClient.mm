@@ -1140,6 +1140,67 @@ std::string SXBrowserClient::ResolveCurrentPageURL(CefRefPtr<CefBrowser> browser
 
 #pragma mark - CefLifeSpanHandler
 
+namespace {
+
+NSURL* SXURLFromCefTargetString(const CefString& target_url) {
+  NSString* urlStr = NSStringFromCefString(target_url);
+  if (urlStr.length == 0) return nil;
+  NSURL* url = [NSURL URLWithString:urlStr];
+  if (!url) {
+    NSString* encoded = [urlStr stringByAddingPercentEncodingWithAllowedCharacters:
+                                    [NSCharacterSet URLFragmentAllowedCharacterSet]];
+    if (encoded.length > 0) {
+      url = [NSURL URLWithString:encoded];
+    }
+  }
+  return url;
+}
+
+}  // namespace
+
+bool SXBrowserClient::OnOpenURLFromTab(CefRefPtr<CefBrowser> browser,
+                                       CefRefPtr<CefFrame> frame,
+                                       const CefString& target_url,
+                                       WindowOpenDisposition target_disposition,
+                                       bool user_gesture) {
+  CEF_REQUIRE_UI_THREAD();
+  (void)browser;
+  (void)frame;
+
+  SXWindowOpenDisposition sxDisposition;
+  switch (target_disposition) {
+    case CEF_WOD_NEW_BACKGROUND_TAB:
+      sxDisposition = SXWindowOpenDispositionNewBackgroundTab;
+      break;
+    case CEF_WOD_NEW_FOREGROUND_TAB:
+      sxDisposition = SXWindowOpenDispositionNewForegroundTab;
+      break;
+    case CEF_WOD_NEW_WINDOW:
+    case CEF_WOD_NEW_POPUP:
+      sxDisposition = SXWindowOpenDispositionNewWindow;
+      break;
+    case CEF_WOD_OFF_THE_RECORD:
+      sxDisposition = SXWindowOpenDispositionOffTheRecord;
+      break;
+    default:
+      // Allow CEF_WOD_CURRENT_TAB / downloads to proceed through standard Chromium navigation.
+      return false;
+  }
+
+  SXBrowserTab* strongTab = RetainTab();
+  NSURL* url = SXURLFromCefTargetString(target_url);
+  if (!strongTab || !url) {
+    return true;
+  }
+
+  dispatch_async(dispatch_get_main_queue(), ^{
+    (void)[strongTab handleOpenRequestURL:url
+                              disposition:sxDisposition
+                              userGesture:user_gesture ? YES : NO];
+  });
+  return true;
+}
+
 bool SXBrowserClient::OnBeforePopup(CefRefPtr<CefBrowser> browser,
                                     CefRefPtr<CefFrame> frame,
                                     int popup_id,
@@ -1156,12 +1217,11 @@ bool SXBrowserClient::OnBeforePopup(CefRefPtr<CefBrowser> browser,
   CEF_REQUIRE_UI_THREAD();
   (void)browser;
   (void)popup_id;
-  (void)target_disposition;
   (void)popupFeatures;
   (void)settings;
   (void)extra_info;
   NSString* urlStr = NSStringFromCefString(target_url);
-  NSURL* url = urlStr.length > 0 ? [NSURL URLWithString:urlStr] : nil;
+  NSURL* url = SXURLFromCefTargetString(target_url);
 
   // Enforce per-website / default Pop-up Windows policy (0=Block and Notify, 1=Block, 2=Allow)
   // for non-user-gesture popups.
@@ -1223,10 +1283,26 @@ bool SXBrowserClient::OnBeforePopup(CefRefPtr<CefBrowser> browser,
   }
 
   if (strongTab && url) {
+    SXWindowOpenDisposition sxDisposition = SXWindowOpenDispositionNewTabDefault;
+    switch (target_disposition) {
+      case CEF_WOD_NEW_BACKGROUND_TAB:
+        sxDisposition = SXWindowOpenDispositionNewBackgroundTab;
+        break;
+      case CEF_WOD_NEW_WINDOW:
+        sxDisposition = SXWindowOpenDispositionNewWindow;
+        break;
+      case CEF_WOD_OFF_THE_RECORD:
+        sxDisposition = SXWindowOpenDispositionOffTheRecord;
+        break;
+      default:
+        sxDisposition = SXWindowOpenDispositionNewTabDefault;
+        break;
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
-      SXBrowserTab* newTab = [strongTab handlePopupRequestURL:url
-                                                  userGesture:user_gesture ? YES : NO];
-      if (!newTab) {
+      BOOL handled = [strongTab handleOpenRequestURL:url
+                                         disposition:sxDisposition
+                                         userGesture:user_gesture ? YES : NO];
+      if (!handled) {
         [strongTab loadURL:url];
       }
     });

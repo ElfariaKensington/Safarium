@@ -25,6 +25,8 @@ typedef void (^SXTopEdgeStripReadbackProvider)(
 
 @property (nonatomic, assign) BOOL automaticSamplingEnabled;
 @property (nonatomic, assign) CGFloat stripHeightPoints;
+@property (nonatomic, copy, nullable) CGFloat (^topOffsetPointsProvider)(void);
+@property (nonatomic, copy, nullable) CGFloat (^backingScaleProvider)(void);
 @property (nonatomic, readonly, strong, nullable) NSColor *lastSampledColor;
 @property (nonatomic, readonly) double lastRelativeLuminance;
 /// Fraction [0.0, 1.0] of horizontal columns in the last sampled top strip matching the strip's trimmed mean.

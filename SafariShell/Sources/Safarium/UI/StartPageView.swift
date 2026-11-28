@@ -246,6 +246,15 @@ final class StartPageView: NSView {
         rebuildFavorites()
     }
 
+    /// Returns true when the Start Page still has room to scroll in `direction` (`< 0` = down, `> 0` = up).
+    func canScrollVertically(direction: Int) -> Bool {
+        guard let doc = scrollView.documentView else { return false }
+        let clip = scrollView.contentView
+        let curY = clip.bounds.origin.y
+        let maxY = max(0.0, doc.bounds.height - clip.bounds.height)
+        return direction > 0 ? (curY > 0.5) : (curY < maxY - 0.5)
+    }
+
     /// Scrolls the Start Page vertically by a precise trackpad-style pixel delta (`deltaY < 0` scrolls down).
     func scrollByDeltaY(_ deltaY: CGFloat) {
         guard let doc = scrollView.documentView else { return }
@@ -1498,6 +1507,30 @@ final class FavoritesReorderGridView: NSView {
         hoverPrewarmWorkItem = nil
     }
 
+    private var middlePressedIndex: Int?
+
+    override func otherMouseDown(with event: NSEvent) {
+        guard event.buttonNumber == 2 else {
+            super.otherMouseDown(with: event)
+            return
+        }
+        let pt = convert(event.locationInWindow, from: nil)
+        middlePressedIndex = tileIndex(at: pt)
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        guard event.buttonNumber == 2 else {
+            super.otherMouseUp(with: event)
+            return
+        }
+        let idx = middlePressedIndex
+        middlePressedIndex = nil
+        let pt = convert(event.locationInWindow, from: nil)
+        if let idx, tileIndex(at: pt) == idx, idx < entries.count, let url = URL(string: entries[idx].url) {
+            onOpenInNewTab?(url)
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
         hoverPrewarmWorkItem?.cancel()
         hoverPrewarmWorkItem = nil
@@ -1570,7 +1603,11 @@ final class FavoritesReorderGridView: NSView {
 
         if !isDragging {
             if idx < entries.count, tile.frame.contains(pt), let url = URL(string: entries[idx].url) {
-                onSelectURL?(url)
+                if event.modifierFlags.contains(.command) {
+                    onOpenInNewTab?(url)
+                } else {
+                    onSelectURL?(url)
+                }
             }
             return
         }

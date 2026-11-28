@@ -506,12 +506,16 @@ static constexpr NSTimeInterval kPostLoadSettleDelaySec = 0.35;
   _coalescedPending = NO;
   uint64_t capturedGen = _generation;
   CGFloat stripHeight = MAX(2.0, MIN(4.0, rawStripHeight));
-  // Estimate backing scale (~2x on Retina) for cropping top 2-4pt rows cleanly.
-  CGFloat backingScale = [NSScreen mainScreen] ? [NSScreen mainScreen].backingScaleFactor : 2.0;
+  // Use the host window's actual backing scale when available so mixed-DPI setups crop the exact toolbar seam.
+  CGFloat backingScale = self.backingScaleProvider
+                             ? self.backingScaleProvider()
+                             : ([NSScreen mainScreen] ? [NSScreen mainScreen].backingScaleFactor : 2.0);
   if (backingScale < 1.0) backingScale = 2.0;
   size_t topStripPx = (size_t)std::max<double>(2.0, std::round(stripHeight * backingScale));
-  // Web content is positioned natively below the toolbar, so y = 0 in the surface already meets the toolbar bottom.
-  size_t topOffsetPx = 0;
+  // Web content spans full-bleed behind the toolbar (y = 0 at window top), so sample the 2-4pt strip immediately
+  // below the toolbar stack (where docked fixed headers and visible top content meet the glass).
+  CGFloat topOffsetPts = self.topOffsetPointsProvider ? MAX(0.0, self.topOffsetPointsProvider()) : 0.0;
+  size_t topOffsetPx = (size_t)std::max<double>(0.0, std::round(topOffsetPts * backingScale));
 
   __weak SXTopEdgeColorSampler *weakSelf = self;
   self.readbackProvider(^(NSData * _Nullable imageData) {

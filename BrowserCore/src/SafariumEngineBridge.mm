@@ -188,22 +188,31 @@ static void SXApplyPendingSiteStorageClear(NSString *profileDir) {
 
 #pragma mark - SXBrowserHostView
 
-static NSView * _Nullable SXFindFocusableWebView(NSView *root) {
+static NSView * _Nullable SXFindFocusableWebView(NSView *root, NSView * _Nullable excludeSubtree = nil) {
   if (!root) {
     return nil;
   }
-  // Walk depth-first looking for Chromium's RenderWidgetHostViewCocoa (or deepest subview accepting first responder).
+  // Walk depth-first looking for the visible RenderWidgetHostViewCocoa of the active page, skipping hidden outgoing
+  // views and any docked DevTools container so keyboard focus never lands on an offscreen RWHV or Web Inspector.
   for (NSView *sub in root.subviews) {
+    if (sub == excludeSubtree || sub.isHidden || sub.alphaValue < 0.01) {
+      continue;
+    }
     NSString *clsName = NSStringFromClass([sub class]);
     if ([clsName containsString:@"RenderWidgetHostView"]) {
       return sub;
     }
-    NSView *nested = SXFindFocusableWebView(sub);
+    NSView *nested = SXFindFocusableWebView(sub, excludeSubtree);
     if (nested) {
       return nested;
     }
   }
-  return root.subviews.firstObject;
+  for (NSView *sub in root.subviews) {
+    if (sub != excludeSubtree && !sub.isHidden && sub.alphaValue >= 0.01) {
+      return sub;
+    }
+  }
+  return nil;
 }
 
 static void SXSyncSubviewHierarchy(NSView *view, NSRect bounds, BOOL hidden) {
@@ -667,6 +676,10 @@ static void SXSyncSubviewHierarchy(NSView *view, NSRect bounds, BOOL hidden) {
 
 - (void)setFrameSize:(NSSize)newSize {
   [super setFrameSize:newSize];
+  if (self.isHidden) {
+    // Keep the AppKit frame updated, but defer Blink/GPU surface resize and sampler timer work until unhidden.
+    return;
+  }
   [self syncLayoutAndVisibility];
   [self.ownerTab handleHostViewFrameChanged];
 }
@@ -677,6 +690,9 @@ static void SXSyncSubviewHierarchy(NSView *view, NSRect bounds, BOOL hidden) {
   [self syncLayoutAndVisibility];
   if (changed) {
     [self.ownerTab handleHostViewVisibilityChanged:hidden];
+    if (!hidden) {
+      [self.ownerTab handleHostViewFrameChanged];
+    }
   }
 }
 
@@ -898,6 +914,47 @@ static NSImage * _Nullable SXDecodeDownscaledPreviewImage(NSData *jpegData,
   if (!rep) {
     return nil;
   }
+  NSImage *image = [[NSImage alloc] initWithSize:pointSize];
+  [image addRepresentation:rep];
+  return image;
+}
+
+static NSImage * _Nullable SXCreateDownscaledPreviewFromCGImage(CGImageRef full,
+                                                                NSSize logicalSize) {
+  if (!full) return nil;
+  size_t srcW = CGImageGetWidth(full), srcH = CGImageGetHeight(full);
+  if (srcW == 0 || srcH == 0) return nil;
+  size_t maxDim = 1280;
+  double scale = 1.0;
+  size_t larger = srcW > srcH ? srcW : srcH;
+  if (larger > maxDim) {
+    scale = (double)maxDim / (double)larger;
+  }
+  size_t dstW = (size_t)fmax(1.0, round((double)srcW * scale));
+  size_t dstH = (size_t)fmax(1.0, round((double)srcH * scale));
+  CGColorSpaceRef cs = CGImageGetColorSpace(full);
+  CGColorSpaceRef space = cs ? (CGColorSpaceRef)CFRetain(cs) : CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  CGContextRef ctx = CGBitmapContextCreate(NULL, dstW, dstH, 8, dstW * 4, space,
+                                           kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+  if (!ctx && space) {
+    CGColorSpaceRelease(space);
+    space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    ctx = CGBitmapContextCreate(NULL, dstW, dstH, 8, dstW * 4, space,
+                                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+  }
+  if (space) CGColorSpaceRelease(space);
+  if (!ctx) return nil;
+  CGContextSetInterpolationQuality(ctx, kCGInterpolationMedium);
+  CGContextDrawImage(ctx, CGRectMake(0, 0, dstW, dstH), full);
+  CGImageRef thumb = CGBitmapContextCreateImage(ctx);
+  CGContextRelease(ctx);
+  if (!thumb) return nil;
+  NSSize pointSize = (logicalSize.width >= 2.0 && logicalSize.height >= 2.0)
+                         ? logicalSize
+                         : NSMakeSize(dstW, dstH);
+  NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage:thumb];
+  CGImageRelease(thumb);
+  if (!rep) return nil;
   NSImage *image = [[NSImage alloc] initWithSize:pointSize];
   [image addRepresentation:rep];
   return image;
@@ -1490,6 +1547,19 @@ class SXAuthPopupClient : public CefClient,
         }];
     _colorSampler.automaticSamplingEnabled = _automaticTopEdgeSamplingEnabled;
     _colorSampler.stripHeightPoints = _topEdgeSampleHeightPoints;
+    _colorSampler.backingScaleProvider = ^CGFloat {
+      SXBrowserTab *s = weakSelf;
+      if (s && s.hostView.window && s.hostView.window.backingScaleFactor >= 1.0) {
+        return s.hostView.window.backingScaleFactor;
+      }
+      return [NSScreen mainScreen] ? [NSScreen mainScreen].backingScaleFactor : 2.0;
+    };
+    _colorSampler.topOffsetPointsProvider = ^CGFloat {
+      SXBrowserTab *s = weakSelf;
+      if (!s) return 0.0;
+      double z = s.pageZoomFactor > 0.1 ? s.pageZoomFactor : 1.0;
+      return MAX(0.0, round(s->_topContentInset * z));
+    };
     _colorSampler.onColorSampled = ^(NSColor *color, double luminance) {
       SXBrowserTab *s = weakSelf;
       if (!s || s->_isClosed) return;
@@ -1608,7 +1678,7 @@ class SXAuthPopupClient : public CefClient,
     CFTimeInterval hiddenAt = CACurrentMediaTime();
     _tabHiddenAt = hiddenAt;
     __weak SXBrowserTab *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
       SXBrowserTab *strongSelf = weakSelf;
       if (strongSelf && !strongSelf->_tabActiveState && strongSelf->_tabHiddenAt == hiddenAt) {
         strongSelf->_standbyImage = nil;  // long in the background: free the memory
@@ -1642,7 +1712,7 @@ class SXAuthPopupClient : public CefClient,
     return;
   }
   NSWindow *window = self.hostView.window;
-  NSView *rwhv = SXFindFocusableWebView(self.hostView);
+  NSView *rwhv = SXFindFocusableWebView(self.hostView, self.hostView.devToolsContainer);
   if (window && rwhv) {
     [window makeFirstResponder:rwhv];
   }
@@ -1818,6 +1888,7 @@ class SXAuthPopupClient : public CefClient,
       browser->GetHost()->SetFocus(false);
     }
   }
+  [self pushTopContentInsetToMainFrame];
   if (self.pendingURL && _browser && _browser->GetMainFrame()) {
     NSString *current = [NSString
         stringWithUTF8String:_browser->GetMainFrame()->GetURL().ToString().c_str()];
@@ -2002,15 +2073,29 @@ class SXAuthPopupClient : public CefClient,
   _browser->GetMainFrame()->ExecuteJavaScript(CefString(js.UTF8String), CefString(), 0);
 }
 
+- (void)pushTopContentInsetToMainFrame {
+  if (_browser && _browser->GetMainFrame() && _browser->GetMainFrame()->IsValid()) {
+    CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("sx.top_inset");
+    msg->GetArgumentList()->SetInt(0, (int)lround(_topContentInset));
+    _browser->GetMainFrame()->SendProcessMessage(PID_RENDERER, msg);
+  }
+}
+
+- (void)probeScrollStateAtCSSPoint:(NSPoint)point {
+  if (_isClosed || !_browser || !_browser->GetMainFrame() || !_browser->GetMainFrame()->IsValid()) {
+    return;
+  }
+  CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("sx.probe_point");
+  msg->GetArgumentList()->SetInt(0, (int)lround(point.x));
+  msg->GetArgumentList()->SetInt(1, (int)lround(point.y));
+  _browser->GetMainFrame()->SendProcessMessage(PID_RENDERER, msg);
+}
+
 - (void)setTopContentInset:(CGFloat)topContentInset {
   CGFloat v = MAX(0.0, round(topContentInset));
   if (fabs(v - _topContentInset) < 0.5) return;
   _topContentInset = v;
-  if (_browser && _browser->GetMainFrame()) {
-    CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("sx.top_inset");
-    msg->GetArgumentList()->SetInt(0, (int)v);
-    _browser->GetMainFrame()->SendProcessMessage(PID_RENDERER, msg);
-  }
+  [self pushTopContentInsetToMainFrame];
 }
 
 - (void)goBack {
@@ -3217,7 +3302,6 @@ static NSString *SXSanitizedSaveFileBaseName(NSString * _Nullable title, NSURL *
       id standbySurface = nil;
       NSData *data = nil;
       @autoreleasepool {
-        decoded = SXDecodeDownscaledPreviewImage(pngData, logicalSize);
         CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)pngData, NULL);
         if (src) {
           NSDictionary *opts = @{ (__bridge NSString *)kCGImageSourceShouldCacheImmediately : @YES };
@@ -3225,13 +3309,15 @@ static NSString *SXSanitizedSaveFileBaseName(NSString * _Nullable title, NSURL *
           CFRelease(src);
           if (full) {
             fullImage = CFBridgingRelease(full);
-            standbySurface = SXCopyImageToIOSurface(full);
+            CGImageRef fullRef = (__bridge CGImageRef)fullImage;
+            standbySurface = SXCopyImageToIOSurface(fullRef);
+            decoded = SXCreateDownscaledPreviewFromCGImage(fullRef, logicalSize);
             NSMutableData *jpeg = [NSMutableData data];
             CGImageDestinationRef dst = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)jpeg,
                                                                          CFSTR("public.jpeg"), 1, NULL);
             if (dst) {
               NSDictionary *jopts = @{ (__bridge NSString *)kCGImageDestinationLossyCompressionQuality : @0.6 };
-              CGImageDestinationAddImage(dst, (__bridge CGImageRef)fullImage, (__bridge CFDictionaryRef)jopts);
+              CGImageDestinationAddImage(dst, fullRef, (__bridge CFDictionaryRef)jopts);
               if (CGImageDestinationFinalize(dst)) data = jpeg;
               CFRelease(dst);
             }
@@ -3467,12 +3553,13 @@ static NSString *SXSanitizedSaveFileBaseName(NSString * _Nullable title, NSURL *
   BOOL focusOnPageOrNowhere = (fr == nil || fr == window ||
                                ([fr isKindOfClass:[NSView class]] && [(NSView *)fr isDescendantOf:self.hostView]));
   if (!focusOnPageOrNowhere) return;
-  NSView *rwhv = SXFindFocusableWebView(self.hostView);
+  NSView *rwhv = SXFindFocusableWebView(self.hostView, self.hostView.devToolsContainer);
   if (rwhv && fr != rwhv) [window makeFirstResponder:rwhv];
   if (_browser && _browser->GetHost()) _browser->GetHost()->SetFocus(true);
 }
 
 - (void)handleMainFrameLoadStart {
+  [self pushTopContentInsetToMainFrame];
   [self restoreWebContentFocusAfterCommit];
   // The new view can be attached a turn later; check again once it is in place.
   __weak SXBrowserTab *weakFocusSelf = self;
@@ -4424,6 +4511,25 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
                          userGesture:userGesture];
   }
   return nil;
+}
+
+- (BOOL)handleOpenRequestURL:(NSURL *)url
+                 disposition:(SXWindowOpenDisposition)disposition
+                 userGesture:(BOOL)userGesture {
+  if (_isClosed || !url) return NO;
+  if ([self.delegate respondsToSelector:@selector(browserTab:requestOpenURL:disposition:userGesture:)]) {
+    return [self.delegate browserTab:self
+                      requestOpenURL:url
+                         disposition:disposition
+                         userGesture:userGesture];
+  }
+  if ([self.delegate respondsToSelector:@selector(browserTab:requestNewTabWithURL:userGesture:)]) {
+    (void)[self.delegate browserTab:self
+               requestNewTabWithURL:url
+                        userGesture:userGesture];
+    return YES;
+  }
+  return NO;
 }
 
 - (BOOL)isPrivateBrowsing {

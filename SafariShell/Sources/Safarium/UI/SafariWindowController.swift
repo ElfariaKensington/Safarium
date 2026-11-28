@@ -1569,6 +1569,12 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             guard let self else { return }
             self.openURL(url, inTabID: targetTabID, newTab: openInNewTab)
         }
+        separateTabStripView.onTabAnimationBegan = { [weak self] in
+            self?.tabAddressBar.beginExternalAnimation()
+        }
+        separateTabStripView.onTabAnimationEnded = { [weak self] in
+            self?.tabAddressBar.endExternalAnimation()
+        }
         verticalTabRailView.onSelectTab = { [weak self] id in
             guard let self, let idx = self.tabs.firstIndex(where: { $0.tabID == id }) else { return }
             self.tabHoverPreviewController.dismiss(animated: false)
@@ -1954,6 +1960,9 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
                !isEditingAppKitText {
                 if event.keyCode == 49 && (primaryMods.isEmpty || primaryMods == .shift) { // Space / Shift+Space
                     let dir = primaryMods == .shift ? 1 : -1
+                    if event.isARepeat && !self.startPageView.canScrollVertically(direction: dir) {
+                        return nil
+                    }
                     self.elasticScrollEngine.triggerSpaceScroll(direction: dir, isRepeat: event.isARepeat, isStartPage: true)
                     return nil
                 }
@@ -1989,6 +1998,22 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
                         return nil
                     }
                 }
+            }
+
+            // Webpage Space / Shift+Space fallback when the window (not Chromium's RenderWidgetHostView or an AppKit text field)
+            // currently holds focus (e.g. right after switching tabs or pressing Escape out of the address bar).
+            if let tab = self.activeTab, !tab.isNativeInternalPage,
+               self.tabLoadErrors[tab.tabID] == nil,
+               !isWebViewFocused,
+               !isEditingAppKitText,
+               !self.tabOverviewView.isPresented,
+               !self.addressBarPopover.isShown,
+               !self.swipeNavigationController.isTrackingOrAnimating,
+               event.keyCode == 49 && (primaryMods.isEmpty || primaryMods == .shift) {
+                let dir = primaryMods == .shift ? 1 : -1
+                self.syncElasticMetrics(for: tab, isFreshTelemetry: false)
+                self.elasticScrollEngine.triggerSpaceScroll(direction: dir, isRepeat: event.isARepeat, isStartPage: false)
+                return nil
             }
             return event
         }
@@ -2035,12 +2060,26 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
                 }
             }
 
-            guard !tab.isStartPage, self.tabLoadErrors[tab.tabID] == nil else {
+            guard !tab.isNativeInternalPage, self.tabLoadErrors[tab.tabID] == nil else {
                 return event
             }
             self.syncElasticMetrics(for: tab, isFreshTelemetry: false)
             let phase = event.phase
             let momPhase = event.momentumPhase
+            if phase.contains(.mayBegin) || phase.contains(.began) {
+                let winPt: NSPoint
+                if let cgLoc = event.cgEvent?.location, let win = self.window {
+                    let screenH = NSScreen.screens.first?.frame.height ?? win.frame.maxY
+                    winPt = win.convertPoint(fromScreen: NSPoint(x: cgLoc.x, y: screenH - cgLoc.y))
+                } else {
+                    winPt = event.locationInWindow
+                }
+                let ptInTab = tab.contentView.convert(winPt, from: nil)
+                let h = tab.contentView.bounds.height
+                let topDownY = tab.contentView.isFlipped ? ptInTab.y : (h - ptInTab.y)
+                let zoom = max(0.25, CGFloat(tab.pageZoomFactor))
+                tab.probeScrollState(atCSSPoint: NSPoint(x: ptInTab.x / zoom, y: topDownY / zoom))
+            }
             let trackpadActive =
                 phase.contains(.began) || phase.contains(.changed) || phase.contains(.mayBegin) ||
                 momPhase.contains(.began) || momPhase.contains(.changed)
@@ -2054,10 +2093,10 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
                     tab.setScrollInteractionActive(true)
                 }
             } else if momentumEnded || fingersEnded {
-                // Bridge the 1-frame gap between finger lift (`phase == .ended`) and momentum start
-                // (`momentumPhase == .began`) so top-edge color readbacks NEVER fire mid-fling or mid-bounce.
+                // Keep scroll-interaction suppression active across both the finger-to-momentum gap and
+                // Chromium's ~400ms compositor rubber-band bounce so top-edge GPU readbacks never fire mid-recoil.
                 self.scrollIdleWorkItem?.cancel()
-                let settleDelay: TimeInterval = momentumEnded ? 0.06 : 0.14
+                let settleDelay: TimeInterval = 0.42
                 let work = DispatchWorkItem { [weak self] in
                     guard let self else { return }
                     self.scrollIdleWorkItem = nil
@@ -2112,8 +2151,9 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             // SAFARIUM_SCROLL_DEBUG: also accept Space while the app is in the background (CDP-driven measurements).
             guard let self,
                   let window = self.window, window.isKeyWindow || (ScrollDebugLog.isEnabled && NSApp.keyWindow == nil),
-                  let tab = self.activeTab, !tab.isStartPage,
+                  let tab = self.activeTab, !tab.isNativeInternalPage,
                   self.tabLoadErrors[tab.tabID] == nil,
+                  !self.swipeNavigationController.isTrackingOrAnimating,
                   !self.tabOverviewView.isPresented,
                   !self.addressBarPopover.isShown else { return }
             let dir = (note.userInfo?["direction"] as? NSNumber)?.intValue ?? -1
@@ -2187,13 +2227,9 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             return
         }
         guard let window else { return }
-        if phase == .began { syntheticScrollRemainder = 0.0 }
-        let total = syntheticScrollRemainder + deltaY
-        let points = total.rounded()
-        syntheticScrollRemainder = total - points
+        if phase == .began || phase == .ended { syntheticScrollRemainder = 0.0 }
         // Nothing to move this frame: keep the stream quiet (no zero-delta "changed" events).
-        if phase == .changed && points == 0.0 { return }
-        if phase == .ended { syntheticScrollRemainder = 0.0 }
+        if phase == .changed && abs(deltaY) < 0.001 { return }
 
         let targetView = findRenderWidgetHostView(in: tab.contentView) ?? tab.contentView
         // Chromium ignores a momentum stream that no gesture opened, so open it like a real trackpad flick:
@@ -2208,13 +2244,13 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         case .changed: momentum = 2    // kCGMomentumScrollPhaseContinue
         case .ended: momentum = 3      // kCGMomentumScrollPhaseEnd
         }
-        sendSyntheticScrollEvent(points: points, scrollPhase: 0, momentumPhase: momentum, to: targetView, in: window)
+        sendSyntheticScrollEvent(points: deltaY, scrollPhase: 0, momentumPhase: momentum, to: targetView, in: window)
     }
 
     private func sendSyntheticScrollEvent(points: CGFloat, scrollPhase: Int64, momentumPhase: Int64,
                                           to targetView: NSView, in window: NSWindow) {
         guard let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
-                               wheel1: Int32(points), wheel2: 0, wheel3: 0) else { return }
+                               wheel1: Int32(points.rounded()), wheel2: 0, wheel3: 0) else { return }
         // Aim at the pointer when it is over the page (a hovered inner scroller scrolls, like a trackpad), else at
         // the middle of the page.
         let mouseScreen = NSEvent.mouseLocation
@@ -2226,8 +2262,9 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         let primaryH = NSScreen.screens.first?.frame.height ?? 900.0
         cg.location = CGPoint(x: screenPoint.x, y: primaryH - screenPoint.y)
         cg.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-        cg.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(points))
+        // Set line/fixed fields BEFORE point delta so CoreGraphics preserves exact floating-point sub-pixel scrollingDeltaY.
         cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Double(points) / 10.0)
+        cg.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: Double(points))
         cg.setIntegerValueField(.scrollWheelEventScrollPhase, value: scrollPhase)
         cg.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentumPhase)
         cg.timestamp = CGEventTimestamp(ProcessInfo.processInfo.systemUptime * 1e9)
@@ -2298,6 +2335,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             tabOverviewView.closeAnimated()
         }
         swipeNavigationController.cancelImmediately()
+        elasticScrollEngine.resetImmediately()
         let targetIsNative = (url.scheme?.lowercased() == "safarium") || InspectPageURL.isInspectURL(url)
         if let tab = activeTab {
             let outgoingPayload = (tab.isNativeInternalPage && !targetIsNative)
@@ -2851,8 +2889,11 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         }
         let now = CACurrentMediaTime()
         let onScreenTabID = activeTab?.tabID
-        if let outgoingTab = activeTab, outgoingTab.tabID != tabs[index].tabID {
-            tabLastBackgroundedAt[outgoingTab.tabID] = now
+        if let outgoingTab = activeTab {
+            outgoingTab.endPageOvershoot()
+            if outgoingTab.tabID != tabs[index].tabID {
+                tabLastBackgroundedAt[outgoingTab.tabID] = now
+            }
         }
         elasticScrollEngine.resetImmediately()
         swipeNavigationController.cancelImmediately()
@@ -5016,14 +5057,14 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         let layout = BrowserSettings.shared.tabLayout
         tabAddressBar.update(items: items, animated: animatedTabBar)
         sidebarView.update(tabs: items)
+        updateSeparateTabStripVisibility(animated: false)
+        updateVerticalTabRailVisibility(animated: false)
         if layout == "separate" {
             separateTabStripView.update(items: items, animated: animatedTabBar ?? true)
         }
         if layout == "vertical" {
             verticalTabRailView.update(items: items)
         }
-        updateSeparateTabStripVisibility(animated: false)
-        updateVerticalTabRailVisibility(animated: false)
         if let active = activeTab {
             tabLastActiveAt[active.tabID] = Date()
             let cleanTitle = active.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5594,6 +5635,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             toolbarFrostHeightConstraint?.constant = ToolbarGlassView.activeTotalHeight + stripH
             for tab in tabs { syncPageTopInset(for: tab) }
             tabOverviewTopConstraint?.constant = SafariMetrics.toolbarHeight + stripH
+            tabOverviewView.toolbarTopInsetPoints = SafariMetrics.toolbarHeight + stripH
             startPageView.setExtraTopInset(stripH, animated: animated)
             if animated {
                 NSAnimationContext.runAnimationGroup { ctx in
@@ -5716,6 +5758,9 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         // CADisplayLink retains its target: invalidate so a close during the sidebar slide cannot leak the controller.
         sidebarDisplayLink?.invalidate()
         sidebarDisplayLink = nil
+        elasticScrollEngine.resetImmediately()
+        swipeNavigationController.cancelImmediately()
+        tabOverviewView.interruptSpringForInteractivePinch()
         autoCloseTimer?.invalidate()
         autoCloseTimer = nil
         persistCurrentSession()
@@ -5834,9 +5879,9 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
                 swipeNavigationController.finishTransitionRevealIfNeeded(fromBFCache: true)
                 navigationTransitionCoordinator.completeTransitionIfNeeded(tabID: tab.tabID, fromBFCache: true)
             }
-            elasticScrollEngine.setReloadableWebPage(!tab.isStartPage)
+            elasticScrollEngine.setReloadableWebPage(!tab.isNativeInternalPage)
             syncElasticMetrics(for: tab)
-            if !tab.isStartPage && !engine.isRealChromium {
+            if !tab.isNativeInternalPage && !engine.isRealChromium {
                 scheduleMockTabColorSample(delay: 0.15)
             }
         }
@@ -5985,7 +6030,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             viewportHeight: vh,
             canInnerScrollUp: tab.canInnerScrollUp,
             canInnerScrollDown: tab.canInnerScrollDown,
-            isReloadableWebPage: !tab.isStartPage,
+            isReloadableWebPage: !tab.isNativeInternalPage,
             isPageLoading: tab.isLoading,
             resyncEstimate: isFreshTelemetry
         )
@@ -6101,12 +6146,27 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
     }
 
     func tabEngine(_ tab: BrowserTabEngine, didRequestNewTabWithURL url: URL) {
+        tabEngine(tab, didRequestOpenURL: url, disposition: .newTabDefault)
+    }
+
+    func tabEngine(_ tab: BrowserTabEngine, didRequestOpenURL url: URL, disposition: TabOpenDisposition) {
         extensionPopoverController.close()
-        let activate = BrowserSettings.shared.activateNewTabsOnOpen
-        if BrowserSettings.shared.openPagesInTabsMode == 2 {
+        let activatePref = BrowserSettings.shared.activateNewTabsOnOpen
+        switch disposition {
+        case .newBackgroundTab:
+            createNewTab(url: url, activate: activatePref)
+        case .newForegroundTab:
+            createNewTab(url: url, activate: !activatePref)
+        case .newWindow:
             (NSApp.delegate as? AppDelegate)?.openNewWindow(url: url, isPrivate: isPrivate)
-        } else {
-            createNewTab(url: url, activate: activate)
+        case .offTheRecord:
+            (NSApp.delegate as? AppDelegate)?.openNewWindow(url: url, isPrivate: true)
+        case .newTabDefault:
+            if BrowserSettings.shared.openPagesInTabsMode == 2 {
+                (NSApp.delegate as? AppDelegate)?.openNewWindow(url: url, isPrivate: isPrivate)
+            } else {
+                createNewTab(url: url, activate: true)
+            }
         }
     }
 
@@ -6149,6 +6209,8 @@ private final class SeparateTabStripView: NSView {
     var onBeginTabTearOff: ((String, NSRect, NSPoint, NSPoint) -> Void)?
     var onTabHoverChanged: ((String, NSView, Bool) -> Void)?
     var onDropURL: ((URL, String?, Bool) -> Void)?
+    var onTabAnimationBegan: (() -> Void)?
+    var onTabAnimationEnded: (() -> Void)?
 
     var isTabDragActive: Bool { draggingTabID != nil || SafariTabDragCoordinator.shared.isDragging }
 
@@ -6554,8 +6616,32 @@ private final class SeparateTabStripView: NSView {
 
         let visible = displayedItems
         let validIDs = Set(visible.map(\.id))
+        let shouldAnimateClose = animated && (window?.isVisible == true) && !(window?.inLiveResize ?? true) && lastSlotCount > 0
         for (id, view) in existingByID where !validIDs.contains(id) {
-            view.removeFromSuperview()
+            if shouldAnimateClose && id != draggingTabID && view.frame.width > 1 {
+                let collapseFrame = NSRect(x: view.frame.minX, y: view.frame.minY, width: 0, height: view.frame.height)
+                view.wantsLayer = true
+                if let vLayer = view.layer {
+                    let fade = CABasicAnimation(keyPath: "opacity")
+                    fade.fromValue = Float(view.alphaValue)
+                    fade.toValue = 0.0
+                    fade.duration = 0.13
+                    fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    fade.fillMode = .forwards
+                    fade.isRemovedOnCompletion = false
+                    vLayer.add(fade, forKey: "sepSlotCloseFade")
+                }
+                NSAnimationContext.runAnimationGroup({ ctx in
+                    ctx.duration = 0.21
+                    ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.92, 0.26, 1.0)
+                    view.animator().frame = collapseFrame
+                    view.animator().alphaValue = 0.0
+                }, completionHandler: {
+                    view.removeFromSuperview()
+                })
+            } else {
+                view.removeFromSuperview()
+            }
         }
 
         var nextSlots: [SeparateTabSlotView] = []
@@ -6627,16 +6713,23 @@ private final class SeparateTabStripView: NSView {
             activeSlotPos = nil
         }
 
-        let structureChanged = (lastSlotCount != 0 && lastSlotCount != totalSlots) || draggingTabID != nil || phIndex != nil
+        let prevSlotCount = lastSlotCount
+        let structureChanged = (prevSlotCount != 0 && prevSlotCount != totalSlots) || draggingTabID != nil || phIndex != nil
+        let isClosingTab = prevSlotCount > 0 && totalSlots < prevSlotCount
+        let stripDuration: TimeInterval = isClosingTab ? 0.21 : 0.24
+        let stripCurve = isClosingTab
+            ? CAMediaTimingFunction(controlPoints: 0.22, 0.92, 0.26, 1.0)
+            : CAMediaTimingFunction(controlPoints: 0.20, 0.90, 0.25, 1.0)
         lastSlotCount = totalSlots
 
+        let canAnimate = animated && !isHidden && (window?.isVisible == true) && !(window?.inLiveResize ?? true)
         var animatedFrames: [(NSView, NSRect)] = []
         if let aPos = activeSlotPos {
             activePillSurface.isHidden = false
             let targetPillFrame = NSRect(x: CGFloat(aPos) * slotW, y: 0.0, width: slotW, height: Self.trackHeight)
             let activeID = visible[activeVisualIdx!].id
             if draggingTabID != activeID {
-                if animated && structureChanged && activePillSurface.frame.width > 1 {
+                if canAnimate && structureChanged && activePillSurface.frame.width > 1 {
                     animatedFrames.append((activePillSurface, targetPillFrame))
                 } else {
                     activePillSurface.frame = targetPillFrame
@@ -6654,26 +6747,40 @@ private final class SeparateTabStripView: NSView {
             let visualPos = (phIndex != nil && idx >= phIndex!) ? (idx + 1) : idx
             let targetFrame = NSRect(x: CGFloat(visualPos) * slotW, y: 0.0, width: slotW, height: Self.trackHeight)
             if draggingTabID != slot.tabID {
-                if animated && structureChanged && slot.frame.width > 1 {
+                if canAnimate && structureChanged {
+                    if slot.frame.width <= 1 {
+                        slot.frame = NSRect(x: targetFrame.minX, y: 0.0, width: 0.0, height: Self.trackHeight)
+                        slot.alphaValue = 0.0
+                    }
                     animatedFrames.append((slot, targetFrame))
                 } else {
                     slot.frame = targetFrame
+                    slot.alphaValue = 1.0
                 }
             }
         }
 
         if !animatedFrames.isEmpty {
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.20
-                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1.0, 0.36, 1.0)
+            onTabAnimationBegan?()
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = stripDuration
+                ctx.timingFunction = stripCurve
                 for (v, f) in animatedFrames {
                     v.animator().frame = f
+                    v.animator().alphaValue = 1.0
                 }
-            }
+            }, completionHandler: { [weak self] in
+                self?.onTabAnimationEnded?()
+            })
         }
 
         CATransaction.begin()
-        CATransaction.setDisableActions(true)
+        let animateDividers = canAnimate && structureChanged && !animatedFrames.isEmpty
+        CATransaction.setDisableActions(!animateDividers)
+        if animateDividers {
+            CATransaction.setAnimationDuration(stripDuration)
+            CATransaction.setAnimationTimingFunction(stripCurve)
+        }
         let divH: CGFloat = 14.0
         let divY = floor((Self.trackHeight - divH) * 0.5)
         for (i, div) in dividerLayers.enumerated() {

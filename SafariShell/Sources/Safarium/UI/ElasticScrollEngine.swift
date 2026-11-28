@@ -1,277 +1,333 @@
 import AppKit
+import Darwin
+import ObjectiveC.runtime
 import QuartzCore
 
-/// Brand-new, from-scratch 120Hz Safari Elastic Scrolling, Momentum Fling Overshoot,
-/// and Pull-to-Refresh physics engine.
-///
-/// Every physics constant, geometry metric, and state transition is calibrated directly
-/// from 120fps reference recordings of macOS 27.3 Safari (`apple.com` fling overshoot and
-/// `google.com` direct-touch rubber-band pull-to-refresh):
-///
-/// 1. **Momentum Fling Overshoot** (calibrated to `apple.com` 120fps reference, RMSE = 0.55 pt):
-///    - Critically damped harmonic oscillator: `y(t) = (y0 + (v0 + ω*y0)*t) * exp(-ω*t)`
-///    - Natural angular frequency `ω = 12.45 rad/s` (`t_peak = 80.3 ms`, zero oscillation)
-///    - Never displays the pull-to-refresh spinner or triggers reload during momentum overshoot
-///
-/// 2. **Direct-Touch Elastic Rubber-Band** (calibrated to `google.com` 120fps reference):
-///    - Invertible Apple asymptotic curve: `f(d, D) = sign(d) * (c * |d| * D) / (D + c * |d|)`, `c = 0.55`
-///    - Symmetrical top and bottom overscroll, including non-scrollable pages
-///    - Zero-jump mid-air bounce catching and seamless direction reversal back into page scroll
-///    - Release recoil: measured exponential snap-back `k = 11.7 s^-1` (or gentle critically-damped
-///      crest if lifted with outward flick velocity)
-///
-/// 3. **Pull-to-Refresh State Machine** (calibrated to `google.com` 120fps reference):
-///    - Direct-touch top pull ONLY on reloadable web pages
-///    - Spinner reveals at `26 pt`, ramps full opacity by `52 pt`, fills 24 spokes up to `106 pt`
-///    - Triggers immediately on crossing `106 pt` with haptic tick, `1.0 → 1.28× → 1.0` 155ms pop,
-///      immediate reload callback, and 20fps continuous spin
-///    - On finger release while loading, smoothly snaps to `68 pt` hold offset
-///    - On load completion (after min spin duration), smoothly snaps `68 → 0 pt` while fading spinner
-///      out cleanly between `62 pt` and `46 pt`
-///
-/// 4. **Zero-Reflow 120Hz Presentation**:
-///    - Translates `targetView.layer?.transform` strictly on the GPU (`CATransform3DMakeTranslation`)
-///    - Never resizes `webContentHost` or forces Chromium IPC layout/reflow during overscroll
+/// macOS 120 Hz root elastic scrolling, Pull-to-Refresh (`NSRefreshController` model), and keyboard
+/// `Space` / `Shift+Space` paging controller modeled on Apple WebKit's `WebCore::ScrollingEffectsController`,
+/// `WebCore::ScrollAnimationRubberBand`, and `WebCore::KeyboardScrollingAnimator`, backed by AppKit's
+/// elasticity SPI. Inner overflow scrollers (`[data-sx-oby]` / `[data-sx-obx]`) report `canInnerScroll`
+/// and rubber-band independently on Chromium's 120 Hz compositor (`OverscrollEffectOnNonRootScrollers`).
 final class ElasticScrollEngine: NSObject {
 
-    // MARK: - Calibrated Reference Constants
+    // MARK: - AppKit Elasticity SPI (`NSScrollViewSPI.h`)
 
-    enum Constants {
-        /// Initial direct-touch rubber-band slope (`NSScrollView` / WebKit standard).
-        static let rubberBandSlope: CGFloat = 0.55
-        /// Asymptotic rubber-band ceiling as a fraction of viewport height.
-        static let maxStretchFraction: CGFloat = 0.42
-        /// Minimum effective dimension `D` used in the rubber-band curve.
-        static let minRubberBandDimension: CGFloat = 360.0
+    enum AppKitElasticity {
+        private typealias HyperbolicFn = @convention(c) (CGFloat, CGFloat, CGFloat) -> CGFloat
+        private typealias ElasticTimeFn = @convention(c) (CGFloat, CGFloat, Double) -> CGFloat
 
-        /// Critically damped spring natural frequency (rad/s) measured from `apple.com` 120fps fling.
-        static let flingOmega: Double = 12.45
-        /// Asymptotic velocity ceiling (pt/s) for momentum fling overshoot (`y_peak_max = 5900 / (e * 12.45) ≈ 174 pt`).
-        static let maxFlingVelocity: CGFloat = 5900.0
-        /// Progressive velocity compression scale (pt/s): normal/fast/hard flings (`3k–18k pt/s`) peak cleanly
-        /// at `38–152 pt` (driving the spinner visibly with zero accidental reload); only an extreme
-        /// max-effort trackpad slam (`>= 22,000 pt/s`) reaches `ptrFlingTriggerThreshold` (`162 pt`).
-        static let flingVelocityCompressionScale: CGFloat = 13500.0
-        /// Minimum incoming velocity (pt/s) required to launch a momentum fling overshoot.
-        static let minFlingVelocity: CGFloat = 110.0
+        private static let appKitHandle: UnsafeMutableRawPointer? = {
+            let path = "/System/Library/Frameworks/AppKit.framework/AppKit"
+            return dlopen(path, RTLD_LAZY | RTLD_NOLOAD) ?? dlopen(path, RTLD_LAZY)
+        }()
 
-        /// Exponential recoil rate (s^-1) measured from `google.com` 120fps release snap-backs.
-        static let snapBackDecayRate: Double = 11.7
-        /// Settle epsilon in points below which displacement snaps cleanly to target.
-        static let settleEpsilon: CGFloat = 0.22
+        private static let elasticForReboundFn: HyperbolicFn? = {
+            guard let h = appKitHandle,
+                  let sym = dlsym(h, "_NSHyperbolicElasticDeltaForReboundDelta") else { return nil }
+            return unsafeBitCast(sym, to: HyperbolicFn.self)
+        }()
 
-        /// Pull-to-refresh thresholds measured from `google.com` 120fps recording.
-        static let ptrRevealStart: CGFloat = 26.0
-        static let ptrFullOpacityOffset: CGFloat = 52.0
-        static let ptrTriggerThreshold: CGFloat = 106.0
-        /// Extreme threshold for momentum fling overshoot: drives spinner visibly on all normal/hard flings,
-        /// while requiring a sustained extreme slam (`>= 22,000 pt/s`, peak `>= 162 pt`) to trigger refresh.
-        static let ptrFlingTriggerThreshold: CGFloat = 162.0
-        static let ptrHoldOffset: CGFloat = 68.0
-        static let ptrFadeOutHigh: CGFloat = 66.0
-        static let ptrFadeOutLow: CGFloat = 22.0
-        static let ptrDismissOmega: Double = 14.0
+        private static let reboundForElasticFn: HyperbolicFn? = {
+            guard let h = appKitHandle,
+                  let sym = dlsym(h, "_NSHyperbolicReboundDeltaForElasticDelta") else { return nil }
+            return unsafeBitCast(sym, to: HyperbolicFn.self)
+        }()
 
-        /// Pop scale animation on PTR trigger (`23pt → 29pt → 23pt` over 155ms).
-        static let ptrPopDuration: Double = 0.155
-        static let ptrPopPeakTime: Double = 0.055
-        static let ptrPopPeakScale: CGFloat = 1.28
+        private static let elasticForTimeFn: ElasticTimeFn? = {
+            guard let h = appKitHandle,
+                  let sym = dlsym(h, "_NSElasticDeltaForTimeDelta") else { return nil }
+            return unsafeBitCast(sym, to: ElasticTimeFn.self)
+        }()
 
-        /// Continuous spin cadence & lifecycle timing.
-        static let ptrSpinFPS: Double = 20.0
-        static let ptrMinSpinDuration: Double = 0.40
-        static let ptrMaxSpinTimeout: Double = 3.2
+        /// `NSScrollingBehaviorHyperbolicCoefficientTouch` (`0.55` Safari direct-stretch slope).
+        static let defaultHyperbolicCoefficient: CGFloat = {
+            if let h = appKitHandle,
+               let sym = dlsym(h, "NSScrollingBehaviorHyperbolicCoefficientTouch") {
+                let value = sym.assumingMemoryBound(to: CGFloat.self).pointee
+                if value.isFinite && value > 0.05 && value <= 1.0 {
+                    return value
+                }
+            }
+            return 0.55
+        }()
+
+        /// Forward rubber-band curve `_NSHyperbolicElasticDeltaForReboundDelta(force, c, viewportLength)`.
+        static func hyperbolicElasticDelta(
+            forReboundDelta force: CGFloat,
+            coefficient c: CGFloat = defaultHyperbolicCoefficient,
+            viewportLength L: CGFloat
+        ) -> CGFloat {
+            guard force != 0, L > 0, c > 0 else { return 0 }
+            if let fn = elasticForReboundFn {
+                return fn(force, c, L)
+            }
+            let mag = abs(force)
+            let damped = (c * mag * L) / (L + c * mag)
+            return force < 0 ? -damped : damped
+        }
+
+        /// Exact inverse `_NSHyperbolicReboundDeltaForElasticDelta(stretch, c, viewportLength)`.
+        static func hyperbolicReboundDelta(
+            forElasticDelta stretch: CGFloat,
+            coefficient c: CGFloat = defaultHyperbolicCoefficient,
+            viewportLength L: CGFloat
+        ) -> CGFloat {
+            guard stretch != 0, L > 0, c > 0 else { return 0 }
+            if let fn = reboundForElasticFn {
+                return fn(stretch, c, L)
+            }
+            let clamped = min(abs(stretch), max(0, L - 1.0))
+            let denom = c * max(1.0, L - clamped)
+            let force = (clamped * L) / denom
+            return stretch < 0 ? -force : force
+        }
+
+        /// Time-domain bounce & snapback `_NSElasticDeltaForTimeDelta(initialPosition, initialVelocity, elapsedTime)`.
+        static func elasticDelta(
+            initialPosition: CGFloat,
+            initialVelocity: CGFloat,
+            elapsedTime: Double
+        ) -> CGFloat {
+            let t = max(0.0, elapsedTime)
+            if let fn = elasticForTimeFn {
+                return fn(initialPosition, initialVelocity, t)
+            }
+            let term = initialPosition - CGFloat(0.31 * Double(initialVelocity) * t)
+            return term * CGFloat(Foundation.exp(-12.5 * t))
+        }
     }
 
-    // MARK: - Telemetry & State
+    // MARK: - Public Types
 
-    struct PageScrollMetrics {
-        var scrollY: CGFloat = 0.0
-        var contentHeight: CGFloat = 0.0
-        var viewportHeight: CGFloat = 0.0
+    enum SyntheticScrollPhase: Equatable {
+        case began
+        case changed
+        case ended
+    }
+
+    struct PageScrollMetrics: Equatable {
+        var scrollY: CGFloat = 0
+        var contentHeight: CGFloat = 0
+        var viewportHeight: CGFloat = 0
         var canInnerScrollUp: Bool = false
         var canInnerScrollDown: Bool = false
-        var isReloadableWebPage: Bool = true
+        var isReloadableWebPage: Bool = false
         var isPageLoading: Bool = false
 
         var maxScrollY: CGFloat {
-            max(0.0, contentHeight - viewportHeight)
+            max(0, contentHeight - viewportHeight)
         }
 
-        var isAtTopBoundary: Bool {
-            scrollY <= 1.5 && !canInnerScrollUp
+        var isVerticallyScrollable: Bool {
+            maxScrollY > 0.5
         }
 
-        var isAtBottomBoundary: Bool {
-            scrollY >= max(0.0, maxScrollY - 1.5) && !canInnerScrollDown
+        func isAtTopEdge(tolerance: CGFloat = 0.5) -> Bool {
+            scrollY <= tolerance && !canInnerScrollUp
+        }
+
+        func isAtBottomEdge(tolerance: CGFloat = 0.5) -> Bool {
+            scrollY >= maxScrollY - tolerance && !canInnerScrollDown
         }
     }
 
-    enum MotionState: Equatable {
-        case idle
-        case directDrag
-        /// Analytic critically damped oscillator: y(t) = target + (y0 + (v0 + ω*y0)*t) * exp(-ω*t)
-        case criticallyDamped(startTime: CFTimeInterval, y0: CGFloat, v0: CGFloat, target: CGFloat, omega: Double)
-        /// Pure exponential recoil: y(t) = target + (y0 - target) * exp(-k*t)
-        case exponentialSnap(startTime: CFTimeInterval, fromY: CGFloat, target: CGFloat, rate: Double)
-        /// Settled at `ptrHoldOffset` while the page reloads and spinner loops.
-        case ptrHolding
-        /// 1:1 macOS momentum unwinding PTR hold offset directly into downward page scroll.
-        case ptrMomentumUnwind
-        /// Synthetic smooth demo pull triggered from Page Menu.
-        case demoPull(startTime: CFTimeInterval)
+    // MARK: - WebKit & Refresh-Controller Parameters
+
+    private enum Parameters {
+        static let velocityZeroingTimeout: TimeInterval = 0.100
+        static let velocityWindowDuration: TimeInterval = 0.040
+        static let minVelocitySampleDuration: TimeInterval = 1.0 / 120.0
+        static let maxMomentumVelocity: CGFloat = 12_000.0
+        static let minBounceImpactVelocity: CGFloat = 80.0
+        static let axisLockDecayTimeConstant: TimeInterval = 0.120
+        static let minViewportLength: CGFloat = 320.0
+        static let maxStretchFraction: CGFloat = 0.44
+        static let rubberBandMinElapsedBeforeSettle: TimeInterval = 0.024
+        static let rubberBandSettleEpsilon: CGFloat = 0.22
+
+        /// WebKit `NSRefreshController` / Safari 27.3 Pull-to-Refresh geometry & timing.
+        static let refreshRevealOffset: CGFloat = 26.0
+        static let refreshFullOpacityOffset: CGFloat = 52.0
+        static let refreshTriggerOffset: CGFloat = 106.0
+        static let refreshFlingProgressDenominator: CGFloat = 162.0
+        static let refreshHoldOffset: CGFloat = 68.0
+        static let refreshFadeHighOffset: CGFloat = 66.0
+        static let refreshFadeLowOffset: CGFloat = 22.0
+        static let refreshPopDuration: TimeInterval = 0.155
+        static let refreshPopPeakTime: TimeInterval = 0.055
+        static let refreshPopPeakScale: CGFloat = 1.28
+        static let refreshSpinFPS: Double = 20.0
+        static let refreshMinSpinDuration: TimeInterval = 0.40
+        static let refreshMaxSpinTimeout: TimeInterval = 3.20
+
+        /// WebKit `Scrollbar::pageStep` (`max(visibleH * 0.875, visibleH - 40)`).
+        static let pageStepFraction: CGFloat = 0.875
+        static let pageStepOverlap: CGFloat = 40.0
+        /// Touchpad-style underdamped spring-momentum Space scroll (`zeta = 0.68`, `omega = 15.0` -> ~5.5% overshoot + settle).
+        static let keyboardSpringOmega: CGFloat = 15.0
+        static let keyboardSpringZeta: CGFloat = 0.68
+        static let keyboardLaunchVelocityFactor: CGFloat = 3.2
+        static let keyboardMomentumChainWindow: TimeInterval = 0.55
+        static let keyboardMaxMomentumChain: CGFloat = 5.0
+        static let keyboardMaxQueuedPages: CGFloat = 7.0
+        static let keyboardSettleDistanceEpsilon: CGFloat = 0.30
+        static let keyboardSettleVelocityEpsilon: CGFloat = 10.0
     }
 
-    enum PTRState: Equatable {
-        case idle
-        case pulling
-        /// Momentum top overshoot drives spinner progress visually, with a very high trigger threshold (150pt).
-        case flingPulling
-        case spinning(triggeredAt: CFTimeInterval, loadFinished: Bool)
-        case dismissing(spinStartedAt: CFTimeInterval)
+    // MARK: - Animation & Refresh State (`ScrollAnimationRubberBand` + `NSRefreshController`)
+
+    private struct RubberBandAnimationState {
+        var startTime: CFTimeInterval
+        var initialStretchY: CGFloat
+        var initialScrollVelocityY: CGFloat
+        /// WebKit `m_targetOverscroll` (`0` normally, `-68 pt` while Pull-to-Refresh is holding).
+        var targetStretchY: CGFloat
     }
 
-    enum ConsumedMomentumLock {
-        case none
-        case top
-        case bottom
+    private enum RefreshControlState {
+        case hidden
+        case pullingDirect
+        case pullingMomentum
+        case refreshing(triggeredAt: CFTimeInterval, pageLoadObserved: Bool)
+        case dismissing(triggeredAt: CFTimeInterval)
     }
 
-    // MARK: - Public Callbacks & Read-Only State
+    private struct KeyboardGlideState {
+        var lastFrameTime: CFTimeInterval
+        var scrollSign: CGFloat
+        var remainingScrollDeltaY: CGFloat
+        var currentScrollVelocityY: CGFloat
+        var peakForwardSpeed: CGFloat
+        var isStartPage: Bool
+        var emittedBegan: Bool
+    }
 
+    private struct VelocitySample {
+        var timestamp: TimeInterval
+        var scrollDeltaY: CGFloat
+    }
+
+    // MARK: - Public Callbacks & State
+
+    var obscuredTopInset: CGFloat = 0
     var onTriggerRefresh: (() -> Void)?
-    /// Emits 120Hz precise-pixel vertical scroll deltas (`deltaY < 0` scrolls down, `deltaY > 0` scrolls up)
-    /// driven by touchpad-style Space / Shift+Space inertia.
-    /// Space-bar momentum stream: (delta in points, + = scroll up, phase). `.began` opens a momentum scroll,
-    /// `.changed` carries each frame's delta, `.ended` (delta 0) closes it, like a trackpad fling's momentum phase.
     var onSyntheticScroll: ((CGFloat, SyntheticScrollPhase) -> Void)?
-    enum SyntheticScrollPhase { case began, changed, ended }
-    /// Height of the shell chrome over the top of the page (toolbar + tab strip); Space pages by what is visible.
-    var obscuredTopInset: CGFloat = 0.0
-    /// Fires when elastic rubber-band drag or spring animation begins (`true`) or settles back to idle (`false`).
     var onElasticInteractionChanged: ((Bool) -> Void)?
 
-    private(set) var currentOverscrollY: CGFloat = 0.0 {
-        didSet { notifyElasticInteractionIfNeeded() }
-    }
-    var isOverscrolling: Bool { abs(currentOverscrollY) > 0.05 }
-    var isElasticInteractionActive: Bool {
-        if case .idle = motionState { return isOverscrolling }
-        return true
-    }
-    private var lastReportedElasticActive: Bool = false
-
-    private func notifyElasticInteractionIfNeeded() {
-        let active = isElasticInteractionActive
-        if active != lastReportedElasticActive {
-            lastReportedElasticActive = active
-            onElasticInteractionChanged?(active)
-        }
+    /// Screen-space vertical displacement (`> 0` = top overhang shifting page DOWN, `< 0` = bottom overhang shifting page UP).
+    var currentOverscrollY: CGFloat {
+        -stretchY
     }
 
-    // MARK: - Attached Views & Display Link
+    var isOverscrolling: Bool {
+        abs(stretchY) > 0.01
+    }
+
+    private(set) var isElasticInteractionActive: Bool = false
+    private(set) var metrics = PageScrollMetrics()
+    private(set) var estimatedScrollY: CGFloat = 0
+
+    var isAnimatingRubberBand: Bool {
+        rubberBandAnimation != nil
+    }
+
+    var isAnimatingKeyboardScroll: Bool {
+        keyboardGlide != nil
+    }
+
+    // MARK: - Private State (`ScrollingEffectsController`)
 
     private weak var targetView: NSView?
     private weak var spinnerView: PullToRefreshView?
-
     private var displayLink: CADisplayLink?
 
-    // MARK: - Internal Simulation State
+    /// WebKit scroll-space overhang (`< 0` = top overhang, `> 0` = bottom overhang).
+    private var stretchY: CGFloat = 0
+    private var stretchScrollForceY: CGFloat = 0
+    private var residualForwardDeltaY: CGFloat?
 
-    var metrics = PageScrollMetrics()
-    var estimatedScrollY: CGFloat = 0.0
-    /// Set when a direct-touch step unwound the overscroll and crossed zero: the part of the step that must still
-    /// reach the page (negative = scroll down). The scroll monitor forwards only this remainder, not the whole event.
-    private(set) var residualForwardDeltaY: CGFloat?
+    private var inScrollGesture: Bool = false
+    private var gestureBeganAtTop: Bool = false
+    private var momentumScrollInProgress: Bool = false
+    private var ignoreMomentumScrolls: Bool = false
+    private var gestureLatchedToInnerUp: Bool = false
+    private var gestureLatchedToInnerDown: Bool = false
 
-    /// Returns and clears the remainder recorded by the last event (nil when the whole event goes to the page as-is).
-    func takeResidualForwardDeltaY() -> CGFloat? {
-        defer { residualForwardDeltaY = nil }
-        return residualForwardDeltaY
-    }
+    private var cumulativeGestureDelta: CGPoint = .zero
+    private var lastGestureTimestamp: TimeInterval = 0
+    private var velocitySamples: [VelocitySample] = []
 
-    var motionState: MotionState = .idle {
-        didSet { notifyElasticInteractionIfNeeded() }
-    }
-    var ptrState: PTRState = .idle
-    var rawStretch: CGFloat = 0.0
+    private var rubberBandAnimation: RubberBandAnimationState?
+    private var refreshState: RefreshControlState = .hidden
+    private var keyboardGlide: KeyboardGlideState?
+    private var spaceMomentumChain: CGFloat = 0
+    private var lastSpaceTriggerTime: CFTimeInterval = 0
+    private var lastSpaceScrollSign: CGFloat = 0
+    private var spaceRepeatLatchedEdgeSign: CGFloat = 0
 
-    /// Rolling 45ms velocity estimator in points/second (immune to coalesced 1ms-dt spikes).
-    struct VelocitySample {
-        let timestamp: TimeInterval
-        let deltaY: CGFloat
-    }
-    var velocitySamples: [VelocitySample] = []
-    var smoothedVelocityY: CGFloat = 0.0
-    var lastDirectDragVelocityY: CGFloat = 0.0
-
-    /// Locks out residual macOS momentum events once an overshoot spring has taken ownership.
-    var momentumLock: ConsumedMomentumLock = .none
-
-    /// Tracks whether the current direct-touch gesture began while horizontal scroll dominated.
-    private var gestureLockedHorizontal: Bool = false
-
-    /// Set when the user actively scrolls down during PTR triggered/holding to unwind cleanly to 0.
-    var ptrDismissedByUserScroll: Bool = false
-    /// Timestamp of last macOS momentum delta received during `.ptrMomentumUnwind`.
-    private var lastMomentumUnwindTime: CFTimeInterval = 0.0
-
-    // MARK: Space / Shift+Space momentum
-    // A press is a momentum fling that travels exactly one page (WebKit's page step: max(87.5% of the visible height,
-    // visible height - 40)), with velocity decaying exponentially like trackpad momentum, delivered to Chromium as a
-    // momentum-phase scroll stream. Momentum builds up: each quick press in the same direction adds a bigger impulse
-    // on top of the current velocity and lowers the friction, so a burst of presses keeps getting faster; a held key
-    // accelerates from 4 to 13 pages/s over a second. Reaching an edge lands the page exactly on it and hands the
-    // remaining velocity to the same overshoot spring a trackpad fling uses.
-    /// pt/s, + = up. Remaining travel of the current glide is `spaceVelocityY / spaceDecayRate`.
-    var spaceVelocityY: CGFloat = 0.0
-    private(set) var spaceLastTickTime: CFTimeInterval = 0.0
-    var spaceIsStartPage: Bool = false
-    /// True between the `.began` and `.ended` of a momentum stream sent to the page.
-    private(set) var spaceStreamOpen: Bool = false
-    /// Set when the glide began while the page already sat on the edge it moves toward (no bounce, like Safari).
-    private var spaceStartedAtEdge: Bool = false
-    static let spaceDecayRate: CGFloat = 10.0
-    /// Friction of the current glide (lowered while a press streak builds momentum).
-    private(set) var spaceFriction: CGFloat = ElasticScrollEngine.spaceDecayRate
-    /// Consecutive same-direction presses less than `spaceStreakWindow` apart.
-    private(set) var spaceStreak: Int = 0
-    private var spaceLastPressTime: CFTimeInterval = -1.0
-    private var spaceHoldStartTime: CFTimeInterval = 0.0
-    static let spaceStreakWindow: CFTimeInterval = 0.6
-    /// Fastest glide, in visible pages per second.
-    static let spaceMaxPagesPerSecond: CGFloat = 36.0
-    static let spaceMaxImpactVelocity: CGFloat = 9000.0
-    /// Glide ends once less than this much travel remains (the remainder is sent in the last frame).
-    private static let spaceStopDistance: CGFloat = 1.0
-
-    // MARK: - Lifecycle
+    // MARK: - Lifecycle & Attachment
 
     func attach(targetView: NSView, spinnerView: PullToRefreshView) {
         self.targetView = targetView
         self.spinnerView = spinnerView
         targetView.wantsLayer = true
-        applyVisualOffset(0.0)
         spinnerView.render(state: .hidden)
+        applyLayerTranslation()
+        updateDisplayLinkRunningState()
     }
 
     func invalidate() {
-        stopDisplayLink()
-        applyVisualOffset(0.0)
+        cancelKeyboardGlide(emitEnded: false)
+        rubberBandAnimation = nil
+        refreshState = .hidden
+        tearDownDisplayLink()
+        stretchY = 0
+        stretchScrollForceY = 0
+        residualForwardDeltaY = nil
+        applyLayerTranslation()
         spinnerView?.render(state: .hidden)
+        updateInteractionState()
     }
 
-    deinit {
-        stopDisplayLink()
+    func resetImmediately() {
+        cancelKeyboardGlide(emitEnded: true)
+        rubberBandAnimation = nil
+        refreshState = .hidden
+        inScrollGesture = false
+        gestureBeganAtTop = false
+        momentumScrollInProgress = false
+        ignoreMomentumScrolls = false
+        gestureLatchedToInnerUp = false
+        gestureLatchedToInnerDown = false
+        cumulativeGestureDelta = .zero
+        lastGestureTimestamp = 0
+        velocitySamples.removeAll(keepingCapacity: true)
+        residualForwardDeltaY = nil
+        stretchScrollForceY = 0
+        setStretchY(0)
+        spinnerView?.render(state: .hidden)
+        updateDisplayLinkRunningState()
+        updateInteractionState()
     }
 
-    // MARK: - Telemetry & External Lifecycle Hooks
+    // MARK: - Page Telemetry & Refresh Lifecycle
 
-    /// `resyncEstimate`: true when this is fresh renderer telemetry (or a tab/page change), false for the cached-value
-    /// sync the scroll monitor runs before every event. The renderer reports scroll a frame or more after it applied
-    /// a delta, so the predictive `estimatedScrollY` (last report minus every delta forwarded since) must only be
-    /// reset when a new report arrives; resetting it from the cached value on every event threw the prediction away
-    /// and the top/bottom fling overshoot fired late or not at all.
+    func setReloadableWebPage(_ isReloadable: Bool) {
+        metrics.isReloadableWebPage = isReloadable
+        if !isReloadable {
+            refreshState = .hidden
+            spinnerView?.render(state: .hidden)
+        }
+    }
+
+    func notifyPageLoadingStateChanged(isLoading: Bool) {
+        metrics.isPageLoading = isLoading
+        if case .refreshing(let triggeredAt, _) = refreshState {
+            refreshState = .refreshing(triggeredAt: triggeredAt, pageLoadObserved: true)
+            updateDisplayLinkRunningState()
+        }
+    }
+
     func updateMetrics(
         scrollY: CGFloat,
         contentHeight: CGFloat,
@@ -282,1153 +338,1208 @@ final class ElasticScrollEngine: NSObject {
         isPageLoading: Bool,
         resyncEstimate: Bool = true
     ) {
-        metrics.scrollY = max(0.0, scrollY)
-        metrics.contentHeight = max(0.0, contentHeight)
-        metrics.viewportHeight = max(1.0, viewportHeight)
-        metrics.canInnerScrollUp = canInnerScrollUp
-        metrics.canInnerScrollDown = canInnerScrollDown
-        metrics.isReloadableWebPage = isReloadableWebPage
-        metrics.isPageLoading = isPageLoading
+        let clampedViewport = max(0, viewportHeight)
+        let clampedContent = max(clampedViewport, contentHeight)
+        let maxScroll = max(0, clampedContent - clampedViewport)
+        let clampedScrollY = min(max(0, scrollY), maxScroll)
 
-        if resyncEstimate {
-            estimatedScrollY = metrics.scrollY
-        }
-    }
+        metrics = PageScrollMetrics(
+            scrollY: clampedScrollY,
+            contentHeight: clampedContent,
+            viewportHeight: clampedViewport,
+            canInnerScrollUp: canInnerScrollUp,
+            canInnerScrollDown: canInnerScrollDown,
+            isReloadableWebPage: isReloadableWebPage,
+            isPageLoading: isPageLoading
+        )
 
-    func setReloadableWebPage(_ reloadable: Bool) {
-        metrics.isReloadableWebPage = reloadable
-        if !reloadable {
-            resetImmediately()
-        }
-    }
-
-    func notifyPageLoadingStateChanged(isLoading: Bool) {
-        metrics.isPageLoading = isLoading
-        if !isLoading {
-            markPTRLoadFinished()
-        }
-    }
-
-    func resetImmediately() {
-        stopDisplayLink()
-        motionState = .idle
-        ptrState = .idle
-        rawStretch = 0.0
-        currentOverscrollY = 0.0
-        velocitySamples.removeAll(keepingCapacity: true)
-        smoothedVelocityY = 0.0
-        lastDirectDragVelocityY = 0.0
-        momentumLock = .none
-        gestureLockedHorizontal = false
-        ptrDismissedByUserScroll = false
-        lastMomentumUnwindTime = 0.0
-        cancelSpaceScroll()
-        spaceLastTickTime = 0.0
-        spaceIsStartPage = false
-        applyVisualOffset(0.0)
-        spinnerView?.render(state: .hidden)
-    }
-
-    /// Launches or stacks a 120Hz macOS touchpad-inertia scroll impulse for Space (`direction = -1`)
-    /// or Shift+Space (`direction = +1`), unwinding PTR or triggering elastic boundary bounce seamlessly.
-    /// Visible page height Space steps by (viewport minus the chrome over its top).
-    func spaceVisibleHeight() -> CGFloat {
-        let vh = max(320.0, metrics.viewportHeight > 1.0 ? metrics.viewportHeight : (targetView?.bounds.height ?? 800.0))
-        return max(240.0, vh - (spaceIsStartPage ? 0.0 : obscuredTopInset))
-    }
-
-    /// WebKit's page step for a visible height.
-    static func spacePageStep(visibleHeight h: CGFloat) -> CGFloat {
-        max(h * 0.875, h - 40.0)
-    }
-
-    /// `direction` -1 = Space (down), +1 = Shift+Space (up). `isRepeat` = key auto-repeat while held.
-    func triggerSpaceScroll(direction: Int, isRepeat: Bool, isStartPage: Bool, now: CFTimeInterval = CACurrentMediaTime()) {
-        let sign: CGFloat = direction >= 0 ? 1.0 : -1.0
-        spaceIsStartPage = isStartPage
-        let base = Self.spaceDecayRate
-        let visible = spaceVisibleHeight()
-        let reversing = (spaceVelocityY > 0 && sign < 0) || (spaceVelocityY < 0 && sign > 0)
-        if reversing {
-            spaceVelocityY = 0.0
-            spaceStreak = 0
-            spaceFriction = base
-            endSpaceStream()
-        }
-
-        if isRepeat {
-            // Held key: speed ramps from 4 to 13 visible pages/s over the first second of auto-repeat, never down.
-            if spaceHoldStartTime <= 0.0 { spaceHoldStartTime = now }
-            let held = CGFloat(min(1.0, (now - spaceHoldStartTime) / 1.0))
-            let target = visible * (4.0 + 9.0 * held)
-            if abs(spaceVelocityY) < target { spaceVelocityY = sign * target }
+        if resyncEstimate && keyboardGlide == nil {
+            estimatedScrollY = clampedScrollY
         } else {
-            spaceHoldStartTime = 0.0
-            let quick = spaceLastPressTime >= 0.0 && (now - spaceLastPressTime) < Self.spaceStreakWindow
-            spaceStreak = (quick && !reversing && spaceVelocityY != 0.0) ? spaceStreak + 1 : 1
-            spaceLastPressTime = now
-            let n = CGFloat(spaceStreak - 1)
-            // 1st press: exactly one page at base friction. Each quick follow-up adds a bigger kick (x1.35, x1.7, ...
-            // up to x3) on top of the velocity still left, and the glide coasts further (friction down to base/1.8).
-            let boost = min(1.0 + 0.35 * n, 3.0)
-            spaceFriction = base / min(1.8, 1.0 + 0.2 * n)
-            spaceVelocityY = sign * (abs(spaceVelocityY) + Self.spacePageStep(visibleHeight: visible) * base * boost)
+            estimatedScrollY = min(max(0, estimatedScrollY), maxScroll)
         }
-        let maxV = visible * Self.spaceMaxPagesPerSecond
-        spaceVelocityY = max(-maxV, min(maxV, spaceVelocityY))
-        if !spaceStreamOpen {
-            spaceLastTickTime = now
-            spaceStartedAtEdge = false
-        }
-        ensureDisplayLinkRunning()
-    }
-
-    /// Stops a Space glide (real trackpad input, reset, edge arrival) and closes its momentum stream.
-    func cancelSpaceScroll() {
-        spaceVelocityY = 0.0
-        spaceStreak = 0
-        spaceHoldStartTime = 0.0
-        spaceFriction = Self.spaceDecayRate
-        endSpaceStream()
-    }
-
-    private func emitSpaceDelta(_ deltaY: CGFloat) {
-        if !spaceStreamOpen {
-            spaceStreamOpen = true
-            onSyntheticScroll?(deltaY, .began)
-        } else {
-            onSyntheticScroll?(deltaY, .changed)
+        if spaceRepeatLatchedEdgeSign < 0 && (estimatedScrollY > 1.0 || canInnerScrollUp) {
+            spaceRepeatLatchedEdgeSign = 0
+        } else if spaceRepeatLatchedEdgeSign > 0 && (estimatedScrollY < maxScroll - 1.0 || canInnerScrollDown) {
+            spaceRepeatLatchedEdgeSign = 0
         }
     }
 
-    private func endSpaceStream() {
-        guard spaceStreamOpen else { return }
-        spaceStreamOpen = false
-        onSyntheticScroll?(0.0, .ended)
+    func takeResidualForwardDeltaY() -> CGFloat? {
+        defer { residualForwardDeltaY = nil }
+        return residualForwardDeltaY
     }
 
-    func triggerPullToRefreshDemo() {
-        guard metrics.isReloadableWebPage else { return }
-        momentumLock = .none
-        ptrState = .pulling
-        motionState = .demoPull(startTime: CACurrentMediaTime())
-        ensureDisplayLinkRunning()
-    }
+    // MARK: - Wheel & Gesture Entry Points
 
-    /// Programmatic momentum fling overshoot helper (useful for automated runtime verification).
-    func triggerSyntheticFlingOvershoot(impactVelocity: CGFloat) {
-        guard abs(impactVelocity) >= Constants.minFlingVelocity else { return }
-        launchFlingOvershoot(impactVelocity: impactVelocity, lock: impactVelocity > 0 ? .top : .bottom)
-    }
-
-    // MARK: - Trackpad Scroll Event Entrypoint
-
-    /// Processes an AppKit `.scrollWheel` event directed at `targetView`.
-    /// Returns `true` if the event was consumed by elastic overscroll (caller should drop it so
-    /// Chromium does not double-scroll or double-bounce), or `false` to pass through to Chromium.
     func handleScrollWheel(_ event: NSEvent) -> Bool {
-        let consumed = handleScrollWheelCore(event)
-        if ScrollDebugLog.isEnabled {
-            let line = String(format: "%.4f ph=%lu mo=%lu dy=%.2f v=%.0f sy=%.1f est=%.1f max=%.0f up=%d dn=%d ov=%.1f st=%@ lock=%@ c=%d\n",
-                              event.timestamp, event.phase.rawValue, event.momentumPhase.rawValue,
-                              event.scrollingDeltaY, smoothedVelocityY, metrics.scrollY, estimatedScrollY,
-                              metrics.maxScrollY, metrics.canInnerScrollUp ? 1 : 0, metrics.canInnerScrollDown ? 1 : 0,
-                              currentOverscrollY, String(describing: motionState).prefix(18).description,
-                              String(describing: momentumLock), consumed ? 1 : 0)
-            ScrollDebugLog.write(line)
-        }
-        return consumed
-    }
+        residualForwardDeltaY = nil
 
-    private func handleScrollWheelCore(_ event: NSEvent) -> Bool {
-        // Discrete notched mouse wheels do not trigger macOS Safari elastic rubber-banding.
-        let isPreciseTrackpad = event.hasPreciseScrollingDeltas
-            || !event.phase.isEmpty
-            || !event.momentumPhase.isEmpty
-        guard isPreciseTrackpad else {
+        if MotionPreference.reduced {
+            if isOverscrolling || isAnimatingRubberBand || isAnimatingKeyboardScroll {
+                resetImmediately()
+            }
+            if event.hasPreciseScrollingDeltas {
+                estimatedScrollY = clampScrollY(estimatedScrollY - event.scrollingDeltaY)
+            }
             return false
         }
 
-        let phase = event.phase
-        let momentum = event.momentumPhase
-        let deltaY = event.scrollingDeltaY
-        let deltaX = event.scrollingDeltaX
-        let now = event.timestamp > 0 ? event.timestamp : CACurrentMediaTime()
+        let ts = event.timestamp > 0 ? event.timestamp : CACurrentMediaTime()
 
-        // Any real trackpad input immediately cancels synthetic Space-scroll inertia.
-        if !phase.isEmpty || !momentum.isEmpty {
-            cancelSpaceScroll()
+        if !event.hasPreciseScrollingDeltas && event.phase.isEmpty && event.momentumPhase.isEmpty {
+            cancelKeyboardGlide(emitEnded: true)
+            if !isOverscrolling && !isAnimatingRubberBand {
+                estimatedScrollY = clampScrollY(estimatedScrollY - event.scrollingDeltaY)
+                return false
+            }
         }
 
-        // Update viewport height from live target view if telemetry hasn't reported one yet.
-        if let tv = targetView, tv.bounds.height > 1.0, metrics.viewportHeight <= 1.0 {
-            metrics.viewportHeight = tv.bounds.height
+        if !event.momentumPhase.isEmpty {
+            return handleMomentumEvent(
+                momentumPhase: event.momentumPhase,
+                deltaX: event.scrollingDeltaX,
+                deltaY: event.scrollingDeltaY,
+                timestamp: ts
+            )
         }
 
-        // Update velocity estimator from precise deltas (only reset on a fresh finger touch,
-        // preserving finger-lift momentum velocity seamlessly across phase.ended -> momentum.began).
-        updateVelocityEstimate(deltaY: deltaY, timestamp: now, isBegin: phase == .began)
-
-        // 1. Direct finger touch phase (`phase != []`, `momentumPhase == []`).
-        if !phase.isEmpty && momentum.isEmpty {
-            return handleDirectTouchEvent(phase: phase, deltaX: deltaX, deltaY: deltaY)
+        if !event.phase.isEmpty {
+            return handleDirectTouchEvent(
+                phase: event.phase,
+                deltaX: event.scrollingDeltaX,
+                deltaY: event.scrollingDeltaY,
+                timestamp: ts
+            )
         }
 
-        // 2. Momentum coast phase (`momentumPhase != []`).
-        if !momentum.isEmpty {
-            return handleMomentumEvent(momentum: momentum, deltaY: deltaY)
-        }
-
+        estimatedScrollY = clampScrollY(estimatedScrollY - event.scrollingDeltaY)
         return false
     }
 
-    // MARK: - Direct-Touch Elastic Rubber-Band Handling
+    @discardableResult
+    func handleDirectTouchEvent(
+        phase: NSEvent.Phase,
+        deltaX: CGFloat,
+        deltaY: CGFloat,
+        timestamp: TimeInterval? = nil
+    ) -> Bool {
+        residualForwardDeltaY = nil
 
-    func handleDirectTouchEvent(phase: NSEvent.Phase, deltaX: CGFloat, deltaY: CGFloat) -> Bool {
-        // Putting fingers down clears any previous momentum consumption lock.
-        if phase == .mayBegin || phase == .began {
-            momentumLock = .none
-            gestureLockedHorizontal = false
-            lastDirectDragVelocityY = 0.0
-
-            // While pull-to-refresh is spinning or dismissing, keep spinner calm on finger rest;
-            // actual vertical movement in `.changed` will seamlessly grab and unwind 1:1.
-            if isPTRRefreshingOrDismissing {
-                ptrDismissedByUserScroll = false
-                return false
+        if MotionPreference.reduced {
+            if isOverscrolling || isAnimatingRubberBand {
+                resetImmediately()
             }
+            estimatedScrollY = clampScrollY(estimatedScrollY - deltaY)
+            return false
+        }
 
-            // Mid-air catch: if currently bouncing (non-PTR), seamlessly grab the page
-            // at its exact current visual pixel with ZERO jump!
-            if abs(currentOverscrollY) > 0.25 {
-                let d = effectiveDimension()
-                rawStretch = inverseRubberBand(visual: currentOverscrollY, dimension: d)
-                motionState = .directDrag
-                if currentOverscrollY > 0, metrics.isReloadableWebPage {
-                    ptrState = .pulling
-                }
-                ensureDisplayLinkRunning()
-                return true
+        let ts = timestamp ?? CACurrentMediaTime()
+        let viewportLength = effectiveViewportLength
+        let coeff = AppKitElasticity.defaultHyperbolicCoefficient
+
+        if phase == .mayBegin || phase == .began || phase == .changed {
+            cancelKeyboardGlide(emitEnded: true)
+        }
+
+        if phase == .mayBegin {
+            momentumScrollInProgress = false
+            ignoreMomentumScrolls = false
+            velocitySamples.removeAll(keepingCapacity: true)
+            cumulativeGestureDelta = .zero
+            lastGestureTimestamp = 0
+            gestureLatchedToInnerUp = metrics.canInnerScrollUp
+            gestureLatchedToInnerDown = metrics.canInnerScrollDown
+            gestureBeganAtTop = estimatedScrollY <= 1.0 && !metrics.canInnerScrollUp
+
+            if isAnimatingRubberBand {
+                rubberBandAnimation = nil
+                stretchScrollForceY = AppKitElasticity.hyperbolicReboundDelta(
+                    forElasticDelta: stretchY,
+                    coefficient: coeff,
+                    viewportLength: viewportLength
+                )
+                updateDisplayLinkRunningState()
+                updateInteractionState()
+                return isOverscrolling
             }
             return false
+        }
+
+        if phase == .began {
+            inScrollGesture = true
+            momentumScrollInProgress = false
+            ignoreMomentumScrolls = false
+            velocitySamples.removeAll(keepingCapacity: true)
+            cumulativeGestureDelta = .zero
+            lastGestureTimestamp = 0
+            gestureLatchedToInnerUp = metrics.canInnerScrollUp
+            gestureLatchedToInnerDown = metrics.canInnerScrollDown
+            gestureBeganAtTop = (estimatedScrollY <= 1.0 && !metrics.canInnerScrollUp) || stretchY < -0.5
+
+            rubberBandAnimation = nil
+            stretchScrollForceY = AppKitElasticity.hyperbolicReboundDelta(
+                forElasticDelta: stretchY,
+                coefficient: coeff,
+                viewportLength: viewportLength
+            )
+            updateDisplayLinkRunningState()
+
+            if deltaX == 0 && deltaY == 0 {
+                updateInteractionState()
+                return isOverscrolling
+            }
         }
 
         if phase == .ended || phase == .cancelled {
-            gestureLockedHorizontal = false
-            if case .directDrag = motionState {
-                beginDirectReleaseRecoil()
-                return true
+            inScrollGesture = false
+            cumulativeGestureDelta = .zero
+            lastGestureTimestamp = 0
+
+            let targetStretch = activeRefreshTargetStretchY
+            if abs(stretchY - targetStretch) > 0.01 || targetStretch != 0 {
+                startRubberBandAnimation(
+                    initialScrollVelocityY: 0,
+                    initialStretchY: stretchY,
+                    targetStretchY: targetStretch,
+                    now: ts
+                )
+            } else {
+                stretchScrollForceY = 0
+                setStretchY(0)
+                if case .pullingDirect = refreshState { refreshState = .hidden }
+                if case .pullingMomentum = refreshState { refreshState = .hidden }
             }
+            updateSpinnerPresentation(now: ts)
+            updateDisplayLinkRunningState()
+            updateInteractionState()
+            return isOverscrolling || isAnimatingRubberBand
+        }
+
+        if phase == .stationary {
+            return isOverscrolling
+        }
+
+        inScrollGesture = true
+        if rubberBandAnimation != nil {
+            rubberBandAnimation = nil
+            stretchScrollForceY = AppKitElasticity.hyperbolicReboundDelta(
+                forElasticDelta: stretchY,
+                coefficient: coeff,
+                viewportLength: viewportLength
+            )
+            updateDisplayLinkRunningState()
+        }
+
+        let scrollDX = -deltaX
+        let scrollDY = -deltaY
+        recordVelocitySample(scrollDeltaY: scrollDY, timestamp: ts)
+
+        let dominantVertical = updatePredominantGestureAxisIsVertical(
+            scrollDX: scrollDX,
+            scrollDY: scrollDY,
+            timestamp: ts
+        )
+        if !isOverscrolling && !dominantVertical {
             return false
         }
 
-        // Active finger movement (`.changed` or `.stationary`).
-        guard phase == .changed else {
-            return isCurrentlyInDirectDrag
+        guard scrollDY != 0 else {
+            return isOverscrolling
         }
 
-        // While pull-to-refresh is triggered / holding / dismissing:
-        // Unwind `currentOverscrollY` 1:1 with downward scroll (`deltaY < 0`) so the page stays locked
-        // to the user's fingers with ZERO jump/double-motion, then hand off at exact 1:1 speed into Chromium at y = 0.
-        if isPTRRefreshingOrDismissing {
-            if currentOverscrollY > 0.25 {
-                let wasDirectDrag = isCurrentlyInDirectDrag
-                if !wasDirectDrag {
-                    if gestureLockedHorizontal {
-                        return false
-                    }
-                    if abs(deltaX) > abs(deltaY) * 1.15 && abs(deltaX) > 1.0 {
-                        gestureLockedHorizontal = true
-                        return false
-                    }
-                }
+        let consumed = applyGestureScrollDeltaY(scrollDY, viewportLength: viewportLength, coefficient: coeff, now: ts)
+        logWheelStepIfEnabled(phase: phase.rawValue, momentumPhase: 0, wheelDY: deltaY)
+        updateSpinnerPresentation(now: ts)
+        updateDisplayLinkRunningState()
+        updateInteractionState()
+        return consumed
+    }
 
-                let now = CACurrentMediaTime()
-                if deltaY < 0.0 {
-                    let nextY = currentOverscrollY + deltaY
-                    lastDirectDragVelocityY = smoothedVelocityY
+    @discardableResult
+    func handleMomentumEvent(
+        momentumPhase: NSEvent.Phase,
+        deltaX: CGFloat = 0,
+        deltaY: CGFloat,
+        timestamp: TimeInterval? = nil
+    ) -> Bool {
+        residualForwardDeltaY = nil
+        _ = deltaX
 
-                    // Transition to dismissing if this is a fresh scroll-down touch, or user pushed below hold shelf, or flicked up.
-                    if !wasDirectDrag || nextY < Constants.ptrHoldOffset - 4.0 || smoothedVelocityY < -160.0 {
-                        ptrDismissedByUserScroll = true
-                        if case .spinning(let triggeredAt, _) = ptrState {
-                            ptrState = .dismissing(spinStartedAt: triggeredAt)
-                        }
-                    }
-
-                    if nextY <= 0.0 {
-                        resetToIdleRest()
-                        // Only the part beyond the unwound overscroll is real page scroll.
-                        estimatedScrollY = clampScrollY(estimatedScrollY - nextY)
-                        residualForwardDeltaY = nextY
-                        return false
-                    }
-
-                    motionState = .directDrag
-                    rawStretch = inverseRubberBand(visual: nextY, dimension: effectiveDimension())
-                    applyVisualOffset(nextY)
-                    updateSpinnerPresentation(now: now)
-                    ensureDisplayLinkRunning()
-                    return true
-                }
-
-                if deltaY > 0.0 {
-                    if !wasDirectDrag {
-                        rawStretch = inverseRubberBand(visual: currentOverscrollY, dimension: effectiveDimension())
-                        motionState = .directDrag
-                    }
-                    rawStretch += deltaY
-                    lastDirectDragVelocityY = smoothedVelocityY
-                    let visual = rubberBand(raw: rawStretch, dimension: effectiveDimension())
-                    applyVisualOffset(visual)
-                    updateSpinnerPresentation(now: now)
-                    ensureDisplayLinkRunning()
-                    return true
-                }
-
-                return wasDirectDrag
-            }
-
+        if MotionPreference.reduced {
             estimatedScrollY = clampScrollY(estimatedScrollY - deltaY)
             return false
         }
 
-        // If already dragging in elastic stretch, keep full continuous ownership until crossing 0.
-        if case .directDrag = motionState {
-            let prevSign: CGFloat = rawStretch >= 0 ? 1.0 : -1.0
-            rawStretch += deltaY
-            lastDirectDragVelocityY = smoothedVelocityY
+        let ts = timestamp ?? CACurrentMediaTime()
 
-            // Did the user drag all the way back past 0?
-            if (prevSign > 0 && rawStretch <= 0.0) || (prevSign < 0 && rawStretch >= 0.0) {
-                let canScrollBackIntoPage = (prevSign > 0)
-                    ? (!metrics.isAtBottomBoundary || metrics.maxScrollY > 1.0)
-                    : (!metrics.isAtTopBoundary || metrics.maxScrollY > 1.0)
-
-                if canScrollBackIntoPage {
-                    // Only the overshoot past the unwound stretch is real page scroll.
-                    let residual = rawStretch
-                    estimatedScrollY = clampScrollY(estimatedScrollY - residual)
-                    residualForwardDeltaY = residual
-                    rawStretch = 0.0
-                    motionState = .idle
-                    if case .pulling = ptrState {
-                        ptrState = .idle
-                    }
-                    applyVisualOffset(0.0)
-                    updateSpinnerPresentation(now: CACurrentMediaTime())
-                    stopDisplayLinkIfIdle()
-                    return false
-                }
-                // On a non-scrollable page (`maxScrollY == 0`), allow seamless elastic crossover
-                // from top stretch directly into bottom stretch!
+        if ignoreMomentumScrolls {
+            if momentumPhase == .ended || momentumPhase == .cancelled {
+                ignoreMomentumScrolls = false
+                momentumScrollInProgress = false
+                velocitySamples.removeAll(keepingCapacity: true)
             }
-
-            let visual = rubberBand(raw: rawStretch, dimension: effectiveDimension())
-            applyVisualOffset(visual)
-            evaluateDirectTouchPTR(visualOffset: visual, now: CACurrentMediaTime())
-            updateSpinnerPresentation(now: CACurrentMediaTime())
             return true
         }
 
-        // Not currently stretched: check if we should stay out of horizontal gestures.
-        if gestureLockedHorizontal {
-            return false
-        }
-        if abs(deltaX) > abs(deltaY) * 1.15 && abs(deltaX) > 1.0 {
-            gestureLockedHorizontal = true
-            return false
-        }
-
-        // Check boundary entry for direct-touch elastic pull.
-        if deltaY > 0.0, metrics.isAtTopBoundary {
-            rawStretch = deltaY
-            motionState = .directDrag
-            lastDirectDragVelocityY = smoothedVelocityY
-            let visual = rubberBand(raw: rawStretch, dimension: effectiveDimension())
-            applyVisualOffset(visual)
-            if metrics.isReloadableWebPage, case .idle = ptrState {
-                ptrState = .pulling
+        if momentumPhase == .ended || momentumPhase == .cancelled {
+            momentumScrollInProgress = false
+            ignoreMomentumScrolls = false
+            velocitySamples.removeAll(keepingCapacity: true)
+            let targetStretch = activeRefreshTargetStretchY
+            if abs(stretchY - targetStretch) > 0.01 && !isAnimatingRubberBand {
+                startRubberBandAnimation(
+                    initialScrollVelocityY: 0,
+                    initialStretchY: stretchY,
+                    targetStretchY: targetStretch,
+                    now: ts
+                )
             }
-            evaluateDirectTouchPTR(visualOffset: visual, now: CACurrentMediaTime())
-            updateSpinnerPresentation(now: CACurrentMediaTime())
-            return true
+            updateSpinnerPresentation(now: ts)
+            updateDisplayLinkRunningState()
+            updateInteractionState()
+            return isOverscrolling || isAnimatingRubberBand
         }
 
-        if deltaY < 0.0, metrics.isAtBottomBoundary {
-            rawStretch = deltaY
-            motionState = .directDrag
-            lastDirectDragVelocityY = smoothedVelocityY
-            let visual = rubberBand(raw: rawStretch, dimension: effectiveDimension())
-            applyVisualOffset(visual)
-            return true
+        momentumScrollInProgress = true
+        let scrollDY = -deltaY
+        recordVelocitySample(scrollDeltaY: scrollDY, timestamp: ts)
+        let scrollVelY = currentScrollVelocityY(fallbackScrollDeltaY: scrollDY)
+
+        guard scrollDY != 0 else {
+            return isOverscrolling || isAnimatingRubberBand
         }
 
-        // Normal in-bounds scrolling: track estimatedScrollY and let Chromium scroll natively.
-        estimatedScrollY = clampScrollY(estimatedScrollY - deltaY)
-        return false
-    }
-
-    // MARK: - Momentum Coast & Fling Overshoot Handling
-
-    func handleMomentumEvent(momentum: NSEvent.Phase, deltaY: CGFloat) -> Bool {
-        if momentum == .ended || momentum == .cancelled {
-            let wasLocked = (momentumLock != .none)
-            momentumLock = .none
-            if case .ptrMomentumUnwind = motionState {
-                if currentOverscrollY > Constants.settleEpsilon {
-                    beginSmoothPTRCollapseToZero(now: CACurrentMediaTime(), initialVelocity: min(0.0, smoothedVelocityY))
-                } else {
-                    resetToIdleRest()
-                }
-                return true
-            }
-            return wasLocked
-        }
-
-        // While pull-to-refresh is refreshing or dismissing:
-        // - Downward scroll momentum (`deltaY < 0`) smoothly unwinds the remaining PTR gap 1:1,
-        //   then hands off seamlessly at exact continuous velocity into Chromium page scrolling at y = 0.
-        // - Residual upward/pull-down momentum (`deltaY >= 0`) is cleanly absorbed while settling.
-        if isPTRRefreshingOrDismissing {
-            if currentOverscrollY > 0.25 {
-                if deltaY < 0.0 {
-                    momentumLock = .none
-                    ptrDismissedByUserScroll = true
-                    if case .spinning(let triggeredAt, _) = ptrState {
-                        ptrState = .dismissing(spinStartedAt: triggeredAt)
-                    }
-                    let nextY = currentOverscrollY + deltaY
-                    if nextY <= 0.0 {
-                        resetToIdleRest()
-                        // Only the part beyond the unwound overscroll is real page scroll.
-                        estimatedScrollY = clampScrollY(estimatedScrollY - nextY)
-                        residualForwardDeltaY = nextY
-                        return false
-                    }
-                    let now = CACurrentMediaTime()
-                    motionState = .ptrMomentumUnwind
-                    lastMomentumUnwindTime = now
-                    applyVisualOffset(nextY)
-                    updateSpinnerPresentation(now: now)
-                    ensureDisplayLinkRunning()
+        // 1. Already overhanging (e.g., unwinding Pull-to-Refresh hold or flicking while stretched):
+        if abs(stretchY) > 0.01 {
+            let opposesStretch = (stretchY < 0 && scrollDY > 0) || (stretchY > 0 && scrollDY < 0)
+            if opposesStretch {
+                rubberBandAnimation = nil
+                let remainingStretch = stretchY + scrollDY
+                let crossedZero = (stretchY < 0 && remainingStretch >= 0) || (stretchY > 0 && remainingStretch <= 0)
+                if !crossedZero {
+                    stretchScrollForceY = AppKitElasticity.hyperbolicReboundDelta(
+                        forElasticDelta: remainingStretch,
+                        coefficient: AppKitElasticity.defaultHyperbolicCoefficient,
+                        viewportLength: effectiveViewportLength
+                    )
+                    setStretchY(remainingStretch)
+                    updateSpinnerPresentation(now: ts)
+                    updateDisplayLinkRunningState()
+                    updateInteractionState()
                     return true
                 }
-                // Consume residual pull-down momentum so Chromium does not fight the settle/hold curve.
+
+                // Crossed zero: clear any active refresh hold cleanly and forward remainder into page scroll.
+                refreshState = .hidden
+                spinnerView?.render(state: .hidden)
+                setStretchY(0)
+                stretchScrollForceY = 0
+
+                if !metrics.isVerticallyScrollable && canStretchInScrollDirection(remainingStretch) {
+                    ignoreMomentumScrolls = true
+                    momentumScrollInProgress = false
+                    startRubberBandAnimation(
+                        initialScrollVelocityY: scrollVelY,
+                        initialStretchY: 0,
+                        targetStretchY: 0,
+                        now: ts
+                    )
+                    updateDisplayLinkRunningState()
+                    updateInteractionState()
+                    return true
+                }
+                if abs(remainingStretch) > 0.001 {
+                    residualForwardDeltaY = -remainingStretch
+                    estimatedScrollY = clampScrollY(estimatedScrollY + remainingStretch)
+                }
+                updateDisplayLinkRunningState()
+                updateInteractionState()
+                return false
+            } else {
+                ignoreMomentumScrolls = true
+                momentumScrollInProgress = false
+                if stretchY < 0 && metrics.isReloadableWebPage, case .hidden = refreshState {
+                    refreshState = .pullingMomentum
+                }
+                startRubberBandAnimation(
+                    initialScrollVelocityY: scrollVelY,
+                    initialStretchY: stretchY,
+                    targetStretchY: activeRefreshTargetStretchY,
+                    now: ts
+                )
+                updateSpinnerPresentation(now: ts)
+                updateDisplayLinkRunningState()
+                updateInteractionState()
                 return true
             }
-            momentumLock = .none
-            estimatedScrollY = clampScrollY(estimatedScrollY - deltaY)
+        }
+
+        // 2. In-bounds momentum scrolling toward top or bottom edge.
+        if !canStretchInScrollDirection(scrollDY) {
+            estimatedScrollY = clampScrollY(estimatedScrollY + scrollDY)
             return false
         }
 
-        // If a fling overshoot or PTR rebound already owns this momentum stream, consume
-        // same-direction residual events so Chromium does not fight our analytic spring.
-        switch momentumLock {
-        case .top:
-            if deltaY >= -0.5 { return true }
-            momentumLock = .none
-        case .bottom:
-            if deltaY <= 0.5 { return true }
-            momentumLock = .none
-        case .none:
-            break
-        }
-
-        // If already animating a bounce/rebound (e.g., lifted from direct drag into momentum),
-        // consume residual momentum events in the overshoot direction.
-        if abs(currentOverscrollY) > 0.25 {
-            if (currentOverscrollY > 0 && deltaY >= 0) || (currentOverscrollY < 0 && deltaY <= 0) {
-                momentumLock = currentOverscrollY > 0 ? .top : .bottom
+        if scrollDY < 0 {
+            if estimatedScrollY <= 0.5 {
+                estimatedScrollY = 0
+                ignoreMomentumScrolls = true
+                momentumScrollInProgress = false
+                if abs(scrollVelY) >= Parameters.minBounceImpactVelocity {
+                    if metrics.isReloadableWebPage, case .hidden = refreshState {
+                        refreshState = .pullingMomentum
+                    }
+                    startRubberBandAnimation(
+                        initialScrollVelocityY: scrollVelY,
+                        initialStretchY: 0,
+                        targetStretchY: activeRefreshTargetStretchY,
+                        now: ts
+                    )
+                }
+                logWheelStepIfEnabled(phase: 0, momentumPhase: momentumPhase.rawValue, wheelDY: deltaY)
+                updateSpinnerPresentation(now: ts)
+                updateDisplayLinkRunningState()
+                updateInteractionState()
                 return true
             }
-        }
-
-        // Guard against inner scrollable containers (e.g. Gemini chat pane, Gmail list).
-        if deltaY > 0.0 && metrics.canInnerScrollUp {
-            return false
-        }
-        if deltaY < 0.0 && metrics.canInnerScrollDown {
-            return false
-        }
-
-        // Edge arrival during a momentum fling: hand the fling's velocity to the overshoot spring and let this one
-        // event through, resized so the page lands exactly on the edge even when telemetry lags behind it.
-        if deltaY != 0.0, let arrival = edgeArrival(deltaY: deltaY, velocity: smoothedVelocityY) {
-            let lock: ConsumedMomentumLock = deltaY > 0.0 ? .top : .bottom
-            let impactV = smoothedVelocityY
-            if abs(impactV) >= Constants.minFlingVelocity, (impactV > 0.0) == (deltaY > 0.0) {
-                launchFlingOvershoot(impactVelocity: impactV, lock: lock)
-            } else {
-                momentumLock = lock
+            if estimatedScrollY + scrollDY < 0 {
+                let toEdgeScrollDY = -estimatedScrollY
+                estimatedScrollY = 0
+                residualForwardDeltaY = -toEdgeScrollDY
+                ignoreMomentumScrolls = true
+                momentumScrollInProgress = false
+                if abs(scrollVelY) >= Parameters.minBounceImpactVelocity {
+                    if metrics.isReloadableWebPage, case .hidden = refreshState {
+                        refreshState = .pullingMomentum
+                    }
+                    startRubberBandAnimation(
+                        initialScrollVelocityY: scrollVelY,
+                        initialStretchY: 0,
+                        targetStretchY: activeRefreshTargetStretchY,
+                        now: ts
+                    )
+                }
+                logWheelStepIfEnabled(phase: 0, momentumPhase: momentumPhase.rawValue, wheelDY: deltaY)
+                updateSpinnerPresentation(now: ts)
+                updateDisplayLinkRunningState()
+                updateInteractionState()
+                return false
             }
-            estimatedScrollY = deltaY > 0.0 ? 0.0 : metrics.maxScrollY
-            if arrival.alreadyAtEdge { return true }
-            residualForwardDeltaY = deltaY > 0.0 ? arrival.flush : -arrival.flush
+            estimatedScrollY = clampScrollY(estimatedScrollY + scrollDY)
+            logWheelStepIfEnabled(phase: 0, momentumPhase: momentumPhase.rawValue, wheelDY: deltaY)
             return false
-        }
-
-        estimatedScrollY = clampScrollY(estimatedScrollY - deltaY)
-        return false
-    }
-
-    // MARK: - Spring & Recoil Launchers
-
-    private func launchFlingOvershoot(impactVelocity: CGFloat, lock: ConsumedMomentumLock, allowsRefresh: Bool = true) {
-        let compressedV = compressImpactVelocity(impactVelocity)
-        momentumLock = lock
-        if ScrollDebugLog.isEnabled {
-            // Critically damped from rest at the edge: peak = v0 / (omega * e).
-            ScrollDebugLog.write(String(format: "overshoot lock=%@ impact=%.0f v0=%.0f peak=%.1f", String(describing: lock),
-                                        impactVelocity, compressedV, abs(compressedV) / CGFloat(Constants.flingOmega * M_E)))
-        }
-
-        // Top momentum fling overshoot drives the pull-to-refresh spinner visually,
-        // using the much harder `ptrFlingTriggerThreshold` (150pt) so normal flings
-        // show the spinner cleanly without accidental reloads.
-        if lock == .top && metrics.isReloadableWebPage && allowsRefresh {
-            if case .spinning = ptrState {
-                // Keep existing active refresh spinning.
-            } else {
-                ptrState = .flingPulling
-            }
         } else {
-            if case .pulling = ptrState { ptrState = .idle }
-            if case .flingPulling = ptrState { ptrState = .idle }
-            spinnerView?.render(state: .hidden)
-        }
-
-        motionState = .criticallyDamped(
-            startTime: CACurrentMediaTime(),
-            y0: currentOverscrollY,
-            v0: compressedV,
-            target: 0.0,
-            omega: Constants.flingOmega
-        )
-        ensureDisplayLinkRunning()
-    }
-
-    private func beginDirectReleaseRecoil() {
-        let now = CACurrentMediaTime()
-
-        // If PTR is currently spinning: either dismiss smoothly into scroll if user scrolled down,
-        // or smoothly settle to the measured 68pt hold offset.
-        if case .spinning(let triggeredAt, _) = ptrState {
-            let wantsDismiss = ptrDismissedByUserScroll
-                || lastDirectDragVelocityY < -160.0
-                || currentOverscrollY < Constants.ptrHoldOffset - 4.0
-            if wantsDismiss {
-                ptrState = .dismissing(spinStartedAt: triggeredAt)
-                ptrDismissedByUserScroll = true
-                momentumLock = .none
-                beginSmoothPTRCollapseToZero(now: now, initialVelocity: min(0.0, lastDirectDragVelocityY))
-                return
-            }
-
-            momentumLock = .top
-            motionState = .exponentialSnap(
-                startTime: now,
-                fromY: currentOverscrollY,
-                target: Constants.ptrHoldOffset,
-                rate: Constants.snapBackDecayRate
-            )
-            ensureDisplayLinkRunning()
-            return
-        }
-
-        // If PTR is already dismissing, preserve downward-scroll velocity cleanly to 0 without locking momentum.
-        if case .dismissing = ptrState {
-            momentumLock = .none
-            if currentOverscrollY <= Constants.settleEpsilon {
-                resetToIdleRest()
-            } else {
-                beginSmoothPTRCollapseToZero(now: now, initialVelocity: min(0.0, lastDirectDragVelocityY))
-            }
-            return
-        }
-
-        // Otherwise snap back to 0.
-        if abs(currentOverscrollY) <= Constants.settleEpsilon {
-            resetToIdleRest()
-            return
-        }
-
-        momentumLock = currentOverscrollY > 0 ? .top : .bottom
-
-        // If user flicked outward right as they lifted fingers, give a gentle critically damped crest
-        // without ever crossing into PTR trigger; otherwise use the exact measured k=11.7 recoil.
-        let sameDirectionOutward = (currentOverscrollY > 0 && lastDirectDragVelocityY > 220.0)
-            || (currentOverscrollY < 0 && lastDirectDragVelocityY < -220.0)
-
-        if sameDirectionOutward {
-            let carriedV = max(-1100.0, min(1100.0, lastDirectDragVelocityY * 0.28))
-            // Keep spinner visible during post-release crest with the hard fling trigger threshold.
-            if currentOverscrollY > 0 && metrics.isReloadableWebPage {
-                ptrState = .flingPulling
-            } else {
-                ptrState = .idle
-            }
-            motionState = .criticallyDamped(
-                startTime: now,
-                y0: currentOverscrollY,
-                v0: carriedV,
-                target: 0.0,
-                omega: Constants.flingOmega
-            )
-        } else {
-            motionState = .exponentialSnap(
-                startTime: now,
-                fromY: currentOverscrollY,
-                target: 0.0,
-                rate: Constants.snapBackDecayRate
-            )
-        }
-        ensureDisplayLinkRunning()
-    }
-
-    // MARK: - Pull-to-Refresh State Transitions
-
-    private func evaluateDirectTouchPTR(visualOffset: CGFloat, now: CFTimeInterval) {
-        guard metrics.isReloadableWebPage else {
-            ptrState = .idle
-            return
-        }
-
-        switch ptrState {
-        case .idle, .flingPulling:
-            if visualOffset > Constants.ptrRevealStart {
-                ptrState = .pulling
-            }
-
-        case .pulling:
-            if visualOffset >= Constants.ptrTriggerThreshold {
-                // Immediate trigger while fingers are still down (verified in `f_100111` F096 & F363).
-                ptrState = .spinning(triggeredAt: now, loadFinished: false)
-                ensureDisplayLinkRunning()
-                onTriggerRefresh?()
-            } else if visualOffset <= 0.5 {
-                ptrState = .idle
-            }
-
-        case .spinning, .dismissing:
-            break
-        }
-    }
-
-    private func markPTRLoadFinished() {
-        guard case .spinning(let triggeredAt, _) = ptrState else { return }
-        ptrState = .spinning(triggeredAt: triggeredAt, loadFinished: true)
-        ensureDisplayLinkRunning()
-    }
-
-    private var isPTRRefreshingOrDismissing: Bool {
-        switch ptrState {
-        case .spinning, .dismissing:
-            return true
-        case .idle, .pulling, .flingPulling:
-            return false
-        }
-    }
-
-    private func dismissPTRHoldSmoothly(now: CFTimeInterval) {
-        switch ptrState {
-        case .spinning(let triggeredAt, _):
-            beginPTRDismiss(spinStartedAt: triggeredAt, now: now)
-        case .dismissing:
-            if case .ptrHolding = motionState {
-                motionState = .exponentialSnap(
-                    startTime: now,
-                    fromY: currentOverscrollY,
-                    target: 0.0,
-                    rate: Constants.snapBackDecayRate
-                )
-                ensureDisplayLinkRunning()
-            }
-        case .idle, .pulling, .flingPulling:
-            break
-        }
-    }
-
-    private func beginPTRDismiss(spinStartedAt: CFTimeInterval, now: CFTimeInterval) {
-        ptrState = .dismissing(spinStartedAt: spinStartedAt)
-        beginSmoothPTRCollapseToZero(now: now, initialVelocity: 0.0)
-    }
-
-    /// Launches a monotonic, zero-overshoot critically damped glide to `0.0` preserving upward scroll velocity.
-    private func beginSmoothPTRCollapseToZero(now: CFTimeInterval, initialVelocity: CGFloat) {
-        let y0 = max(0.0, currentOverscrollY)
-        guard y0 > Constants.settleEpsilon else {
-            resetToIdleRest()
-            return
-        }
-        let omega = Constants.ptrDismissOmega
-        // Clamp negative velocity to `-omega * y0` so `c2 = v0 + omega * y0 >= 0` (mathematically zero overshoot past 0).
-        let clampedV0 = max(-CGFloat(omega) * y0, min(0.0, initialVelocity))
-        motionState = .criticallyDamped(
-            startTime: now,
-            y0: y0,
-            v0: clampedV0,
-            target: 0.0,
-            omega: omega
-        )
-        ensureDisplayLinkRunning()
-    }
-
-    // MARK: - 120Hz Display Link Tick
-
-    private func ensureDisplayLinkRunning() {
-        if let link = displayLink {
-            link.isPaused = false
-            return
-        }
-        guard let hostView = targetView else { return }
-        let link = hostView.displayLink(target: self, selector: #selector(handleDisplayLink(_:)))
-        // Ask for the panel's full rate: at a throttled 60 Hz the Space glide fed a 120 Hz page every other frame
-        // (visible judder) and the bounce stepped visibly.
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
-        link.add(to: .main, forMode: .common)
-        self.displayLink = link
-    }
-
-    private func stopDisplayLink() {
-        displayLink?.invalidate()
-        displayLink = nil
-    }
-
-    private func stopDisplayLinkIfIdle() {
-        if case .idle = motionState, case .idle = ptrState, spaceVelocityY == 0.0, !spaceStreamOpen {
-            displayLink?.isPaused = true
-        }
-    }
-
-    @objc private func handleDisplayLink(_ sender: CADisplayLink) {
-        let now = CACurrentMediaTime()
-
-        // 0. Space / Shift+Space momentum glide.
-        stepSpaceGlide(now: now)
-
-        // 1. Check PTR spinning completion / timeout.
-        if case .spinning(let triggeredAt, let loadFinished) = ptrState {
-            let elapsed = now - triggeredAt
-            let readyToDismiss = (loadFinished && elapsed >= Constants.ptrMinSpinDuration)
-                || (elapsed >= Constants.ptrMaxSpinTimeout)
-            if readyToDismiss {
-                // Only dismiss once fingers are lifted (not actively holding in .directDrag).
-                if case .directDrag = motionState {
-                    // Wait for finger release; once released, snap straight to 0.
-                    ptrState = .dismissing(spinStartedAt: triggeredAt)
-                } else {
-                    beginPTRDismiss(spinStartedAt: triggeredAt, now: now)
-                }
-            }
-        }
-
-        // 2. Step active motion curve analytically (exact at 60Hz, 120Hz ProMotion, or any dt).
-        switch motionState {
-        case .idle, .directDrag, .ptrHolding:
-            break
-
-        case .ptrMomentumUnwind:
-            // Safety fallback: if momentum stops without delivering `.ended`, glide smoothly to 0.
-            if (now - lastMomentumUnwindTime) > 0.08 {
-                if currentOverscrollY > Constants.settleEpsilon {
-                    beginSmoothPTRCollapseToZero(now: now, initialVelocity: 0.0)
-                } else {
-                    resetToIdleRest()
-                }
-            }
-
-        case .criticallyDamped(let startTime, let y0, let v0, let target, let omega):
-            let t = max(0.0, now - startTime)
-            let d0 = Double(y0 - target)
-            let v = Double(v0)
-            let e = exp(-omega * t)
-            let c1 = d0
-            let c2 = v + omega * d0
-            let disp = (c1 + c2 * t) * e
-            let vel = (c2 - omega * (c1 + c2 * t)) * e
-            let nextY = target + CGFloat(disp)
-
-            // Check extreme momentum fling PTR trigger (>= 162pt, very hard to reach intentionally).
-            if case .flingPulling = ptrState,
-               metrics.isReloadableWebPage,
-               nextY >= Constants.ptrFlingTriggerThreshold {
-                ptrState = .spinning(triggeredAt: now, loadFinished: false)
-                // Re-target the spring seamlessly onto the 68pt spinning hold shelf preserving velocity!
-                motionState = .criticallyDamped(
-                    startTime: now,
-                    y0: nextY,
-                    v0: CGFloat(vel),
-                    target: Constants.ptrHoldOffset,
-                    omega: omega
-                )
-                applyVisualOffset(nextY)
-                onTriggerRefresh?()
-            } else if target == 0.0 && y0 > 0.0 && nextY <= 0.0 && isPTRRefreshingOrDismissing {
-                finishMotionAt(target: 0.0)
-            } else if abs(nextY - target) < Constants.settleEpsilon && abs(vel) < 6.0 && t > 0.04 {
-                finishMotionAt(target: target)
-            } else {
-                applyVisualOffset(nextY)
-            }
-
-        case .exponentialSnap(let startTime, let fromY, let target, let rate):
-            let t = max(0.0, now - startTime)
-            let delta = Double(fromY - target) * exp(-rate * t)
-            let nextY = target + CGFloat(delta)
-
-            if abs(nextY - target) < Constants.settleEpsilon {
-                finishMotionAt(target: target)
-            } else {
-                applyVisualOffset(nextY)
-            }
-
-        case .demoPull(let startTime):
-            let t = max(0.0, now - startTime)
-            let pullDuration = 0.34
-            if t < pullDuration {
-                let u = t / pullDuration
-                // Smooth ease-out curve down to 112pt (past the 106pt trigger).
-                let eased = 1.0 - pow(1.0 - u, 3.0)
-                let y = CGFloat(eased) * 112.0
-                applyVisualOffset(y)
-                evaluateDirectTouchPTR(visualOffset: y, now: now)
-            } else {
-                // Release into PTR hold (68pt).
-                if case .pulling = ptrState {
-                    ptrState = .spinning(triggeredAt: now, loadFinished: false)
-                    onTriggerRefresh?()
-                }
-                motionState = .exponentialSnap(
-                    startTime: now,
-                    fromY: currentOverscrollY,
-                    target: Constants.ptrHoldOffset,
-                    rate: Constants.snapBackDecayRate
-                )
-            }
-        }
-
-        // 3. Update spinner visual state (pull frames, pop scale, 20fps spin, or fade-out).
-        updateSpinnerPresentation(now: now)
-        stopDisplayLinkIfIdle()
-    }
-
-    /// One frame of the Space glide: exact integral of v0*e^(-kt) over the frame, so a missed frame just carries its
-    /// share and the glide always travels exactly its distance.
-    func stepSpaceGlide(now: CFTimeInterval) {
-        if spaceVelocityY != 0.0 {
-            let dt = max(1.0 / 480.0, min(1.0 / 24.0, now - spaceLastTickTime))
-            spaceLastTickTime = now
-            let k = spaceFriction
-            let v0 = spaceVelocityY
-            let decay = CGFloat(exp(-Double(k) * dt))
-            var deltaY = (v0 / k) * (1.0 - decay)
-            var nextV = v0 * decay
-            if abs(nextV) / k < Self.spaceStopDistance {
-                deltaY += nextV / k      // send the last fraction now: the glide ends exactly on its distance
-                nextV = 0.0
-            }
-            spaceVelocityY = nextV
-            if ScrollDebugLog.isEnabled {
-                ScrollDebugLog.write(String(format: "space t=%.4f d=%.2f v=%.0f sy=%.1f est=%.1f ov=%.1f",
-                                            now, deltaY, v0, metrics.scrollY, estimatedScrollY, currentOverscrollY))
-            }
-            if spaceIsStartPage {
-                emitSpaceDelta(deltaY)
-            } else {
-                stepSpaceScroll(deltaY: deltaY, velocityY: v0, now: now)
-            }
-            if spaceVelocityY == 0.0 {
-                endSpaceStream()
-                spaceFriction = Self.spaceDecayRate
-            }
-        } else if spaceStreamOpen {
-            endSpaceStream()
-        }
-    }
-
-    /// One frame of a Space glide on a web page: PTR unwind, edge arrival + overshoot, or plain page scroll.
-    private func stepSpaceScroll(deltaY: CGFloat, velocityY: CGFloat, now: CFTimeInterval) {
-        // Space (down) while pull-to-refresh holds the page open: unwind the hold 1:1, then scroll the page.
-        if isPTRRefreshingOrDismissing, currentOverscrollY > 0.25 {
-            guard deltaY < 0.0 else { return }
-            ptrDismissedByUserScroll = true
-            if case .spinning(let triggeredAt, _) = ptrState {
-                ptrState = .dismissing(spinStartedAt: triggeredAt)
-            }
-            let nextY = currentOverscrollY + deltaY
-            if nextY <= 0.0 {
-                resetToIdleRest()
-                estimatedScrollY = clampScrollY(estimatedScrollY - nextY)
-                if abs(nextY) > 0.05 { emitSpaceDelta(nextY) }
-                return
-            }
-            motionState = .ptrMomentumUnwind
-            lastMomentumUnwindTime = now
-            applyVisualOffset(nextY)
-            updateSpinnerPresentation(now: now)
-            return
-        }
-
-        let movingUp = deltaY > 0.0
-        let innerCanScroll = movingUp ? metrics.canInnerScrollUp : metrics.canInnerScrollDown
-        if !innerCanScroll, let arrival = edgeArrival(deltaY: deltaY, velocity: velocityY) {
-            let firstFrame = !spaceStreamOpen
-            if firstFrame && arrival.alreadyAtEdge {
-                // Pressed while already on that edge: nothing to scroll, no bounce (Safari does not bounce here).
-                spaceStartedAtEdge = true
-                spaceVelocityY = 0.0
-                return
-            }
-            // Land exactly on the edge: `arrival.flush` covers at least the true remaining distance even when
-            // telemetry lags, and Chromium clamps any excess at the edge.
-            if arrival.flush > 0.05 {
-                emitSpaceDelta(movingUp ? arrival.flush : -arrival.flush)
-            }
-            estimatedScrollY = movingUp ? 0.0 : metrics.maxScrollY
-            spaceVelocityY = 0.0
-            endSpaceStream()
-            let bouncingSameWay = isOverscrolling && ((currentOverscrollY > 0) == movingUp)
-            if !spaceStartedAtEdge, !bouncingSameWay, abs(velocityY) >= Constants.minFlingVelocity {
-                // A burst of presses reaches speeds a trackpad rarely does; past ~9000 pt/s the bounce would swallow
-                // ~15% of the window, so the keyboard bounce tops out around 100 pt.
-                let impact = max(-Self.spaceMaxImpactVelocity, min(Self.spaceMaxImpactVelocity, velocityY))
-                launchFlingOvershoot(impactVelocity: impact, lock: movingUp ? .top : .bottom, allowsRefresh: false)
-            }
-            return
-        }
-
-        estimatedScrollY = clampScrollY(estimatedScrollY - deltaY)
-        emitSpaceDelta(deltaY)
-    }
-
-    /// Edge arrival test shared by trackpad momentum and the Space glide. `estimatedScrollY` (last renderer report
-    /// minus every delta sent since) is never ahead of the page, so `next <= edge` means this step reaches the edge.
-    /// The reported offset must also be within the distance telemetry can lag at this speed (~60 ms of travel), which
-    /// keeps a stale estimate (deltas the page swallowed) from bouncing a page that is still far from the edge.
-    /// `flush` = travel that is certain to land the page on the edge.
-    func edgeArrival(deltaY: CGFloat, velocity: CGFloat) -> (alreadyAtEdge: Bool, flush: CGFloat)? {
-        let step = abs(deltaY)
-        let lagAllowance = max(120.0, abs(velocity) * 0.06 + step * 2.0)
-        if deltaY > 0.0 {
-            if metrics.isAtTopBoundary { return (true, 0.0) }
-            let remaining = estimatedScrollY
-            guard remaining - step <= 0.0, metrics.scrollY <= lagAllowance else { return nil }
-            return (false, max(step, remaining))
-        }
-        if deltaY < 0.0 {
             let maxY = metrics.maxScrollY
-            if metrics.isAtBottomBoundary { return (true, 0.0) }
-            let remaining = maxY - estimatedScrollY
-            guard maxY > 2.0, remaining - step <= 0.0, maxY - metrics.scrollY <= lagAllowance else { return nil }
-            return (false, max(step, remaining))
+            if estimatedScrollY >= maxY - 0.5 {
+                estimatedScrollY = maxY
+                ignoreMomentumScrolls = true
+                momentumScrollInProgress = false
+                if abs(scrollVelY) >= Parameters.minBounceImpactVelocity {
+                    startRubberBandAnimation(
+                        initialScrollVelocityY: scrollVelY,
+                        initialStretchY: 0,
+                        targetStretchY: 0,
+                        now: ts
+                    )
+                }
+                logWheelStepIfEnabled(phase: 0, momentumPhase: momentumPhase.rawValue, wheelDY: deltaY)
+                updateDisplayLinkRunningState()
+                updateInteractionState()
+                return true
+            }
+            if estimatedScrollY + scrollDY > maxY {
+                let toEdgeScrollDY = maxY - estimatedScrollY
+                estimatedScrollY = maxY
+                residualForwardDeltaY = -toEdgeScrollDY
+                ignoreMomentumScrolls = true
+                momentumScrollInProgress = false
+                if abs(scrollVelY) >= Parameters.minBounceImpactVelocity {
+                    startRubberBandAnimation(
+                        initialScrollVelocityY: scrollVelY,
+                        initialStretchY: 0,
+                        targetStretchY: 0,
+                        now: ts
+                    )
+                }
+                logWheelStepIfEnabled(phase: 0, momentumPhase: momentumPhase.rawValue, wheelDY: deltaY)
+                updateDisplayLinkRunningState()
+                updateInteractionState()
+                return false
+            }
+            estimatedScrollY = clampScrollY(estimatedScrollY + scrollDY)
+            logWheelStepIfEnabled(phase: 0, momentumPhase: momentumPhase.rawValue, wheelDY: deltaY)
+            return false
         }
-        return nil
     }
 
-    private func finishMotionAt(target: CGFloat) {
-        applyVisualOffset(target)
+    // MARK: - Keyboard `Space` / `Shift+Space` Paging (`KeyboardScrollingAnimator` + Touchpad Spring & Momentum)
 
-        if abs(target) <= 0.1 {
-            resetToIdleRest()
-        } else if abs(target - Constants.ptrHoldOffset) <= 1.0, case .spinning = ptrState {
-            motionState = .ptrHolding
+    var currentSpaceMomentumChainForTesting: CGFloat { spaceMomentumChain }
+    var currentKeyboardVelocityForTesting: CGFloat { keyboardGlide?.currentScrollVelocityY ?? 0 }
+
+    func triggerSpaceScroll(
+        direction: Int,
+        isRepeat: Bool,
+        isStartPage: Bool = false,
+        timestamp: CFTimeInterval? = nil
+    ) {
+        guard direction != 0 else { return }
+        let scrollSign: CGFloat = direction < 0 ? 1.0 : -1.0 // +1 = down, -1 = up
+        let step = pageStepDistance(isStartPage: isStartPage)
+        guard step > 0 else { return }
+
+        if MotionPreference.reduced {
+            cancelKeyboardGlide(emitEnded: true)
+            let wheelStep = -scrollSign * step
+            onSyntheticScroll?(0, .began)
+            onSyntheticScroll?(wheelStep, .changed)
+            onSyntheticScroll?(0, .ended)
+            if !isStartPage {
+                estimatedScrollY = clampScrollY(estimatedScrollY + scrollSign * step)
+            }
+            return
+        }
+
+        let pinnedAtTop = !isStartPage && scrollSign < 0 && estimatedScrollY <= 0.5 && !metrics.canInnerScrollUp
+        let pinnedAtBottom = !isStartPage && scrollSign > 0 && estimatedScrollY >= metrics.maxScrollY - 0.5 && !metrics.canInnerScrollDown
+
+        // Once Space hits a top/bottom edge, stop key-repeat completely so holding Space never keeps
+        // re-bouncing or pumping the rubber-band animation at the boundary.
+        if isRepeat {
+            if spaceRepeatLatchedEdgeSign == scrollSign
+                || isAnimatingRubberBand
+                || isOverscrolling
+                || (keyboardGlide == nil && (pinnedAtTop || pinnedAtBottom)) {
+                return
+            }
+        } else if spaceRepeatLatchedEdgeSign != scrollSign {
+            spaceRepeatLatchedEdgeSign = 0
+        }
+
+        let now = timestamp ?? CACurrentMediaTime()
+        let gap = lastSpaceTriggerTime > 0 ? max(0, now - lastSpaceTriggerTime) : .infinity
+        let sameDirection = (lastSpaceScrollSign == scrollSign)
+        let continuesChain = sameDirection
+            && (keyboardGlide != nil || isAnimatingRubberBand || gap < Parameters.keyboardMomentumChainWindow)
+
+        if !continuesChain {
+            spaceMomentumChain = 0
+        } else if isRepeat {
+            let dtRepeat = min(max(gap.isFinite ? gap : 0.033, 0.016), 0.120)
+            spaceMomentumChain = min(
+                Parameters.keyboardMaxMomentumChain,
+                spaceMomentumChain + CGFloat(dtRepeat) * 2.4
+            )
         } else {
-            motionState = .idle
+            spaceMomentumChain = min(Parameters.keyboardMaxMomentumChain, spaceMomentumChain + 1.0)
+        }
+        lastSpaceTriggerTime = now
+        lastSpaceScrollSign = scrollSign
+
+        // Explicit non-repeat tap when already pinned at top/bottom edge: do one clean bounce (unless already
+        // bouncing in that direction) and latch edge-repeat suppression so holding from here won't repeat.
+        if !isStartPage && keyboardGlide == nil && (pinnedAtTop || pinnedAtBottom) {
+            spaceRepeatLatchedEdgeSign = scrollSign
+            let alreadyBouncingSameWay = (scrollSign < 0 && stretchY < -0.5) || (scrollSign > 0 && stretchY > 0.5)
+            guard !alreadyBouncingSameWay else { return }
+            refreshState = .hidden
+            spinnerView?.render(state: .hidden)
+            let impactSpeed = min(
+                Parameters.maxMomentumVelocity,
+                max(1_650.0, step * 2.4)
+            )
+            startRubberBandAnimation(
+                initialScrollVelocityY: scrollSign * impactSpeed,
+                initialStretchY: stretchY,
+                targetStretchY: 0,
+                now: now
+            )
+            updateDisplayLinkRunningState()
+            updateInteractionState()
+            return
+        }
+
+        if rubberBandAnimation != nil || isOverscrolling {
+            rubberBandAnimation = nil
+            refreshState = .hidden
+            spinnerView?.render(state: .hidden)
+            stretchScrollForceY = 0
+            setStretchY(0)
+        }
+
+        let signedStep = scrollSign * step
+
+        if var active = keyboardGlide {
+            if active.scrollSign == scrollSign {
+                if isRepeat {
+                    let dtRepeat = CGFloat(min(max(gap.isFinite ? gap : 0.033, 0.016), 0.120))
+                    let accelGain = 1.0 + 0.70 * spaceMomentumChain + 0.16 * spaceMomentumChain * spaceMomentumChain
+                    let targetCruiseSpeed = min(
+                        Parameters.maxMomentumVelocity,
+                        step * (2.8 + 1.45 * spaceMomentumChain)
+                    )
+                    let holdImpulse = signedStep * dtRepeat * 2.5 * accelGain
+                    let minCoastLead = targetCruiseSpeed / 3.8
+                    let maxHoldLead = max(minCoastLead, step * (1.35 + 0.85 * spaceMomentumChain))
+                    let advancedMag = max(abs(active.remainingScrollDeltaY + holdImpulse), minCoastLead)
+                    active.remainingScrollDeltaY = scrollSign * min(advancedMag, maxHoldLead)
+
+                    if scrollSign * active.currentScrollVelocityY < targetCruiseSpeed {
+                        active.currentScrollVelocityY = scrollSign * targetCruiseSpeed
+                    }
+                } else {
+                    let tapGain = 1.0 + 0.45 * spaceMomentumChain + 0.10 * spaceMomentumChain * spaceMomentumChain
+                    let maxQueued = step * Parameters.keyboardMaxQueuedPages
+                    let combined = active.remainingScrollDeltaY + signedStep * tapGain
+                    active.remainingScrollDeltaY = scrollSign * min(abs(combined), maxQueued)
+
+                    let velKick = signedStep * (2.6 + 0.90 * spaceMomentumChain)
+                    let boostedVel = active.currentScrollVelocityY + velKick
+                    active.currentScrollVelocityY = min(
+                        max(boostedVel, -Parameters.maxMomentumVelocity),
+                        Parameters.maxMomentumVelocity
+                    )
+                }
+            } else {
+                // Reversing direction mid-glide resets momentum and smoothly redirects in one continuous stream.
+                active.scrollSign = scrollSign
+                active.remainingScrollDeltaY = signedStep
+                active.currentScrollVelocityY = signedStep * Parameters.keyboardLaunchVelocityFactor
+                active.peakForwardSpeed = abs(active.currentScrollVelocityY)
+            }
+            active.isStartPage = isStartPage
+            active.peakForwardSpeed = max(active.peakForwardSpeed, abs(active.currentScrollVelocityY))
+            keyboardGlide = active
+        } else {
+            let tapGain: CGFloat = continuesChain
+                ? (1.0 + 0.45 * spaceMomentumChain + 0.10 * spaceMomentumChain * spaceMomentumChain)
+                : 1.0
+            let launchDelta = signedStep * tapGain
+            let launchVel = min(
+                max(
+                    signedStep * (Parameters.keyboardLaunchVelocityFactor + 0.90 * spaceMomentumChain),
+                    -Parameters.maxMomentumVelocity
+                ),
+                Parameters.maxMomentumVelocity
+            )
+            keyboardGlide = KeyboardGlideState(
+                lastFrameTime: now,
+                scrollSign: scrollSign,
+                remainingScrollDeltaY: launchDelta,
+                currentScrollVelocityY: launchVel,
+                peakForwardSpeed: abs(launchVel),
+                isStartPage: isStartPage,
+                emittedBegan: false
+            )
+        }
+
+        updateDisplayLinkRunningState()
+        updateInteractionState()
+    }
+
+    func pageStepDistance(isStartPage: Bool) -> CGFloat {
+        let inset = isStartPage ? 0 : max(0, obscuredTopInset)
+        let visibleHeight = max(1.0, effectiveViewportLength - inset)
+        return max(1.0, max(visibleHeight * Parameters.pageStepFraction, visibleHeight - Parameters.pageStepOverlap))
+    }
+
+    // MARK: - Deterministic 120 Hz Frame Step (`ScrollAnimationRubberBand` + `NSRefreshController`)
+
+    func stepAnimation(at timestamp: CFTimeInterval) {
+        // Check Pull-to-Refresh spin completion / safety timeout (`0.40s` min spin, `3.20s` max timeout).
+        if case .refreshing(let triggeredAt, let observed) = refreshState {
+            let spinElapsed = max(0, timestamp - triggeredAt)
+            let finishedNormally = observed && !metrics.isPageLoading && spinElapsed >= Parameters.refreshMinSpinDuration
+            let timedOut = spinElapsed >= Parameters.refreshMaxSpinTimeout
+            if finishedNormally || timedOut {
+                transitionRefreshToDismissing(now: timestamp, triggeredAt: triggeredAt)
+            }
+        }
+
+        if let rb = rubberBandAnimation {
+            let elapsed = max(0.0, timestamp - rb.startTime)
+            // WebKit `ScrollAnimationRubberBand.mm`:
+            // `relativeInitial = initialOverscroll - targetOverscroll`
+            // `offset = elasticDeltaForTimeDelta(relativeInitial, -initialVelocity, elapsed) + targetOverscroll`
+            let relativeInitial = rb.initialStretchY - rb.targetStretchY
+            let relativeStretch = AppKitElasticity.elasticDelta(
+                initialPosition: relativeInitial,
+                initialVelocity: -rb.initialScrollVelocityY,
+                elapsedTime: elapsed
+            )
+            let nextStretch = relativeStretch + rb.targetStretchY
+
+            let settled = elapsed > Parameters.rubberBandMinElapsedBeforeSettle
+                && abs(relativeStretch) < Parameters.rubberBandSettleEpsilon
+
+            if settled {
+                rubberBandAnimation = nil
+                setStretchY(rb.targetStretchY)
+                stretchScrollForceY = AppKitElasticity.hyperbolicReboundDelta(
+                    forElasticDelta: rb.targetStretchY,
+                    coefficient: AppKitElasticity.defaultHyperbolicCoefficient,
+                    viewportLength: effectiveViewportLength
+                )
+                if rb.targetStretchY == 0 {
+                    refreshState = .hidden
+                    spinnerView?.render(state: .hidden)
+                }
+            } else {
+                setStretchY(nextStretch)
+            }
+
+            if ScrollDebugLog.isEnabled {
+                ScrollDebugLog.write(String(
+                    format: "anim step t=%.3f v=0 sy=%.1f est=%.1f ov=%.1f",
+                    elapsed, metrics.scrollY, estimatedScrollY, currentOverscrollY
+                ))
+            }
+        }
+
+        if var glide = keyboardGlide {
+            let rawDt = timestamp - glide.lastFrameTime
+            let dt = min(max(rawDt > 0 ? rawDt : (1.0 / 120.0), 1.0 / 240.0), 0.050)
+            glide.lastFrameTime = timestamp
+
+            // Exact closed-form underdamped spring-damper step (`e = -remainingScrollDeltaY`, `v = currentScrollVelocityY`):
+            // accelerates smoothly like a touchpad flick, overshoots target slightly (~5.5%), and cushions back to 0.
+            let omega = Double(Parameters.keyboardSpringOmega)
+            let zeta = Double(Parameters.keyboardSpringZeta)
+            let zetaOmega = zeta * omega
+            let omegaD = omega * Foundation.sqrt(max(1e-6, 1.0 - zeta * zeta))
+
+            let e0 = -Double(glide.remainingScrollDeltaY)
+            let v0 = Double(glide.currentScrollVelocityY)
+            let a = e0
+            let b = (v0 + zetaOmega * e0) / omegaD
+            let env = Foundation.exp(-zetaOmega * dt)
+            let c = Foundation.cos(omegaD * dt)
+            let s = Foundation.sin(omegaD * dt)
+
+            let e1 = env * (a * c + b * s)
+            let v1 = env * ((b * omegaD - zetaOmega * a) * c - (a * omegaD + zetaOmega * b) * s)
+
+            var stepScrollDY = CGFloat(e1 - e0)
+            let newRemaining = CGFloat(-e1)
+            let instantVelY = CGFloat(v1)
+            glide.remainingScrollDeltaY = newRemaining
+            glide.currentScrollVelocityY = instantVelY
+            if glide.scrollSign * instantVelY > 0 {
+                glide.peakForwardSpeed = max(glide.peakForwardSpeed, abs(instantVelY))
+            }
+
+            let phase: SyntheticScrollPhase = glide.emittedBegan ? .changed : .began
+            glide.emittedBegan = true
+
+            var hitPinnedEdge = false
+            if !glide.isStartPage {
+                if stepScrollDY < 0 && !metrics.canInnerScrollUp && estimatedScrollY + stepScrollDY <= 0 {
+                    stepScrollDY = -estimatedScrollY
+                    estimatedScrollY = 0
+                    hitPinnedEdge = (glide.scrollSign < 0)
+                } else if stepScrollDY > 0 && !metrics.canInnerScrollDown && estimatedScrollY + stepScrollDY >= metrics.maxScrollY {
+                    stepScrollDY = metrics.maxScrollY - estimatedScrollY
+                    estimatedScrollY = metrics.maxScrollY
+                    hitPinnedEdge = (glide.scrollSign > 0)
+                } else {
+                    estimatedScrollY = clampScrollY(estimatedScrollY + stepScrollDY)
+                }
+            }
+
+            let settled = abs(glide.remainingScrollDeltaY) <= Parameters.keyboardSettleDistanceEpsilon
+                && abs(instantVelY) <= Parameters.keyboardSettleVelocityEpsilon
+
+            if hitPinnedEdge {
+                if abs(stepScrollDY) > 0.001 || phase == .began {
+                    onSyntheticScroll?(-stepScrollDY, phase)
+                }
+                onSyntheticScroll?(0, .ended)
+                keyboardGlide = nil
+                spaceRepeatLatchedEdgeSign = glide.scrollSign
+                spaceMomentumChain = 0
+                let minEdgeImpact = min(2_200.0, glide.peakForwardSpeed * 0.34)
+                let impactSpeed = max(abs(instantVelY), minEdgeImpact)
+                if impactSpeed >= Parameters.minBounceImpactVelocity {
+                    startRubberBandAnimation(
+                        initialScrollVelocityY: glide.scrollSign * impactSpeed,
+                        initialStretchY: 0,
+                        targetStretchY: 0,
+                        now: timestamp
+                    )
+                }
+            } else if settled {
+                let finalStep = stepScrollDY + glide.remainingScrollDeltaY
+                if !glide.isStartPage {
+                    estimatedScrollY = clampScrollY(estimatedScrollY + glide.remainingScrollDeltaY)
+                }
+                if abs(finalStep) > 0.001 || phase == .began {
+                    onSyntheticScroll?(-finalStep, phase)
+                }
+                onSyntheticScroll?(0, .ended)
+                keyboardGlide = nil
+            } else {
+                onSyntheticScroll?(-stepScrollDY, phase)
+                keyboardGlide = glide
+            }
+        }
+
+        updateSpinnerPresentation(now: timestamp)
+        updateDisplayLinkRunningState()
+        updateInteractionState()
+    }
+
+    // MARK: - Internal Stretch & Refresh Helpers
+
+    private var effectiveViewportLength: CGFloat {
+        if metrics.viewportHeight > 1 {
+            return max(Parameters.minViewportLength, metrics.viewportHeight)
+        }
+        if let viewH = targetView?.bounds.height, viewH > 1 {
+            return max(Parameters.minViewportLength, viewH)
+        }
+        return 800.0
+    }
+
+    private var activeRefreshTargetStretchY: CGFloat {
+        if case .refreshing = refreshState {
+            return -Parameters.refreshHoldOffset
+        }
+        return 0
+    }
+
+    private var isRefreshingSpinnerActive: Bool {
+        switch refreshState {
+        case .refreshing, .dismissing:
+            return true
+        case .hidden, .pullingDirect, .pullingMomentum:
+            return false
         }
     }
 
-    private func resetToIdleRest() {
-        motionState = .idle
-        ptrState = .idle
-        rawStretch = 0.0
-        momentumLock = .none
-        ptrDismissedByUserScroll = false
-        lastMomentumUnwindTime = 0.0
-        applyVisualOffset(0.0)
-        spinnerView?.render(state: .hidden)
-        stopDisplayLinkIfIdle()
+    private func clampScrollY(_ value: CGFloat) -> CGFloat {
+        min(max(0, value), metrics.maxScrollY)
     }
 
-    // MARK: - Spinner Presentation
+    private func canStretchInScrollDirection(_ scrollDY: CGFloat) -> Bool {
+        if scrollDY < 0 {
+            return !metrics.canInnerScrollUp && !gestureLatchedToInnerUp
+        }
+        if scrollDY > 0 {
+            return !metrics.canInnerScrollDown && !gestureLatchedToInnerDown
+        }
+        return false
+    }
+
+    private func clampStretch(_ stretch: CGFloat, viewportLength: CGFloat) -> CGFloat {
+        let limit = viewportLength * Parameters.maxStretchFraction
+        return min(max(stretch, -limit), limit)
+    }
+
+    private func applyGestureScrollDeltaY(
+        _ scrollDY: CGFloat,
+        viewportLength: CGFloat,
+        coefficient: CGFloat,
+        now: CFTimeInterval
+    ) -> Bool {
+        // 1. Already stretched: unwind 1:1 on opposing delta, or accumulate hyperbolic force in same direction.
+        if abs(stretchY) > 0.0001 {
+            let opposesStretch = (stretchY < 0 && scrollDY > 0) || (stretchY > 0 && scrollDY < 0)
+            if opposesStretch {
+                let remainingStretch = stretchY + scrollDY
+                let crossedZero = (stretchY < 0 && remainingStretch >= 0) || (stretchY > 0 && remainingStretch <= 0)
+                if !crossedZero {
+                    stretchScrollForceY = AppKitElasticity.hyperbolicReboundDelta(
+                        forElasticDelta: remainingStretch,
+                        coefficient: coefficient,
+                        viewportLength: viewportLength
+                    )
+                    setStretchY(remainingStretch)
+                    return true
+                }
+
+                refreshState = .hidden
+                spinnerView?.render(state: .hidden)
+                setStretchY(0)
+                stretchScrollForceY = 0
+
+                if !metrics.isVerticallyScrollable && canStretchInScrollDirection(remainingStretch) {
+                    stretchScrollForceY = remainingStretch
+                    let rawStretch = AppKitElasticity.hyperbolicElasticDelta(
+                        forReboundDelta: stretchScrollForceY,
+                        coefficient: coefficient,
+                        viewportLength: viewportLength
+                    )
+                    setStretchY(clampStretch(rawStretch, viewportLength: viewportLength))
+                    return true
+                }
+
+                if abs(remainingStretch) > 0.001 {
+                    residualForwardDeltaY = -remainingStretch
+                    estimatedScrollY = clampScrollY(estimatedScrollY + remainingStretch)
+                }
+                return false
+            } else {
+                stretchScrollForceY += scrollDY
+                let rawStretch = AppKitElasticity.hyperbolicElasticDelta(
+                    forReboundDelta: stretchScrollForceY,
+                    coefficient: coefficient,
+                    viewportLength: viewportLength
+                )
+                setStretchY(clampStretch(rawStretch, viewportLength: viewportLength))
+                evaluateDirectPullToRefresh(now: now)
+                return true
+            }
+        }
+
+        // 2. Not currently stretched: check inner-scroller latch and top/bottom edge boundaries.
+        guard canStretchInScrollDirection(scrollDY) else {
+            estimatedScrollY = clampScrollY(estimatedScrollY + scrollDY)
+            return false
+        }
+
+        if scrollDY < 0 {
+            if estimatedScrollY <= 0.5 {
+                estimatedScrollY = 0
+                stretchScrollForceY = scrollDY
+                let rawStretch = AppKitElasticity.hyperbolicElasticDelta(
+                    forReboundDelta: stretchScrollForceY,
+                    coefficient: coefficient,
+                    viewportLength: viewportLength
+                )
+                setStretchY(clampStretch(rawStretch, viewportLength: viewportLength))
+                evaluateDirectPullToRefresh(now: now)
+                return true
+            }
+            if estimatedScrollY + scrollDY < 0 {
+                let toEdgeScrollDY = -estimatedScrollY
+                let excessScrollDY = scrollDY - toEdgeScrollDY
+                estimatedScrollY = 0
+                residualForwardDeltaY = -toEdgeScrollDY
+                stretchScrollForceY = excessScrollDY
+                let rawStretch = AppKitElasticity.hyperbolicElasticDelta(
+                    forReboundDelta: stretchScrollForceY,
+                    coefficient: coefficient,
+                    viewportLength: viewportLength
+                )
+                setStretchY(clampStretch(rawStretch, viewportLength: viewportLength))
+                evaluateDirectPullToRefresh(now: now)
+                return false
+            }
+            estimatedScrollY = clampScrollY(estimatedScrollY + scrollDY)
+            return false
+        } else {
+            let maxY = metrics.maxScrollY
+            if estimatedScrollY >= maxY - 0.5 {
+                estimatedScrollY = maxY
+                stretchScrollForceY = scrollDY
+                let rawStretch = AppKitElasticity.hyperbolicElasticDelta(
+                    forReboundDelta: stretchScrollForceY,
+                    coefficient: coefficient,
+                    viewportLength: viewportLength
+                )
+                setStretchY(clampStretch(rawStretch, viewportLength: viewportLength))
+                return true
+            }
+            if estimatedScrollY + scrollDY > maxY {
+                let toEdgeScrollDY = maxY - estimatedScrollY
+                let excessScrollDY = scrollDY - toEdgeScrollDY
+                estimatedScrollY = maxY
+                residualForwardDeltaY = -toEdgeScrollDY
+                stretchScrollForceY = excessScrollDY
+                let rawStretch = AppKitElasticity.hyperbolicElasticDelta(
+                    forReboundDelta: stretchScrollForceY,
+                    coefficient: coefficient,
+                    viewportLength: viewportLength
+                )
+                setStretchY(clampStretch(rawStretch, viewportLength: viewportLength))
+                return false
+            }
+            estimatedScrollY = clampScrollY(estimatedScrollY + scrollDY)
+            return false
+        }
+    }
+
+    // MARK: - Pull-to-Refresh (`NSRefreshController` + `PullToRefreshView`)
+
+    private func evaluateDirectPullToRefresh(now: CFTimeInterval) {
+        guard metrics.isReloadableWebPage, stretchY < 0 else { return }
+        switch refreshState {
+        case .hidden, .pullingMomentum:
+            if gestureBeganAtTop {
+                refreshState = .pullingDirect
+            } else {
+                return
+            }
+        case .pullingDirect:
+            break
+        case .refreshing, .dismissing:
+            return
+        }
+
+        if currentOverscrollY >= Parameters.refreshTriggerOffset {
+            refreshState = .refreshing(triggeredAt: now, pageLoadObserved: metrics.isPageLoading)
+            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+            onTriggerRefresh?()
+        }
+    }
+
+    private func transitionRefreshToDismissing(now: CFTimeInterval, triggeredAt: CFTimeInterval) {
+        refreshState = .dismissing(triggeredAt: triggeredAt)
+        if !inScrollGesture {
+            startRubberBandAnimation(
+                initialScrollVelocityY: 0,
+                initialStretchY: stretchY,
+                targetStretchY: 0,
+                now: now
+            )
+        }
+        updateDisplayLinkRunningState()
+    }
 
     private func updateSpinnerPresentation(now: CFTimeInterval) {
         guard let spinner = spinnerView else { return }
+        let y = currentOverscrollY
 
-        switch ptrState {
-        case .idle:
+        switch refreshState {
+        case .hidden:
             spinner.render(state: .hidden)
 
-        case .pulling:
-            let y = currentOverscrollY
-            if y <= Constants.ptrRevealStart {
+        case .pullingDirect:
+            if y <= Parameters.refreshRevealOffset {
                 spinner.render(state: .hidden)
             } else {
-                let progress = (y - Constants.ptrRevealStart) / (Constants.ptrTriggerThreshold - Constants.ptrRevealStart)
-                let opacity = (y - Constants.ptrRevealStart) / (Constants.ptrFullOpacityOffset - Constants.ptrRevealStart)
+                let progress = (y - Parameters.refreshRevealOffset)
+                    / (Parameters.refreshTriggerOffset - Parameters.refreshRevealOffset)
+                let opacity = (y - Parameters.refreshRevealOffset)
+                    / (Parameters.refreshFullOpacityOffset - Parameters.refreshRevealOffset)
                 spinner.render(state: .pulling(progress: progress, opacity: opacity))
             }
 
-        case .flingPulling:
-            let y = currentOverscrollY
-            if y <= Constants.ptrRevealStart {
+        case .pullingMomentum:
+            if y <= Parameters.refreshRevealOffset {
                 spinner.render(state: .hidden)
             } else {
-                let progress = (y - Constants.ptrRevealStart) / (Constants.ptrFlingTriggerThreshold - Constants.ptrRevealStart)
-                let opacity = (y - Constants.ptrRevealStart) / (Constants.ptrFullOpacityOffset - Constants.ptrRevealStart)
+                let progress = (y - Parameters.refreshRevealOffset)
+                    / (Parameters.refreshFlingProgressDenominator - Parameters.refreshRevealOffset)
+                let opacity = (y - Parameters.refreshRevealOffset)
+                    / (Parameters.refreshFullOpacityOffset - Parameters.refreshRevealOffset)
                 spinner.render(state: .pulling(progress: progress, opacity: opacity))
             }
 
-        case .spinning(let triggeredAt, _):
-            let y = currentOverscrollY
-            let elapsed = max(0.0, now - triggeredAt)
-            let popScale = computePopScale(elapsed: elapsed)
-            let frameIdx = Int(floor(elapsed * Constants.ptrSpinFPS))
-            renderCollapsingSpinner(spinner: spinner, overscrollY: y, baseScale: popScale, frameIdx: frameIdx)
-
-        case .dismissing(let spinStartedAt):
-            let y = currentOverscrollY
-            let elapsed = max(0.0, now - spinStartedAt)
-            let popScale = computePopScale(elapsed: elapsed)
-            let frameIdx = Int(floor(elapsed * Constants.ptrSpinFPS))
-            renderCollapsingSpinner(spinner: spinner, overscrollY: y, baseScale: popScale, frameIdx: frameIdx)
+        case .refreshing(let triggeredAt, _), .dismissing(let triggeredAt):
+            let elapsed = max(0, now - triggeredAt)
+            let popScale = refreshPopScale(elapsed: elapsed)
+            let frameIdx = Int(floor(elapsed * Parameters.refreshSpinFPS))
+            if y <= Parameters.refreshFadeLowOffset {
+                spinner.render(state: .hidden)
+            } else if y >= Parameters.refreshFadeHighOffset {
+                spinner.render(state: .spinning(popScale: popScale, opacity: 1.0, shiftUp: 0.0), spinFrameIndex: frameIdx)
+            } else {
+                let u = max(0, min(1, (y - Parameters.refreshFadeLowOffset)
+                    / (Parameters.refreshFadeHighOffset - Parameters.refreshFadeLowOffset)))
+                let smoothOpacity = u * u * (3.0 - 2.0 * u)
+                let tuckScale = 0.74 + 0.26 * u
+                let shiftUp = (1.0 - u) * 14.0
+                spinner.render(
+                    state: .spinning(popScale: popScale * tuckScale, opacity: smoothOpacity, shiftUp: shiftUp),
+                    spinFrameIndex: frameIdx
+                )
+            }
         }
     }
 
-    /// Renders the spinning PTR indicator with smoothstep opacity, subtle tuck scale, and upward glide
-    /// as the gap collapses (`66 → 22 pt`), so it melts cleanly out of the way before the page reaches it.
-    private func renderCollapsingSpinner(
-        spinner: PullToRefreshView,
-        overscrollY y: CGFloat,
-        baseScale: CGFloat,
-        frameIdx: Int
+    private func refreshPopScale(elapsed: TimeInterval) -> CGFloat {
+        if elapsed >= Parameters.refreshPopDuration { return 1.0 }
+        let extra = Parameters.refreshPopPeakScale - 1.0
+        if elapsed < Parameters.refreshPopPeakTime {
+            let u = elapsed / Parameters.refreshPopPeakTime
+            return 1.0 + extra * CGFloat(Foundation.sin(u * .pi * 0.5))
+        }
+        let u = (elapsed - Parameters.refreshPopPeakTime)
+            / (Parameters.refreshPopDuration - Parameters.refreshPopPeakTime)
+        return 1.0 + extra * CGFloat(0.5 * (1.0 + Foundation.cos(u * .pi)))
+    }
+
+    // MARK: - Animation Launch & Layer Translation
+
+    private func startRubberBandAnimation(
+        initialScrollVelocityY: CGFloat,
+        initialStretchY: CGFloat,
+        targetStretchY: CGFloat,
+        now: CFTimeInterval = CACurrentMediaTime()
     ) {
-        if y <= Constants.ptrFadeOutLow {
-            spinner.render(state: .hidden)
-            return
-        }
-        if y >= Constants.ptrFadeOutHigh {
-            spinner.render(state: .spinning(popScale: baseScale, opacity: 1.0, shiftUp: 0.0), spinFrameIndex: frameIdx)
-            return
-        }
-        let rawT = max(0.0, min(1.0, (y - Constants.ptrFadeOutLow) / (Constants.ptrFadeOutHigh - Constants.ptrFadeOutLow)))
-        let smoothOpacity = rawT * rawT * (3.0 - 2.0 * rawT)
-        let tuckScale = 0.74 + 0.26 * rawT
-        let shiftUp = (1.0 - rawT) * 14.0
-        spinner.render(
-            state: .spinning(popScale: baseScale * tuckScale, opacity: smoothOpacity, shiftUp: shiftUp),
-            spinFrameIndex: frameIdx
+        let clampedVel = min(
+            max(initialScrollVelocityY, -Parameters.maxMomentumVelocity),
+            Parameters.maxMomentumVelocity
         )
-    }
-
-    /// Measured pop bounce (`f_100111` F363..F372): `1.0 → 1.28×` in 55ms, then smooth `1.28× → 1.0` by 155ms.
-    func computePopScale(elapsed: Double) -> CGFloat {
-        if elapsed >= Constants.ptrPopDuration { return 1.0 }
-        let peakExtra = Constants.ptrPopPeakScale - 1.0
-        if elapsed < Constants.ptrPopPeakTime {
-            let u = elapsed / Constants.ptrPopPeakTime
-            let eased = sin(u * .pi * 0.5)
-            return 1.0 + peakExtra * CGFloat(eased)
-        } else {
-            let u = (elapsed - Constants.ptrPopPeakTime) / (Constants.ptrPopDuration - Constants.ptrPopPeakTime)
-            let eased = 0.5 * (1.0 + cos(u * .pi))
-            return 1.0 + peakExtra * CGFloat(eased)
-        }
-    }
-
-    // MARK: - Pure Math & GPU Layer Application
-
-    private var isCurrentlyInDirectDrag: Bool {
-        if case .directDrag = motionState { return true }
-        return false
-    }
-
-    private func effectiveDimension() -> CGFloat {
-        let h = targetView?.bounds.height ?? metrics.viewportHeight
-        return max(Constants.minRubberBandDimension, h)
-    }
-
-    /// Apple asymptotic rubber-band curve: strictly monotonic & invertible.
-    func rubberBand(raw: CGFloat, dimension D: CGFloat) -> CGFloat {
-        let sign: CGFloat = raw >= 0 ? 1.0 : -1.0
-        let absRaw = abs(raw)
-        let c = Constants.rubberBandSlope
-        let stretched = (c * absRaw * D) / (D + c * absRaw)
-        let maxAllowed = D * Constants.maxStretchFraction
-        return sign * min(stretched, maxAllowed)
-    }
-
-    /// Exact inverse of `rubberBand(raw:dimension:)` for zero-jump mid-air bounce catching.
-    func inverseRubberBand(visual: CGFloat, dimension D: CGFloat) -> CGFloat {
-        let sign: CGFloat = visual >= 0 ? 1.0 : -1.0
-        let maxVisual = D * Constants.maxStretchFraction * 0.98
-        let y = min(abs(visual), maxVisual)
-        let denom = max(1.0, Constants.rubberBandSlope * (D - y))
-        return sign * (y * D) / denom
-    }
-
-    /// Progressively compresses incoming momentum velocity so normal/fast/hard flings produce
-    /// natural Safari overshoot (`38–152 pt`, spinner visible, zero accidental reload) and only
-    /// an extreme max-effort slam (`>= 22,000 pt/s`) crosses `ptrFlingTriggerThreshold` (`162 pt`).
-    func compressImpactVelocity(_ v: CGFloat) -> CGFloat {
-        let vMax = Double(Constants.maxFlingVelocity)
-        let vScale = Double(Constants.flingVelocityCompressionScale)
-        return CGFloat(vMax * tanh(Double(v) / vScale))
-    }
-
-    func updateVelocityEstimate(deltaY: CGFloat, timestamp: TimeInterval, isBegin: Bool) {
-        if isBegin {
-            velocitySamples.removeAll(keepingCapacity: true)
-            smoothedVelocityY = 0.0
+        let relStretch = initialStretchY - targetStretchY
+        guard abs(relStretch) > 0.01 || abs(clampedVel) >= Parameters.minBounceImpactVelocity else {
+            rubberBandAnimation = nil
+            setStretchY(targetStretchY)
+            stretchScrollForceY = AppKitElasticity.hyperbolicReboundDelta(
+                forElasticDelta: targetStretchY,
+                coefficient: AppKitElasticity.defaultHyperbolicCoefficient,
+                viewportLength: effectiveViewportLength
+            )
+            updateDisplayLinkRunningState()
+            return
         }
 
-        // Prune samples older than 48ms (or any stale gap > 120ms).
-        if let last = velocitySamples.last, (timestamp - last.timestamp) > 0.12 {
-            velocitySamples.removeAll(keepingCapacity: true)
+        rubberBandAnimation = RubberBandAnimationState(
+            startTime: now,
+            initialStretchY: initialStretchY,
+            initialScrollVelocityY: clampedVel,
+            targetStretchY: targetStretchY
+        )
+
+        if ScrollDebugLog.isEnabled && abs(clampedVel) > 0 {
+            let peakStretch = AppKitElasticity.elasticDelta(
+                initialPosition: relStretch,
+                initialVelocity: -clampedVel,
+                elapsedTime: 0.080
+            ) + targetStretchY
+            let edge = (clampedVel < 0 || initialStretchY < 0) ? "top" : "bottom"
+            ScrollDebugLog.write(String(
+                format: "rubberBand criticallyDamped edge=%@ sy=%.1f est=%.1f v0=%.0f peak=%.1f ov=%.1f",
+                edge, metrics.scrollY, estimatedScrollY, -clampedVel, -peakStretch, currentOverscrollY
+            ))
         }
-        velocitySamples.append(VelocitySample(timestamp: timestamp, deltaY: deltaY))
-        let cutoff = timestamp - 0.048
-        while velocitySamples.count > 1 && velocitySamples[0].timestamp < cutoff {
+
+        updateDisplayLinkRunningState()
+    }
+
+    private func cancelKeyboardGlide(emitEnded: Bool) {
+        spaceMomentumChain = 0
+        lastSpaceTriggerTime = 0
+        lastSpaceScrollSign = 0
+        spaceRepeatLatchedEdgeSign = 0
+        guard let glide = keyboardGlide else { return }
+        keyboardGlide = nil
+        if emitEnded && glide.emittedBegan {
+            onSyntheticScroll?(0, .ended)
+        }
+        updateDisplayLinkRunningState()
+    }
+
+    private func updatePredominantGestureAxisIsVertical(
+        scrollDX: CGFloat,
+        scrollDY: CGFloat,
+        timestamp: TimeInterval
+    ) -> Bool {
+        if lastGestureTimestamp > 0 {
+            let dt = max(0, timestamp - lastGestureTimestamp)
+            let decay = CGFloat(Foundation.exp(-dt / Parameters.axisLockDecayTimeConstant))
+            cumulativeGestureDelta.x *= decay
+            cumulativeGestureDelta.y *= decay
+        }
+        lastGestureTimestamp = timestamp
+        cumulativeGestureDelta.x += abs(scrollDX)
+        cumulativeGestureDelta.y += abs(scrollDY)
+        return cumulativeGestureDelta.y >= cumulativeGestureDelta.x
+    }
+
+    private func recordVelocitySample(scrollDeltaY: CGFloat, timestamp: TimeInterval) {
+        if let last = velocitySamples.last {
+            let gap = timestamp - last.timestamp
+            if gap >= Parameters.velocityZeroingTimeout || gap < -0.001 {
+                velocitySamples.removeAll(keepingCapacity: true)
+            }
+        }
+        velocitySamples.append(VelocitySample(timestamp: timestamp, scrollDeltaY: scrollDeltaY))
+        let cutoff = timestamp - Parameters.velocityWindowDuration
+        while velocitySamples.count > 2, let first = velocitySamples.first, first.timestamp < cutoff {
             velocitySamples.removeFirst()
         }
+    }
 
-        // Integrate total displacement over a minimum 28ms denominator so coalesced 1ms trackpad
-        // event bursts can NEVER artificially spike velocity!
-        var totalDelta: CGFloat = 0.0
-        for s in velocitySamples {
-            totalDelta += s.deltaY
+    private func currentScrollVelocityY(fallbackScrollDeltaY: CGFloat) -> CGFloat {
+        guard let last = velocitySamples.last else {
+            return fallbackScrollDeltaY / CGFloat(Parameters.minVelocitySampleDuration)
         }
-        let rawSpan = timestamp - (velocitySamples.first?.timestamp ?? timestamp)
-        let effectiveSpan = max(0.028, rawSpan)
-        smoothedVelocityY = totalDelta / CGFloat(effectiveSpan)
+        if velocitySamples.count >= 2, let first = velocitySamples.first {
+            let span = last.timestamp - first.timestamp
+            if span > 0 {
+                var sumDelta: CGFloat = 0
+                for idx in 1..<velocitySamples.count {
+                    sumDelta += velocitySamples[idx].scrollDeltaY
+                }
+                let effectiveSpan = max(span, Parameters.minVelocitySampleDuration * Double(velocitySamples.count - 1))
+                return sumDelta / CGFloat(effectiveSpan)
+            }
+        }
+        return fallbackScrollDeltaY / CGFloat(Parameters.minVelocitySampleDuration)
     }
 
-    func clampScrollY(_ y: CGFloat) -> CGFloat {
-        max(0.0, min(metrics.maxScrollY, y))
+    private func setStretchY(_ newStretchY: CGFloat) {
+        let sanitized = newStretchY.isFinite ? newStretchY : 0
+        guard abs(sanitized - stretchY) > 0.0001 || (sanitized == 0 && stretchY != 0) else { return }
+        stretchY = sanitized
+        applyLayerTranslation()
     }
 
-    /// Applies the visual overscroll shift strictly via GPU `CALayer.transform` — ZERO Auto Layout
-    /// or `NSView.frame.size` mutation, ZERO Chromium IPC resize/reflow!
-    func applyVisualOffset(_ offset: CGFloat) {
-        let clamped = abs(offset) < 0.01 ? 0.0 : offset
-        currentOverscrollY = clamped
-
+    private func applyLayerTranslation() {
         guard let tv = targetView else { return }
         if tv.layer == nil { tv.wantsLayer = true }
         guard let layer = tv.layer else { return }
 
-        // Positive `offset` = top overscroll → move page DOWN on screen.
-        // In AppKit non-flipped coordinates (`isFlipped == false`), `-Y` is DOWN and `+Y` is UP.
+        let offset = currentOverscrollY
+        // Positive `offset` = top overscroll -> move `webContentHost` DOWN on screen.
+        // In AppKit non-flipped coordinates (`contentStageView.isFlipped == false`), `-Y` is DOWN and `+Y` is UP!
         let sign: CGFloat = (tv.superview?.isFlipped == true) ? 1.0 : -1.0
-        let ty = sign * clamped
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        if clamped == 0.0 {
+        if abs(offset) < 0.01 {
             layer.transform = CATransform3DIdentity
         } else {
-            layer.transform = CATransform3DMakeTranslation(0.0, ty, 0.0)
+            layer.transform = CATransform3DMakeTranslation(0, sign * offset, 0)
         }
         CATransaction.commit()
+    }
+
+    private func updateInteractionState() {
+        let active = isOverscrolling || isAnimatingRubberBand || isAnimatingKeyboardScroll || isRefreshingSpinnerActive
+        if active != isElasticInteractionActive {
+            isElasticInteractionActive = active
+            onElasticInteractionChanged?(active)
+        }
+    }
+
+    // MARK: - 120 Hz Display Link
+
+    private func updateDisplayLinkRunningState() {
+        let needsTick = (rubberBandAnimation != nil) || (keyboardGlide != nil) || isRefreshingSpinnerActive
+        guard needsTick else {
+            displayLink?.isPaused = true
+            return
+        }
+        if displayLink == nil, let view = targetView {
+            let link = view.displayLink(target: self, selector: #selector(handleDisplayLinkTick(_:)))
+            if #available(macOS 14.0, *) {
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
+            }
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+        }
+        displayLink?.isPaused = false
+    }
+
+    private func tearDownDisplayLink() {
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+
+    @objc private func handleDisplayLinkTick(_ link: CADisplayLink) {
+        stepAnimation(at: link.timestamp)
+    }
+
+    private func logWheelStepIfEnabled(phase: UInt, momentumPhase: UInt, wheelDY: CGFloat) {
+        guard ScrollDebugLog.isEnabled else { return }
+        let vel = currentScrollVelocityY(fallbackScrollDeltaY: -wheelDY)
+        ScrollDebugLog.write(String(
+            format: "wheel ph=%lu mp=%lu dy=%.1f v=%.0f sy=%.1f est=%.1f ov=%.1f",
+            phase, momentumPhase, wheelDY, -vel, metrics.scrollY, estimatedScrollY, currentOverscrollY
+        ))
     }
 }

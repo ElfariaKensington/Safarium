@@ -578,7 +578,7 @@ final class CompactTabAddressBarTests: HermeticTestCase {
         // with where a placeholder would actually be laid out.
         load([item("a", active: true), item("p", pinned: true), item("b")])
         let total = 4
-        let fill = bar.computeFillWidth(forSlotCount: total)
+        _ = bar.computeFillWidth(forSlotCount: total)
         bar.updateExternalDropPlaceholder(tabID: "ext", insertionIndex: 1)
         spinRunLoop(0.4) // let the 0.28 s track-width animation finish before reading geometry
         container.layoutSubtreeIfNeeded()
@@ -776,6 +776,44 @@ final class CompactTabAddressBarTests: HermeticTestCase {
         bar.isSidebarOpen = false
     }
 
+    func testFocusRingRemainsHiddenDuringTabAnimationAndDelaysTransitionAfterCompletion() {
+        load([item("a", active: true)])
+        bar.beginExternalAnimation()
+        bar.focusAddressBar()
 
+        XCTAssertTrue(bar.isDeferringFocusRingForTesting)
+        XCTAssertEqual(bar.focusRingModelOpacityForTesting, 0.0, accuracy: 0.001)
+        XCTAssertNil(bar.focusRingScheduledDelayForTesting)
 
+        bar.endExternalAnimation()
+        XCTAssertFalse(bar.isDeferringFocusRingForTesting)
+        XCTAssertEqual(bar.focusRingModelOpacityForTesting, 1.0, accuracy: 0.001)
+        guard let scheduledDelay = bar.focusRingScheduledDelayForTesting else {
+            return XCTFail("Expected delayed safariFocusRing animation after tab animation completion")
+        }
+        XCTAssertGreaterThan(scheduledDelay, 0.06)
+        XCTAssertLessThanOrEqual(scheduledDelay, 0.16)
+    }
+
+    func testStartingNewTabAnimationCancelsPendingDelayedFocusRing() {
+        load([item("a", active: true)])
+        bar.beginExternalAnimation()
+        bar.focusAddressBar()
+        bar.endExternalAnimation()
+        XCTAssertNotNil(bar.focusRingScheduledDelayForTesting)
+
+        bar.beginExternalAnimation()
+        XCTAssertEqual(bar.focusRingModelOpacityForTesting, 0.0, accuracy: 0.001)
+        XCTAssertNil(bar.focusRingScheduledDelayForTesting)
+        bar.endExternalAnimation()
+    }
+
+    func testOffscreenAnimatedUpdateNeverLeavesStuckFocusRingDeferral() {
+        load([item("a", active: true)])
+        bar.update(items: [item("a"), item("b", active: true)], animated: true)
+        XCTAssertFalse(bar.isDeferringFocusRingForTesting)
+        bar.focusAddressBar()
+        XCTAssertEqual(bar.focusRingModelOpacityForTesting, 1.0, accuracy: 0.001)
+        XCTAssertNotNil(bar.focusRingScheduledDelayForTesting)
+    }
 }

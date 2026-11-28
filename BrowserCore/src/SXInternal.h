@@ -122,6 +122,9 @@ class SXBrowserClient;
 - (void)handleDownloadUpdated:(SXDownloadItem *)item;
 - (nullable SXBrowserTab *)handlePopupRequestURL:(NSURL *)url
                                      userGesture:(BOOL)userGesture;
+- (BOOL)handleOpenRequestURL:(NSURL *)url
+                 disposition:(SXWindowOpenDisposition)disposition
+                 userGesture:(BOOL)userGesture;
 - (void)handleHostViewVisibilityChanged:(BOOL)hidden;
 - (void)handleHostViewFrameChanged;
 - (int)chromiumBrowserIdentifier;

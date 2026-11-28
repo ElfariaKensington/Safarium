@@ -30,6 +30,16 @@ final class TabOverviewView: NSView, NSSearchFieldDelegate {
     var onDismiss: (() -> Void)?
     var onPresentationStateChanged: ((Bool) -> Void)?
 
+    /// Height of the toolbar + optional Separate Tab Strip trimmed off full-bleed snapshots so overview cards align 1:1.
+    var toolbarTopInsetPoints: CGFloat = SafariMetrics.toolbarHeight {
+        didSet {
+            guard abs(toolbarTopInsetPoints - oldValue) > 0.1 else { return }
+            for card in cardViews.values {
+                card.setToolbarTopInsetPoints(toolbarTopInsetPoints)
+            }
+        }
+    }
+
     private(set) var isPresented: Bool = false
     private(set) var transitionProgress: CGFloat = 1.0
     private(set) var zoomRect: NSRect = .zero
@@ -219,7 +229,17 @@ final class TabOverviewView: NSView, NSSearchFieldDelegate {
     func updateSnapshot(_ image: NSImage?, forTabID id: String) {
         if let idx = cards.firstIndex(where: { $0.id == id }) {
             let old = cards[idx]
-            cards[idx] = CardModel(id: old.id, title: old.title, url: old.url, favicon: old.favicon, snapshot: image, isActive: old.isActive)
+            cards[idx] = CardModel(
+                id: old.id,
+                title: old.title,
+                url: old.url,
+                favicon: old.favicon,
+                snapshot: image,
+                isActive: old.isActive,
+                frameSurface: old.frameSurface,
+                frameSize: old.frameSize,
+                liveLayer: old.liveLayer
+            )
         }
         cardViews[id]?.setSnapshot(image)
     }
@@ -591,6 +611,7 @@ final class TabOverviewView: NSView, NSSearchFieldDelegate {
         let newCard = TabOverviewCardView(
             model: model,
             isDarkMode: isDarkMode,
+            toolbarTopInsetPoints: toolbarTopInsetPoints,
             onSelect: {},
             onClose: {}
         )
@@ -664,6 +685,7 @@ final class TabOverviewView: NSView, NSSearchFieldDelegate {
                 model: model,
                 isDarkMode: isDarkMode,
                 showCloseButton: allowClose,
+                toolbarTopInsetPoints: toolbarTopInsetPoints,
                 onSelect: { [weak self] in
                     self?.closeAnimated(
                         selectingTabID: model.id,
@@ -880,10 +902,15 @@ private final class TabOverviewCardView: NSView, NSGestureRecognizerDelegate {
         layer?.shadowRadius = selected ? 18 : 12
     }
 
+    func setToolbarTopInsetPoints(_ points: CGFloat) {
+        snapshotView.toolbarTopInsetPoints = points
+    }
+
     init(
         model: TabOverviewView.CardModel,
         isDarkMode: Bool,
         showCloseButton: Bool = true,
+        toolbarTopInsetPoints: CGFloat = SafariMetrics.toolbarHeight,
         onSelect: @escaping () -> Void,
         onClose: @escaping () -> Void
     ) {
@@ -950,6 +977,7 @@ private final class TabOverviewCardView: NSView, NSGestureRecognizerDelegate {
 
         snapshotView.translatesAutoresizingMaskIntoConstraints = false
         // Every page (native and web) is drawn behind the toolbar now, so every snapshot carries the toolbar band.
+        snapshotView.toolbarTopInsetPoints = toolbarTopInsetPoints
         snapshotView.trimsToolbarTopInset = true
         if let surface = model.frameSurface, model.frameSize.width > 1 {
             snapshotView.setFrameSurface(surface, size: model.frameSize)
@@ -1083,6 +1111,13 @@ private final class EdgeToEdgeTopSnapshotView: NSView {
         didSet { layoutImageLayer() }
     }
 
+    var toolbarTopInsetPoints: CGFloat = SafariMetrics.toolbarHeight {
+        didSet {
+            guard abs(toolbarTopInsetPoints - oldValue) > 0.1 else { return }
+            layoutImageLayer()
+        }
+    }
+
     var snapshotImage: NSImage? {
         didSet { updateImageContents() }
     }
@@ -1160,8 +1195,9 @@ private final class EdgeToEdgeTopSnapshotView: NSView {
         }
         // Snapshots are full-bleed (the page runs behind the toolbar); the overview's page rect starts below the
         // toolbar, so the toolbar band is trimmed to line the card up exactly with the live page.
-        let topTrimFraction: CGFloat = (trimsToolbarTopInset && imagePointSize.height > SafariMetrics.toolbarHeight + 100.0)
-            ? min(0.25, SafariMetrics.toolbarHeight / imagePointSize.height)
+        let trimPoints = max(0.0, toolbarTopInsetPoints)
+        let topTrimFraction: CGFloat = (trimsToolbarTopInset && trimPoints > 0.5 && imagePointSize.height > trimPoints + 100.0)
+            ? min(0.30, trimPoints / imagePointSize.height)
             : 0.0
         let visibleH = imagePointSize.height * (1.0 - topTrimFraction)
         let scale = max(bounds.width / imagePointSize.width, bounds.height / max(1.0, visibleH))

@@ -174,6 +174,14 @@ SX_EXPORT
 
 #pragma mark - Tab Delegate
 
+typedef NS_ENUM(NSInteger, SXWindowOpenDisposition) {
+  SXWindowOpenDispositionNewTabDefault = 0,
+  SXWindowOpenDispositionNewForegroundTab = 1,
+  SXWindowOpenDispositionNewBackgroundTab = 2,
+  SXWindowOpenDispositionNewWindow = 3,
+  SXWindowOpenDispositionOffTheRecord = 4,
+};
+
 /// Delegate callbacks delivered on the main thread for a Chromium browser tab.
 @protocol SXBrowserTabDelegate <NSObject>
 @optional
@@ -247,6 +255,14 @@ SX_EXPORT
 - (nullable SXBrowserTab *)browserTab:(SXBrowserTab *)tab
                   requestNewTabWithURL:(NSURL *)url
                            userGesture:(BOOL)userGesture;
+
+/// Link or popup open request carrying Chromium's window open disposition (middle-click, Cmd-click, target=_blank).
+/// Return YES when handled by the host shell so the originating tab does not navigate.
+- (BOOL)browserTab:(SXBrowserTab *)tab
+    requestOpenURL:(NSURL *)url
+       disposition:(SXWindowOpenDisposition)disposition
+       userGesture:(BOOL)userGesture
+    NS_SWIFT_NAME(browserTab(_:requestOpenURL:disposition:userGesture:));
 
 /// Fired when the user presses Cmd+Left / Cmd+Right on a non-editable region of the webpage.
 - (void)browserTabDidRequestNavigateBack:(SXBrowserTab *)tab;
@@ -450,6 +466,9 @@ SX_EXPORT
 
 /// Resets visual-viewport pinch scale back to 1.0 (e.g. for Cmd+0).
 - (void)resetPageScale;
+/// Probes inner-scroller capability at a top-down CSS viewport point so stationary-cursor trackpad gestures inside
+/// Shadow-DOM or newly opened modals update `canInnerScrollUp/Down` before elastic overscroll claims the gesture.
+- (void)probeScrollStateAtCSSPoint:(NSPoint)point;
 
 /// Applies Safari-style sub-1.0 rubber-band overshoot scale on the web content layer
 /// when closing a pinch past 100% (`scale` in ~[0.78, 1.0]).

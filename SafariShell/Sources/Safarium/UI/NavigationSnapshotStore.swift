@@ -41,6 +41,7 @@ final class NavigationSnapshotStore {
         let logicalSize: CGSize
         let backingScale: CGFloat
         let backgroundColor: NSColor
+        let isFullBleedBehindToolbar: Bool
         var lastAccess: CFTimeInterval
     }
 
@@ -78,7 +79,8 @@ final class NavigationSnapshotStore {
         entryID: Int,
         logicalSize: CGSize,
         backingScale: CGFloat,
-        backgroundColor: NSColor?
+        backgroundColor: NSColor?,
+        isFullBleedBehindToolbar: Bool = true
     ) {
         guard !data.isEmpty, entryID != 0, logicalSize.width >= 32, logicalSize.height >= 32 else { return }
         let key = Key(tabID: tabID, entryID: entryID)
@@ -94,6 +96,7 @@ final class NavigationSnapshotStore {
             logicalSize: logicalSize,
             backingScale: max(1.0, backingScale),
             backgroundColor: bg,
+            isFullBleedBehindToolbar: isFullBleedBehindToolbar,
             lastAccess: now
         )
         totalWarmBytes += data.count
@@ -156,7 +159,8 @@ final class NavigationSnapshotStore {
                 let payload = NavigationSnapshotPayload(
                     image: img,
                     logicalSize: warm.logicalSize,
-                    backgroundColor: warm.backgroundColor
+                    backgroundColor: warm.backgroundColor,
+                    isFullBleedBehindToolbar: warm.isFullBleedBehindToolbar
                 )
                 self.lock.lock()
                 // Only cache if warm entry still exists and matches this data length.
@@ -195,7 +199,8 @@ final class NavigationSnapshotStore {
         let payload = NavigationSnapshotPayload(
             image: img,
             logicalSize: warm.logicalSize,
-            backgroundColor: warm.backgroundColor
+            backgroundColor: warm.backgroundColor,
+            isFullBleedBehindToolbar: warm.isFullBleedBehindToolbar
         )
         lock.lock()
         hotEntries[key] = HotEntry(payload: payload, lastAccess: now)

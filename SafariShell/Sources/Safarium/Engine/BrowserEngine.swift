@@ -54,6 +54,14 @@ struct BrowserDownloadItem: Identifiable {
 }
 
 /// Delegate callbacks from a single browser tab engine instance (delivered on main thread).
+enum TabOpenDisposition: Equatable {
+    case newTabDefault
+    case newForegroundTab
+    case newBackgroundTab
+    case newWindow
+    case offTheRecord
+}
+
 protocol BrowserTabEngineDelegate: AnyObject {
     func tabEngine(_ tab: BrowserTabEngine, didChangeURL url: URL?)
     func tabEngine(_ tab: BrowserTabEngine, didChangeTitle title: String)
@@ -72,6 +80,7 @@ protocol BrowserTabEngineDelegate: AnyObject {
     func tabEngine(_ tab: BrowserTabEngine, didUpdateOverscrollY overscrollY: CGFloat, armed: Bool)
     func tabEngineDidTriggerPullToRefresh(_ tab: BrowserTabEngine)
     func tabEngine(_ tab: BrowserTabEngine, didRequestNewTabWithURL url: URL)
+    func tabEngine(_ tab: BrowserTabEngine, didRequestOpenURL url: URL, disposition: TabOpenDisposition)
     func tabEngine(_ tab: BrowserTabEngine, didStartDownload item: BrowserDownloadItem)
     func tabEngine(_ tab: BrowserTabEngine, didUpdateDownload item: BrowserDownloadItem)
     func tabEngine(_ tab: BrowserTabEngine, didFailLoad error: BrowserPageLoadError)
@@ -96,7 +105,10 @@ extension BrowserTabEngineDelegate {
     func tabEngine(_ tab: BrowserTabEngine, didUpdatePageScale pageScale: CGFloat, isPinching: Bool) {}
     func tabEngine(_ tab: BrowserTabEngine, didUpdateOverscrollY overscrollY: CGFloat, armed: Bool) {}
     func tabEngineDidTriggerPullToRefresh(_ tab: BrowserTabEngine) {}
-    func tabEngine(_ tab: BrowserTabEngine, didRequestNewTabWithURL url: URL) {}
+    func tabEngine(_ tab: BrowserTabEngine, didRequestNewTabWithURL url: URL) {
+        tabEngine(tab, didRequestOpenURL: url, disposition: .newTabDefault)
+    }
+    func tabEngine(_ tab: BrowserTabEngine, didRequestOpenURL url: URL, disposition: TabOpenDisposition) {}
     func tabEngine(_ tab: BrowserTabEngine, didStartDownload item: BrowserDownloadItem) {}
     func tabEngine(_ tab: BrowserTabEngine, didUpdateDownload item: BrowserDownloadItem) {}
     func tabEngine(_ tab: BrowserTabEngine, didFailLoad error: BrowserPageLoadError) {}
@@ -272,6 +284,7 @@ protocol BrowserTabEngine: AnyObject {
     func endPageOvershoot()
     func resetOverscroll()
     func setScrollInteractionActive(_ active: Bool)
+    func probeScrollState(atCSSPoint point: NSPoint)
     func startDownload(at url: URL)
     func captureSnapshot(completion: @escaping (NSImage?) -> Void)
     func setPreviewSnapshotPaused(_ paused: Bool)
@@ -330,6 +343,7 @@ extension BrowserTabEngine {
     func endPageOvershoot() {}
     func resetOverscroll() {}
     func setScrollInteractionActive(_ active: Bool) {}
+    func probeScrollState(atCSSPoint point: NSPoint) {}
     func startDownload(at url: URL) {}
     func setPreviewSnapshotPaused(_ paused: Bool) {}
     func prewarmOrigin(_ url: URL) {}

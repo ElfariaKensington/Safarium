@@ -549,6 +549,11 @@ final class ChromiumTabAdapter: NSObject, BrowserTabEngine, SXBrowserTabDelegate
         sxTab?.setScrollInteractionActive(active)
     }
 
+    func probeScrollState(atCSSPoint point: NSPoint) {
+        guard !isNativeInternalPage else { return }
+        sxTab?.probeScrollState(atCSSPoint: point)
+    }
+
     func startDownload(at url: URL) {
         sxTab?.startDownload(at: url)
     }
@@ -985,8 +990,33 @@ final class ChromiumTabAdapter: NSObject, BrowserTabEngine, SXBrowserTabDelegate
     }
 
     func browserTab(_ tab: SXBrowserTab, requestNewTabWith url: URL, userGesture: Bool) -> SXBrowserTab? {
-        delegate?.tabEngine(self, didRequestNewTabWithURL: url)
+        delegate?.tabEngine(self, didRequestOpenURL: url, disposition: .newTabDefault)
         return nil
+    }
+
+    func browserTab(
+        _ tab: SXBrowserTab,
+        requestOpenURL url: URL,
+        disposition: SXWindowOpenDisposition,
+        userGesture: Bool
+    ) -> Bool {
+        let mapped: TabOpenDisposition
+        switch disposition {
+        case .newForegroundTab:
+            mapped = .newForegroundTab
+        case .newBackgroundTab:
+            mapped = .newBackgroundTab
+        case .newWindow:
+            mapped = .newWindow
+        case .offTheRecord:
+            mapped = .offTheRecord
+        case .newTabDefault:
+            mapped = .newTabDefault
+        @unknown default:
+            mapped = .newTabDefault
+        }
+        delegate?.tabEngine(self, didRequestOpenURL: url, disposition: mapped)
+        return delegate != nil
     }
 
     func browserTabDidRequestNavigateBack(_ tab: SXBrowserTab) {

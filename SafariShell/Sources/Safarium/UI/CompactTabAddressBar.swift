@@ -165,6 +165,7 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
     private var hasLaidOutOnce = false
     private var lastLayoutBoundsWidth: CGFloat = 0
     private var lastStructureSig: String = ""
+    private var lastAnimatedSlotCount: Int = 0
     private var lastActiveTabID: String = ""
     private var lastTrackBgColor: CGColor?
     private var lastActiveTargetFrame: NSRect = .zero
@@ -1234,6 +1235,10 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
         endFocusRingDeferral()
     }
 
+    var isDeferringFocusRingForTesting: Bool { isDeferringFocusRing }
+    var focusRingModelOpacityForTesting: Float { focusRingOverlay.modelOpacityForTesting }
+    var focusRingScheduledDelayForTesting: CFTimeInterval? { focusRingOverlay.scheduledAnimationDelayForTesting }
+
     private func beginFocusRingDeferral() {
         activeLayoutAnimationCount += 1
         if isEditingAddress {
@@ -1265,7 +1270,13 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
         pendingAnimatedFocusRing = false
         let pillFrame = lastActiveTargetFrame.width > 10 ? lastActiveTargetFrame : activePillSurfaceView.frame
         let geom = focusRingGeometry(forPillFrame: pillFrame)
-        focusRingOverlay.setFocusRing(frame: geom.rect, lineWidth: geom.lineWidth, visible: true, animated: shouldAnimate)
+        focusRingOverlay.setFocusRing(
+            frame: geom.rect,
+            lineWidth: geom.lineWidth,
+            visible: true,
+            animated: shouldAnimate,
+            delay: shouldAnimate ? 0.12 : 0.0
+        )
     }
 
     private func updateActiveFocusRing(forFrame f: NSRect, editing: Bool, animated: Bool, delay: CFTimeInterval = 0.0) {
@@ -1539,6 +1550,14 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
 
         let visible = displayedItems
         let totalSlots = effectiveSlotCount
+        let prevSlotCount = lastAnimatedSlotCount
+        lastAnimatedSlotCount = totalSlots
+        let isClosingTab = prevSlotCount > 0 && totalSlots < prevSlotCount
+        let layoutDuration: TimeInterval = isClosingTab ? 0.21 : 0.24
+        let layoutCurve = isClosingTab
+            ? CAMediaTimingFunction(controlPoints: 0.22, 0.92, 0.26, 1.0)
+            : CAMediaTimingFunction(controlPoints: 0.20, 0.90, 0.25, 1.0)
+
         let targetW = computeFillWidth(forSlotCount: totalSlots)
         let targetCenterX = computeTrackCenterOffset(slotCount: totalSlots, trackWidth: targetW)
 
@@ -1551,14 +1570,17 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
         let defaultAnimate = (window?.isVisible == true) && bounds.width > 1.0 && !(window?.inLiveResize ?? true) && hasLaidOutOnce && structureChanged
         let shouldAnimate = forceAnimated ?? defaultAnimate
 
+        let prevActiveID = lastActiveTabID
+        let prevActiveFrame = activePillSurfaceView.frame
+
         let widthChanged = abs((trackWidthConstraint?.constant ?? 0) - targetW) > 0.5
         let centerChanged = abs((trackCenterXConstraint?.constant ?? 0) - targetCenterX) > 0.5
         if widthChanged || centerChanged {
             if shouldAnimate && (window?.isVisible == true) && bounds.width > 1.0 {
                 beginFocusRingDeferral()
                 NSAnimationContext.runAnimationGroup({ ctx in
-                    ctx.duration = 0.28
-                    ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.25, 0.1, 0.25, 1.0)
+                    ctx.duration = layoutDuration
+                    ctx.timingFunction = layoutCurve
                     ctx.allowsImplicitAnimation = true
                     trackWidthConstraint?.animator().constant = targetW
                     trackCenterXConstraint?.animator().constant = targetCenterX
@@ -1600,7 +1622,20 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
                 self.handleInactiveTabMouseDown(view: v, tabID: tid, event: ev)
             }
             trackHostView.addSubview(v, positioned: .below, relativeTo: activePillSurfaceView)
-            v.alphaValue = shouldAnimate ? 0.0 : 1.0
+            if shouldAnimate && tab.id == prevActiveID && prevActiveFrame.width > 20 {
+                // Demoted active tab was already visible on screen: start at its actual slot geometry so it
+                // narrows smoothly in place instead of vanishing to width 0 and regrowing.
+                let startSlot = NSRect(
+                    x: max(0, prevActiveFrame.minX - 2.5),
+                    y: 0,
+                    width: prevActiveFrame.width + 5.0,
+                    height: SafariMetrics.tabPillHeight
+                )
+                setFrameNow(v, startSlot)
+                v.alphaValue = 0.65
+            } else {
+                v.alphaValue = shouldAnimate ? 0.0 : 1.0
+            }
             inactiveTabViews.append(v)
         }
 
@@ -1609,8 +1644,8 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
         //    so the user clearly sees the CURRENT tab closing (never feeling like the left tab was closed).
         // 2. Glide `activePillSurfaceView` smoothly from the promoted tab's former slot into its new target slot.
         if let promoted = reusable.removeValue(forKey: activeTabID) {
-            let oldActiveFrame = activePillSurfaceView.frame
-            let prevActiveWasClosed = !visible.contains(where: { $0.id == lastActiveTabID }) && !lastActiveTabID.isEmpty && lastActiveTabID != activeTabID
+            let oldActiveFrame = prevActiveFrame
+            let prevActiveWasClosed = !visible.contains(where: { $0.id == prevActiveID }) && !prevActiveID.isEmpty && prevActiveID != activeTabID
 
             if shouldAnimate && prevActiveWasClosed && oldActiveFrame.width > 20 && compactDraggingTabId != activeTabID {
                 let ghost = NSView(frame: oldActiveFrame)
@@ -1624,11 +1659,20 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
                 trackHostView.addSubview(ghost, positioned: .below, relativeTo: activePillSurfaceView)
                 let collapsedX = oldActiveFrame.minX > promoted.frame.minX ? oldActiveFrame.maxX : oldActiveFrame.minX
                 let collapsedFrame = NSRect(x: collapsedX, y: oldActiveFrame.minY, width: 0, height: oldActiveFrame.height)
+                if let gLayer = ghost.layer {
+                    let fade = CABasicAnimation(keyPath: "opacity")
+                    fade.fromValue = 1.0
+                    fade.toValue = 0.0
+                    fade.duration = 0.14
+                    fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    fade.fillMode = .forwards
+                    fade.isRemovedOnCompletion = false
+                    gLayer.add(fade, forKey: "ghostCloseFade")
+                }
                 NSAnimationContext.runAnimationGroup({ ctx in
-                    ctx.duration = 0.20
-                    ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.25, 0.1, 0.25, 1.0)
+                    ctx.duration = layoutDuration
+                    ctx.timingFunction = layoutCurve
                     ghost.animator().frame = collapsedFrame
-                    ghost.animator().alphaValue = 0.0
                 }, completionHandler: {
                     ghost.removeFromSuperview()
                 })
@@ -1652,11 +1696,26 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
         }
         lastActiveTabID = activeTabID
 
-        // Closed / torn-off inactive tabs fade out smoothly over 0.18s (or disappear instantly if torn off)
+        // Closed inactive tabs collapse along the exact slot curve while clearing text opacity early (0.13s)
+        // so neighboring labels never overlap during the slide.
         for (goneID, gone) in reusable {
             if shouldAnimate && goneID != hiddenDraggedTabID {
+                gone.wantsLayer = true
+                let collapseFrame = NSRect(x: gone.frame.minX, y: gone.frame.minY, width: 0, height: gone.frame.height)
+                if let goneLayer = gone.layer {
+                    let fade = CABasicAnimation(keyPath: "opacity")
+                    fade.fromValue = Float(gone.alphaValue)
+                    fade.toValue = 0.0
+                    fade.duration = 0.13
+                    fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    fade.fillMode = .forwards
+                    fade.isRemovedOnCompletion = false
+                    goneLayer.add(fade, forKey: "inactiveTabCloseFade")
+                }
                 NSAnimationContext.runAnimationGroup({ ctx in
-                    ctx.duration = 0.18
+                    ctx.duration = layoutDuration
+                    ctx.timingFunction = layoutCurve
+                    gone.animator().frame = collapseFrame
                     gone.animator().alphaValue = 0.0
                 }, completionHandler: {
                     gone.removeFromSuperview()
@@ -1666,7 +1725,12 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
             }
         }
 
-        layoutSlots(animated: shouldAnimate, targetTrackWidth: targetW)
+        layoutSlots(
+            animated: shouldAnimate,
+            targetTrackWidth: targetW,
+            duration: layoutDuration,
+            timingFunction: layoutCurve
+        )
         hasLaidOutOnce = true
     }
 
@@ -1679,11 +1743,17 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
         v.frame = f
     }
 
-    private func layoutSlots(animated: Bool, targetTrackWidth: CGFloat? = nil) {
+    private func layoutSlots(
+        animated: Bool,
+        targetTrackWidth: CGFloat? = nil,
+        duration: TimeInterval = 0.24,
+        timingFunction: CAMediaTimingFunction = CAMediaTimingFunction(controlPoints: 0.20, 0.90, 0.25, 1.0)
+    ) {
+        let canAnimate = animated && (window?.isVisible == true) && bounds.width > 1.0
         let w = targetTrackWidth ?? ((trackWidthConstraint?.constant ?? 0) > 10 ? (trackWidthConstraint?.constant ?? bounds.width) : max(310, bounds.width))
         let h: CGFloat = SafariMetrics.tabPillHeight
         let trackRect = NSRect(x: 0, y: 0, width: w, height: h)
-        if !animated {
+        if !canAnimate {
             trackBgView.frame = trackRect
         }
         focusRingOverlay.frame = trackRect
@@ -1728,15 +1798,15 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
         var inactiveIdx = 0
         var curX: CGFloat = 0
         var animatedFrames: [(NSView, NSRect)] = []
-        if animated && abs(trackBgView.frame.width - trackRect.width) > 0.5 {
+        if canAnimate && abs(trackBgView.frame.width - trackRect.width) > 0.5 {
             animatedFrames.append((trackBgView, trackRect))
         }
         defer {
             if !animatedFrames.isEmpty {
                 beginFocusRingDeferral()
                 NSAnimationContext.runAnimationGroup({ ctx in
-                    ctx.duration = 0.28
-                    ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.25, 0.1, 0.25, 1.0)
+                    ctx.duration = duration
+                    ctx.timingFunction = timingFunction
                     for (v, f) in animatedFrames {
                         v.animator().frame = f
                         v.animator().alphaValue = 1.0
@@ -1777,13 +1847,13 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
                     progressBarHostView.layer?.cornerRadius = f.height * 0.5
                     hdrHighlightView.cornerRadius = f.height * 0.5
                     if compactDraggingTabId != tab.id {
-                        if animated {
+                        if canAnimate {
                             animatedFrames.append((activePillSurfaceView, f))
                         } else {
                             setFrameNow(activePillSurfaceView, f)
                         }
                     }
-                    if animated {
+                    if canAnimate {
                         if isEditingAddress {
                             pendingAnimatedFocusRing = true
                         }
@@ -1798,7 +1868,7 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
                         let v = inactiveTabViews[inactiveIdx]
                         let f = NSRect(x: curX, y: 0, width: max(20, slotW), height: h)
                         if compactDraggingTabId != tab.id {
-                            if animated {
+                            if canAnimate {
                                 if v.frame.width < 1 { v.frame = NSRect(x: f.minX, y: 0, width: 0, height: h) }
                                 animatedFrames.append((v, f))
                             } else {
@@ -1818,13 +1888,21 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
                     let sep: NSView
                     if separatorsInUse < separatorViews.count {
                         sep = separatorViews[separatorsInUse]
+                        if canAnimate && !sep.isHidden && abs(sep.frame.minX - sepFrame.minX) > 0.5 {
+                            animatedFrames.append((sep, sepFrame))
+                        } else {
+                            setFrameNow(sep, sepFrame)
+                        }
                     } else {
                         sep = NSView(frame: sepFrame)
                         sep.wantsLayer = true
                         trackHostView.addSubview(sep)
                         separatorViews.append(sep)
+                        if canAnimate {
+                            sep.alphaValue = 0.0
+                            animatedFrames.append((sep, sepFrame))
+                        }
                     }
-                    sep.frame = sepFrame
                     sep.layer?.backgroundColor = theme.tabDividerColor.cgColor
                     sep.isHidden = false
                     separatorsInUse += 1
@@ -2737,21 +2815,25 @@ private final class SafariFocusRingOverlayView: NSView {
                 let pathAnim = CABasicAnimation(keyPath: "path")
                 pathAnim.fromValue = loosePath
                 pathAnim.toValue = tightPath
+                pathAnim.fillMode = .backwards
 
                 let widthAnim = CABasicAnimation(keyPath: "lineWidth")
                 widthAnim.fromValue = lineWidth + 1.6
                 widthAnim.toValue = lineWidth
+                widthAnim.fillMode = .backwards
 
                 let opacityAnim = CABasicAnimation(keyPath: "opacity")
                 opacityAnim.fromValue = 0.0
                 opacityAnim.toValue = 1.0
+                opacityAnim.fillMode = .backwards
 
                 let group = CAAnimationGroup()
                 group.animations = [pathAnim, widthAnim, opacityAnim]
-                group.duration = 0.26
-                group.timingFunction = CAMediaTimingFunction(controlPoints: 0.25, 0.1, 0.25, 1.0)
+                group.duration = 0.20
+                group.timingFunction = CAMediaTimingFunction(controlPoints: 0.20, 0.90, 0.25, 1.0)
                 if delay > 0.001 {
-                    group.beginTime = CACurrentMediaTime() + delay
+                    let now = ringLayer.convertTime(CACurrentMediaTime(), from: nil)
+                    group.beginTime = now + delay
                     group.fillMode = .backwards
                 }
 
@@ -2780,6 +2862,7 @@ private final class SafariFocusRingOverlayView: NSView {
                 ringLayer.add(opacityAnim, forKey: "safariFocusRing")
             }
         } else {
+            ringLayer.removeAnimation(forKey: "safariFocusRing")
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             ringLayer.frame = bounds
@@ -2788,5 +2871,14 @@ private final class SafariFocusRingOverlayView: NSView {
             ringLayer.opacity = visible ? 1.0 : 0.0
             CATransaction.commit()
         }
+    }
+
+    var modelOpacityForTesting: Float { ringLayer.opacity }
+
+    var scheduledAnimationDelayForTesting: CFTimeInterval? {
+        guard let anim = ringLayer.animation(forKey: "safariFocusRing") else { return nil }
+        guard anim.beginTime > 0 else { return 0.0 }
+        let now = ringLayer.convertTime(CACurrentMediaTime(), from: nil)
+        return max(0.0, anim.beginTime - now)
     }
 }

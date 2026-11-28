@@ -753,7 +753,7 @@ void SXBrowserApp::OnBeforeCommandLineProcessing(
   // Keep Chromium BackForwardCache + PaintHolding (same-origin AND cross-origin) + Prerender2 active
   // for zero-flash Back/Forward, Speculation Rules prerender/prefetch, and link navigations,
   // and enable ThirdPartyStoragePartitioning + PartitionedCookies.
-  command_line->AppendSwitchWithValue("enable-features", "BackForwardCache:enable_same_site/true/all_extensions_allowed/true/TimeToLiveInBackForwardCacheInSeconds/600,BackForwardCacheMemoryControls,AllowPageWithIDBConnectionInBFCache,PaintHolding,PaintHoldingCrossOrigin,Prerender2,WebAuthenticationPasskeys,WebAuthenticationMacPlatformAuthenticator,ThirdPartyStoragePartitioning,PartitionedCookies");
+  command_line->AppendSwitchWithValue("enable-features", "BackForwardCache:enable_same_site/true/all_extensions_allowed/true/TimeToLiveInBackForwardCacheInSeconds/600,BackForwardCacheMemoryControls,AllowPageWithIDBConnectionInBFCache,PaintHolding,PaintHoldingCrossOrigin,Prerender2,WebAuthenticationPasskeys,WebAuthenticationMacPlatformAuthenticator,ThirdPartyStoragePartitioning,PartitionedCookies,OverscrollEffectOnNonRootScrollers,ElasticOverscrollBackgroundPaintLocationFix,ElasticOverscrollUseEventDeltaForAxisSelection");
 
   // Disable Privacy Sandbox / Topics / FLEDGE / Attribution Reporting telemetry while keeping
   // standard NetworkPrediction available for non-private browsing profiles.

@@ -27,8 +27,12 @@ final class ScrollResidualAndMotionTests: HermeticTestCase {
         let engine = ElasticScrollEngine()
         engine.updateMetrics(scrollY: 0, contentHeight: 2000, viewportHeight: 800, canInnerScrollUp: false, canInnerScrollDown: false, isReloadableWebPage: true, isPageLoading: false)
         XCTAssertTrue(engine.handleDirectTouchEvent(phase: .changed, deltaX: 0, deltaY: 30))
+        let stretchedOverscroll = engine.currentOverscrollY
+        XCTAssertGreaterThan(stretchedOverscroll, 2.0)
+        // WebKit unwinds opposing stretch 1:1 in screen space and forwards the remaining delta.
         XCTAssertFalse(engine.handleDirectTouchEvent(phase: .changed, deltaX: 0, deltaY: -50))
-        XCTAssertEqual(engine.takeResidualForwardDeltaY() ?? 0, -20, accuracy: 0.01)
+        XCTAssertEqual(engine.currentOverscrollY, 0, accuracy: 0.001)
+        XCTAssertEqual(engine.takeResidualForwardDeltaY() ?? 0, -(50 - stretchedOverscroll), accuracy: 0.02)
         XCTAssertNil(engine.takeResidualForwardDeltaY(), "the residual is consumed exactly once")
     }
 

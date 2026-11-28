@@ -203,6 +203,11 @@ class SXBrowserClient : public CefClient,
                           const CefString& request_url,
                           CefRefPtr<CefSSLInfo> ssl_info,
                           CefRefPtr<CefCallback> callback) override;
+  bool OnOpenURLFromTab(CefRefPtr<CefBrowser> browser,
+                        CefRefPtr<CefFrame> frame,
+                        const CefString& target_url,
+                        WindowOpenDisposition target_disposition,
+                        bool user_gesture) override;
 
   // CefResourceRequestHandler:
   CefRefPtr<CefCookieAccessFilter> GetCookieAccessFilter(
