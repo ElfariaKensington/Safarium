@@ -873,6 +873,22 @@ bool SXBrowserClient::OnProcessMessageReceived(
     return true;
   }
 
+  if (name == "sx.drag_img_info") {
+    CefRefPtr<CefListValue> args = message->GetArgumentList();
+    double natW = (args && args->GetSize() >= 1) ? args->GetDouble(0) : 0.0;
+    double natH = (args && args->GetSize() >= 2) ? args->GetDouble(1) : 0.0;
+    double boxW = (args && args->GetSize() >= 3) ? args->GetDouble(2) : 0.0;
+    double boxH = (args && args->GetSize() >= 4) ? args->GetDouble(3) : 0.0;
+    std::string fitStr = (args && args->GetSize() >= 5) ? args->GetString(4).ToString() : "";
+    NSString *objectFit = [NSString stringWithUTF8String:fitStr.c_str()] ?: @"";
+    [strongTab handleDragImageInfoNaturalWidth:natW
+                                 naturalHeight:natH
+                                      boxWidth:boxW
+                                     boxHeight:boxH
+                                     objectFit:objectFit];
+    return true;
+  }
+
   if (name == "sx.ext_tab_create") {
     CefRefPtr<CefListValue> args = message->GetArgumentList();
     if (args && args->GetSize() >= 1) {

@@ -87,6 +87,11 @@ static void SXApplyPendingSiteStorageClear(NSString *profileDir) {
 
 + (instancetype)defaultConfiguration {
   SXEngineConfiguration *config = [[SXEngineConfiguration alloc] init];
+  const char *envProfileDir = getenv("SAFARIUM_USER_DATA_DIR");
+  if (envProfileDir && envProfileDir[0] != '\0') {
+    config.userDataDir = [NSString stringWithUTF8String:envProfileDir];
+    return config;
+  }
   NSString *appSupport =
       [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
                                            NSUserDomainMask, YES) firstObject];
@@ -833,6 +838,184 @@ static void SXRWHVRemoveFromSuperview(id self, SEL _cmd) {
   if (gSXOrigRWHVRemoveFromSuperview) gSXOrigRWHVRemoveFromSuperview(self, _cmd);
 }
 
+static NSMapTable<NSView *, SXBrowserTab *> *SXHostViewTabMap(void) {
+  static NSMapTable<NSView *, SXBrowserTab *> *map = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    map = [NSMapTable weakToWeakObjectsMapTable];
+  });
+  return map;
+}
+
+static id (*gSXOrigWebContentsBeginDrag)(id, SEL, NSArray<NSDraggingItem *> *, NSEvent *, id<NSDraggingSource>) = NULL;
+
+static NSImage *SXCreateUnstretchedDragImage(NSImage *src, NSSize newSize, CGFloat backingScale) {
+  if (!src || newSize.width < 1 || newSize.height < 1) return src;
+  CGFloat scale = fmax(1.0, backingScale);
+  NSInteger pxW = (NSInteger)llround(newSize.width * scale);
+  NSInteger pxH = (NSInteger)llround(newSize.height * scale);
+  NSBitmapImageRep *rep = [[NSBitmapImageRep alloc]
+      initWithBitmapDataPlanes:NULL
+                    pixelsWide:pxW
+                    pixelsHigh:pxH
+                 bitsPerSample:8
+               samplesPerPixel:4
+                      hasAlpha:YES
+                      isPlanar:NO
+                colorSpaceName:NSDeviceRGBColorSpace
+                   bytesPerRow:0
+                  bitsPerPixel:0];
+  if (!rep) return src;
+  rep.size = newSize;
+
+  NSGraphicsContext *ctx = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+  if (!ctx) return src;
+  [NSGraphicsContext saveGraphicsState];
+  [NSGraphicsContext setCurrentContext:ctx];
+  ctx.imageInterpolation = NSImageInterpolationHigh;
+  [src drawInRect:NSMakeRect(0, 0, newSize.width, newSize.height)
+         fromRect:NSZeroRect
+        operation:NSCompositingOperationCopy
+         fraction:1.0];
+  [NSGraphicsContext restoreGraphicsState];
+
+  NSImage *out = [[NSImage alloc] initWithSize:newSize];
+  [out addRepresentation:rep];
+  return out;
+}
+
+static id SXWebContentsBeginDraggingSession(
+    id self,
+    SEL _cmd,
+    NSArray<NSDraggingItem *> *items,
+    NSEvent *event,
+    id<NSDraggingSource> source) {
+  NSView *view = (NSView *)self;
+  SXBrowserTab *tab = nil;
+  for (NSView *v = view; v != nil; v = v.superview) {
+    tab = [SXHostViewTabMap() objectForKey:v];
+    if (tab) break;
+  }
+
+  BOOL hasDragImg = NO;
+  double natW = 0, natH = 0, boxW = 0, boxH = 0;
+  NSString *objectFit = @"";
+  if (tab) {
+    hasDragImg = [tab consumeRecentDragImageNaturalWidth:&natW
+                                           naturalHeight:&natH
+                                                boxWidth:&boxW
+                                               boxHeight:&boxH
+                                               objectFit:&objectFit];
+  }
+
+  CGFloat backingScale = view.window ? view.window.backingScaleFactor : 2.0;
+  NSPoint mousePt = event ? [view convertPoint:event.locationInWindow fromView:nil] : NSZeroPoint;
+
+  for (NSDraggingItem *item in items) {
+    NSDraggingImageComponent *comp = item.imageComponents.firstObject;
+    if (![comp.contents isKindOfClass:[NSImage class]]) continue;
+    NSImage *img = (NSImage *)comp.contents;
+    NSRect oldFrame = item.draggingFrame;
+    CGFloat oldW = oldFrame.size.width > 1.0 ? oldFrame.size.width : img.size.width;
+    CGFloat oldH = oldFrame.size.height > 1.0 ? oldFrame.size.height : img.size.height;
+    if (oldW <= 1.0 || oldH <= 1.0) continue;
+
+    CGFloat oldRatio = oldW / oldH;
+    CGFloat targetW = oldW;
+    CGFloat targetH = oldH;
+    BOOL shouldResize = NO;
+
+    if (hasDragImg && natW > 0.0 && natH > 0.0 && ![objectFit isEqualToString:@"fill"]) {
+      CGFloat natRatio = (CGFloat)(natW / natH);
+      CGFloat boxRatio = (boxW > 1.0 && boxH > 1.0) ? (CGFloat)(boxW / boxH) : oldRatio;
+      if (fabs(oldRatio - natRatio) / natRatio > 0.03 &&
+          fabs(oldRatio - boxRatio) / fmax(oldRatio, boxRatio) < 0.18) {
+        if ([objectFit isEqualToString:@"contain"] || [objectFit isEqualToString:@"scale-down"]) {
+          CGFloat s = fmin(oldW / (CGFloat)natW, oldH / (CGFloat)natH);
+          targetW = round((CGFloat)natW * s);
+          targetH = round((CGFloat)natH * s);
+        } else {
+          CGFloat maxDim = fmin(400.0, fmax(oldW, oldH));
+          if (natRatio >= 1.0) {
+            targetW = round(maxDim);
+            targetH = round(maxDim / natRatio);
+          } else {
+            targetH = round(maxDim);
+            targetW = round(maxDim * natRatio);
+          }
+        }
+        shouldResize = (targetW >= 12.0 && targetH >= 12.0);
+      }
+    }
+
+    if (!shouldResize) {
+      NSImageRep *bestRep = nil;
+      NSInteger bestArea = 0;
+      for (NSImageRep *r in img.representations) {
+        NSInteger area = r.pixelsWide * r.pixelsHigh;
+        if (area > bestArea) {
+          bestArea = area;
+          bestRep = r;
+        }
+      }
+      if (bestRep && bestRep.pixelsWide > 0 && bestRep.pixelsHigh > 0) {
+        CGFloat pixRatio = (CGFloat)bestRep.pixelsWide / (CGFloat)bestRep.pixelsHigh;
+        if (fabs(oldRatio - pixRatio) / pixRatio > 0.03) {
+          CGFloat maxDim = fmin(400.0, fmax(oldW, oldH));
+          if (pixRatio >= 1.0) {
+            targetW = round(maxDim);
+            targetH = round(maxDim / pixRatio);
+          } else {
+            targetH = round(maxDim);
+            targetW = round(maxDim * pixRatio);
+          }
+          shouldResize = (targetW >= 12.0 && targetH >= 12.0);
+        }
+      }
+    }
+
+    if (getenv("SAFARIUM_DRAG_DEBUG")) {
+      fprintf(stderr,
+              "[DragFix] old=%.1fx%.1f nat=%.0fx%.0f box=%.0fx%.0f fit=%s -> new=%.1fx%.1f resize=%d\n",
+              oldW, oldH, natW, natH, boxW, boxH, objectFit.UTF8String, targetW, targetH, shouldResize ? 1 : 0);
+      fflush(stderr);
+    }
+
+    if (shouldResize) {
+      NSSize newSize = NSMakeSize(targetW, targetH);
+      NSImage *fixed = SXCreateUnstretchedDragImage(img, newSize, backingScale);
+      CGFloat relX = oldFrame.size.width > 0 ? fmin(1.0, fmax(0.0, (mousePt.x - oldFrame.origin.x) / oldFrame.size.width)) : 0.5;
+      CGFloat relY = oldFrame.size.height > 0 ? fmin(1.0, fmax(0.0, (mousePt.y - oldFrame.origin.y) / oldFrame.size.height)) : 0.5;
+      NSRect newFrame = NSMakeRect(
+          round(mousePt.x - relX * targetW),
+          round(mousePt.y - relY * targetH),
+          targetW,
+          targetH);
+      [item setDraggingFrame:newFrame contents:fixed];
+    }
+  }
+
+  return gSXOrigWebContentsBeginDrag(self, _cmd, items, event, source);
+}
+
+static void SXInstallWebContentsDragHook(void) {
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    Class cls = NSClassFromString(@"WebContentsViewCocoa");
+    if (!cls) return;
+    SEL sel = @selector(beginDraggingSessionWithItems:event:source:);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    IMP hook = (IMP)SXWebContentsBeginDraggingSession;
+    IMP inherited = method_getImplementation(m);
+    if (class_addMethod(cls, sel, hook, method_getTypeEncoding(m))) {
+      gSXOrigWebContentsBeginDrag = (id (*)(id, SEL, NSArray<NSDraggingItem *> *, NSEvent *, id<NSDraggingSource>))inherited;
+    } else {
+      gSXOrigWebContentsBeginDrag = (id (*)(id, SEL, NSArray<NSDraggingItem *> *, NSEvent *, id<NSDraggingSource>))method_setImplementation(m, hook);
+    }
+  });
+}
+
 static void SXInstallRenderWidgetVisibilityHook(void) {
   static dispatch_once_t once;
   dispatch_once(&once, ^{
@@ -1126,6 +1309,7 @@ static void SXApplyPreferencesDictionaryToContext(
 - (CefRefPtr<CefRequestContext>)sharedIncognitoRequestContext;
 - (nullable NSDictionary<NSString *, id> *)cachedPreferencesCopy;
 - (void)notifyNavigationBurst;
+- (void)noteScrollInteractionActiveChanged:(BOOL)active;
 @end
 
 @interface SXBrowserTab () {
@@ -1141,6 +1325,7 @@ static void SXApplyPreferencesDictionaryToContext(
   BOOL _incognito;
   BOOL _tabActiveState;
   BOOL _mainFrameLoading;
+  BOOL _scrollInteractionActive;
   BOOL _pendingOriginThemeReset;
   NSString *_lastPrewarmedOrigin;
   CFTimeInterval _lastPrewarmedAt;
@@ -1224,6 +1409,12 @@ static void SXApplyPreferencesDictionaryToContext(
 @property (nonatomic, weak, nullable) NSWindow *observedHostWindow;
 @property (nonatomic, strong, nullable) NSTimer *devToolsCaptureTimer;
 @property (nonatomic, strong, nullable) id devToolsMouseMonitor;
+@property (nonatomic, assign) double dragImgNaturalWidth;
+@property (nonatomic, assign) double dragImgNaturalHeight;
+@property (nonatomic, assign) double dragImgBoxWidth;
+@property (nonatomic, assign) double dragImgBoxHeight;
+@property (nonatomic, copy, nullable) NSString *dragImgObjectFit;
+@property (nonatomic, assign) CFTimeInterval dragImgTimestamp;
 - (void)handleDevToolsCreatedWithWindow:(NSWindow *)devWindow;
 - (void)syncDockedDevToolsWindowFrame;
 
@@ -1861,6 +2052,10 @@ class SXAuthPopupClient : public CefClient,
 
 - (void)handleBrowserCreated:(CefRefPtr<CefBrowser>)browser {
   SXInstallRenderWidgetVisibilityHook();
+  SXInstallWebContentsDragHook();
+  if (self.hostView) {
+    [SXHostViewTabMap() setObject:self forKey:self.hostView];
+  }
   if (_isClosed) {
     // The tab was closed while CreateBrowser was still pending: tear the late browser down instead of leaking a
     // live, hidden WebContents that keeps loading (and playing audio) with no tab attached.
@@ -1922,6 +2117,10 @@ class SXAuthPopupClient : public CefClient,
 - (void)closeTab {
   if (_isClosed) {
     return;
+  }
+  if (_scrollInteractionActive) {
+    _scrollInteractionActive = NO;
+    [self.runtime noteScrollInteractionActiveChanged:NO];
   }
   [self discardFreezeFrame];
   _isClosed = YES;
@@ -3127,7 +3326,20 @@ static NSString *SXSanitizedSaveFileBaseName(NSString * _Nullable title, NSURL *
 
 - (void)setScrollInteractionActive:(BOOL)active {
   if (_isClosed) return;
+  if (_scrollInteractionActive != active) {
+    _scrollInteractionActive = active;
+    [self.runtime noteScrollInteractionActiveChanged:active];
+  }
   [self.colorSampler notifyScrollGestureActive:active];
+  if (active) {
+    if (_scrollSnapshotTimer) {
+      dispatch_source_cancel(_scrollSnapshotTimer);
+      _scrollSnapshotTimer = nil;
+    }
+  } else if (!_mainFrameLoading && self.currentNavigationEntryID > 0 &&
+             fabs(self.scrollY - self.lastSnapshotScrollY) > 1.0) {
+    [self scheduleSettledScrollSnapshotCapture];
+  }
 }
 
 - (void)resetOverscroll {
@@ -3238,7 +3450,7 @@ static NSString *SXSanitizedSaveFileBaseName(NSString * _Nullable title, NSURL *
 }
 
 - (void)capturePeriodicPreviewIfEligibleForce:(BOOL)force {
-  if (_isClosed || !_client || !_browser || _previewCaptureInFlight || _previewSnapshotPaused) {
+  if (_isClosed || !_client || !_browser || _previewCaptureInFlight || _previewSnapshotPaused || _scrollInteractionActive) {
     return;
   }
   if (self.hostView.isHidden || self.hostView.alphaValue < 0.9) {
@@ -3618,6 +3830,38 @@ static NSString *SXSanitizedSaveFileBaseName(NSString * _Nullable title, NSURL *
                   }];
 }
 
+- (void)handleDragImageInfoNaturalWidth:(double)naturalWidth
+                          naturalHeight:(double)naturalHeight
+                               boxWidth:(double)boxWidth
+                              boxHeight:(double)boxHeight
+                              objectFit:(NSString *)objectFit {
+  self.dragImgNaturalWidth = naturalWidth;
+  self.dragImgNaturalHeight = naturalHeight;
+  self.dragImgBoxWidth = boxWidth;
+  self.dragImgBoxHeight = boxHeight;
+  self.dragImgObjectFit = objectFit ?: @"";
+  self.dragImgTimestamp = (naturalWidth > 0 && naturalHeight > 0) ? CACurrentMediaTime() : 0.0;
+}
+
+- (BOOL)consumeRecentDragImageNaturalWidth:(double *)natW
+                             naturalHeight:(double *)natH
+                                  boxWidth:(double *)boxW
+                                 boxHeight:(double *)boxH
+                                 objectFit:(NSString * _Nullable * _Nonnull)objectFit {
+  CFTimeInterval age = CACurrentMediaTime() - self.dragImgTimestamp;
+  BOOL valid = (self.dragImgTimestamp > 0.0 && age >= 0.0 && age < 1.5 &&
+                self.dragImgNaturalWidth > 0.0 && self.dragImgNaturalHeight > 0.0);
+  if (valid) {
+    if (natW) *natW = self.dragImgNaturalWidth;
+    if (natH) *natH = self.dragImgNaturalHeight;
+    if (boxW) *boxW = self.dragImgBoxWidth;
+    if (boxH) *boxH = self.dragImgBoxHeight;
+    *objectFit = self.dragImgObjectFit ?: @"";
+  }
+  self.dragImgTimestamp = 0.0;
+  return valid;
+}
+
 - (NSUInteger)currentFaviconGeneration {
   return self.faviconGeneration;
 }
@@ -3744,7 +3988,7 @@ static NSString *SXSanitizedSaveFileBaseName(NSString * _Nullable title, NSURL *
 }
 
 - (void)scheduleSettledScrollSnapshotCapture {
-  if (_isClosed || _mainFrameLoading) return;
+  if (_isClosed || _mainFrameLoading || _scrollInteractionActive) return;
   if (_scrollSnapshotTimer) {
     dispatch_source_cancel(_scrollSnapshotTimer);
     _scrollSnapshotTimer = nil;
@@ -4588,6 +4832,7 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
   BOOL _isPumping;
   BOOL _immediatePumpPending;
   CFTimeInterval _navigationBurstUntil;
+  int _activeScrollTabsCount;
   std::mutex _downloadMutex;
   std::unordered_map<uint32_t, CefRefPtr<CefDownloadItemCallback>> _downloads;
   std::mutex _prefsMutex;
@@ -5005,9 +5250,20 @@ static CALayer * _Nullable SXFindRemoteLayerHost(CALayer *root, int depth) {
     _reentrancyDetected = NO;
     [self scheduleMessagePumpWorkWithDelayMs:0];
   } else if (!self.pumpTimer && !_immediatePumpPending) {
-    // Tick at 8ms (120Hz ProMotion) during active navigation bursts, relaxing to 33ms when idle.
-    int64_t heartbeatMs = (CACurrentMediaTime() < _navigationBurstUntil) ? 8 : 33;
+    // Tick at 8ms (120Hz ProMotion) during active navigation bursts or scroll gestures, relaxing to 33ms when idle.
+    int64_t heartbeatMs = (_activeScrollTabsCount > 0 || CACurrentMediaTime() < _navigationBurstUntil) ? 8 : 33;
     [self scheduleMessagePumpWorkWithDelayMs:heartbeatMs];
+  }
+}
+
+- (void)noteScrollInteractionActiveChanged:(BOOL)active {
+  if (active) {
+    _activeScrollTabsCount += 1;
+    if (_activeScrollTabsCount == 1) {
+      [self scheduleMessagePumpWorkWithDelayMs:0];
+    }
+  } else {
+    _activeScrollTabsCount = MAX(0, _activeScrollTabsCount - 1);
   }
 }
 

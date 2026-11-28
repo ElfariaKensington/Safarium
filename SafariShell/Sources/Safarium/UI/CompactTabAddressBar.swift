@@ -1238,6 +1238,7 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
     var isDeferringFocusRingForTesting: Bool { isDeferringFocusRing }
     var focusRingModelOpacityForTesting: Float { focusRingOverlay.modelOpacityForTesting }
     var focusRingScheduledDelayForTesting: CFTimeInterval? { focusRingOverlay.scheduledAnimationDelayForTesting }
+    var hasActiveFocusRingAnimationForTesting: Bool { focusRingOverlay.hasActiveAnimationForTesting }
 
     private func beginFocusRingDeferral() {
         activeLayoutAnimationCount += 1
@@ -1251,9 +1252,10 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
 
     private func endFocusRingDeferral() {
         activeLayoutAnimationCount = max(0, activeLayoutAnimationCount - 1)
+        guard activeLayoutAnimationCount == 0 else { return }
         // layout() skips its work while an animation hold is active (e.g. the sidebar slide), so catch up on any
-        // width change that arrived during the hold.
-        if activeLayoutAnimationCount == 0, hasLaidOutOnce, abs(bounds.width - lastLayoutBoundsWidth) > 0.5 {
+        // width change that arrived during the hold BEFORE flushing the deferred focus ring animation.
+        if hasLaidOutOnce, abs(bounds.width - lastLayoutBoundsWidth) > 0.5 {
             needsLayout = true
             layoutSubtreeIfNeeded()
         }
@@ -1268,6 +1270,11 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
         }
         let shouldAnimate = pendingAnimatedFocusRing
         pendingAnimatedFocusRing = false
+        trackHostView.layoutSubtreeIfNeeded()
+        if trackHostView.bounds.width > 10 {
+            trackBgView.frame = trackHostView.bounds
+            focusRingOverlay.frame = trackHostView.bounds
+        }
         let pillFrame = lastActiveTargetFrame.width > 10 ? lastActiveTargetFrame : activePillSurfaceView.frame
         let geom = focusRingGeometry(forPillFrame: pillFrame)
         focusRingOverlay.setFocusRing(
@@ -1281,7 +1288,7 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
 
     private func updateActiveFocusRing(forFrame f: NSRect, editing: Bool, animated: Bool, delay: CFTimeInterval = 0.0) {
         let geom = focusRingGeometry(forPillFrame: f)
-        if editing && isDeferringFocusRing {
+        if editing && (isDeferringFocusRing || (pendingAnimatedFocusRing && !animated)) {
             pendingAnimatedFocusRing = pendingAnimatedFocusRing || animated
             focusRingOverlay.setFocusRing(frame: geom.rect, lineWidth: geom.lineWidth, visible: false, animated: false)
             return
@@ -1395,6 +1402,10 @@ final class CompactTabAddressBar: NSView, NSTextFieldDelegate, NSGestureRecogniz
         if isEditingAddress {
             if let editor = addressTextField.currentEditor() {
                 editor.selectedRange = NSRange(location: 0, length: (addressTextField.stringValue as NSString).length)
+            }
+            if !focusRingOverlay.isVisibleState {
+                let ringFrame = lastActiveTargetFrame.width > 10 ? lastActiveTargetFrame : activePillSurfaceView.frame
+                updateActiveFocusRing(forFrame: ringFrame, editing: true, animated: true, delay: 0.12)
             }
             return
         }
@@ -2577,6 +2588,29 @@ private final class CompactInactiveTabView: NSView {
         onHoverChanged?(false)
     }
 
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        if superview == nil {
+            clearHoverOnDetach()
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            clearHoverOnDetach()
+        }
+    }
+
+    private func clearHoverOnDetach() {
+        let wasHovered = isTabHovered || isCloseHovered
+        isTabHovered = false
+        isCloseHovered = false
+        if wasHovered {
+            onHoverChanged?(false)
+        }
+    }
+
     private func updateSubHover(_ event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
         isCloseHovered = showsCloseButton && closeRect.contains(pt)
@@ -2773,6 +2807,10 @@ private final class SafariFocusRingOverlayView: NSView {
     private var lastFrame: NSRect = .zero
     private var lastLineWidth: CGFloat = 3.4
     private var isRingVisible: Bool = false
+    private var activeAppearDelayEnd: CFTimeInterval = 0
+    private var activeAppearEndTime: CFTimeInterval = 0
+
+    var isVisibleState: Bool { isRingVisible }
 
     override var isFlipped: Bool { true }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
@@ -2804,6 +2842,33 @@ private final class SafariFocusRingOverlayView: NSView {
         let ringColor = NSColor.controlAccentColor.withAlphaComponent(0.58).cgColor
         ringLayer.strokeColor = ringColor
 
+        let hostNow = CACurrentMediaTime()
+        let geometryUnchanged = abs(f.minX - lastFrame.minX) < 0.5
+            && abs(f.minY - lastFrame.minY) < 0.5
+            && abs(f.width - lastFrame.width) < 0.5
+            && abs(f.height - lastFrame.height) < 0.5
+            && abs(lineWidth - lastLineWidth) < 0.1
+
+        // Never let routine non-animated layout/title passes clobber an in-flight delayed focus halo contraction!
+        if visible && isRingVisible && !animated,
+           hostNow < activeAppearEndTime,
+           ringLayer.animation(forKey: "safariFocusRing") != nil {
+            if geometryUnchanged {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                ringLayer.frame = bounds
+                CATransaction.commit()
+                return
+            } else if hostNow < activeAppearDelayEnd {
+                // Geometry shifted while still waiting in the pre-start delay: retarget paths keeping remaining delay.
+                let remainingDelay = max(0.0, activeAppearDelayEnd - hostNow)
+                lastFrame = f
+                lastLineWidth = lineWidth
+                scheduleAppearAnimation(tightPath: tightPath, loosePath: loosePath, lineWidth: lineWidth, delay: remainingDelay, hostNow: hostNow)
+                return
+            }
+        }
+
         let stateChanged = (visible != isRingVisible)
         lastFrame = f
         lastLineWidth = lineWidth
@@ -2812,40 +2877,10 @@ private final class SafariFocusRingOverlayView: NSView {
         if animated && stateChanged {
             ringLayer.removeAnimation(forKey: "safariFocusRing")
             if visible {
-                let pathAnim = CABasicAnimation(keyPath: "path")
-                pathAnim.fromValue = loosePath
-                pathAnim.toValue = tightPath
-                pathAnim.fillMode = .backwards
-
-                let widthAnim = CABasicAnimation(keyPath: "lineWidth")
-                widthAnim.fromValue = lineWidth + 1.6
-                widthAnim.toValue = lineWidth
-                widthAnim.fillMode = .backwards
-
-                let opacityAnim = CABasicAnimation(keyPath: "opacity")
-                opacityAnim.fromValue = 0.0
-                opacityAnim.toValue = 1.0
-                opacityAnim.fillMode = .backwards
-
-                let group = CAAnimationGroup()
-                group.animations = [pathAnim, widthAnim, opacityAnim]
-                group.duration = 0.20
-                group.timingFunction = CAMediaTimingFunction(controlPoints: 0.20, 0.90, 0.25, 1.0)
-                if delay > 0.001 {
-                    let now = ringLayer.convertTime(CACurrentMediaTime(), from: nil)
-                    group.beginTime = now + delay
-                    group.fillMode = .backwards
-                }
-
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                ringLayer.frame = bounds
-                ringLayer.path = tightPath
-                ringLayer.lineWidth = lineWidth
-                ringLayer.opacity = 1.0
-                CATransaction.commit()
-                ringLayer.add(group, forKey: "safariFocusRing")
+                scheduleAppearAnimation(tightPath: tightPath, loosePath: loosePath, lineWidth: lineWidth, delay: delay, hostNow: hostNow)
             } else {
+                activeAppearDelayEnd = 0
+                activeAppearEndTime = 0
                 let opacityAnim = CABasicAnimation(keyPath: "opacity")
                 opacityAnim.fromValue = ringLayer.presentation()?.opacity ?? 1.0
                 opacityAnim.toValue = 0.0
@@ -2858,10 +2893,12 @@ private final class SafariFocusRingOverlayView: NSView {
                 ringLayer.path = tightPath
                 ringLayer.lineWidth = lineWidth
                 ringLayer.opacity = 0.0
-                CATransaction.commit()
                 ringLayer.add(opacityAnim, forKey: "safariFocusRing")
+                CATransaction.commit()
             }
         } else {
+            activeAppearDelayEnd = 0
+            activeAppearEndTime = 0
             ringLayer.removeAnimation(forKey: "safariFocusRing")
             CATransaction.begin()
             CATransaction.setDisableActions(true)
@@ -2873,7 +2910,57 @@ private final class SafariFocusRingOverlayView: NSView {
         }
     }
 
+    private func scheduleAppearAnimation(
+        tightPath: CGPath,
+        loosePath: CGPath,
+        lineWidth: CGFloat,
+        delay: CFTimeInterval,
+        hostNow: CFTimeInterval
+    ) {
+        let animDuration: CFTimeInterval = 0.22
+        activeAppearDelayEnd = hostNow + max(0.0, delay)
+        activeAppearEndTime = activeAppearDelayEnd + animDuration
+
+        let pathAnim = CABasicAnimation(keyPath: "path")
+        pathAnim.fromValue = loosePath
+        pathAnim.toValue = tightPath
+        pathAnim.duration = animDuration
+        pathAnim.fillMode = .backwards
+
+        let widthAnim = CABasicAnimation(keyPath: "lineWidth")
+        widthAnim.fromValue = lineWidth + 1.6
+        widthAnim.toValue = lineWidth
+        widthAnim.duration = animDuration
+        widthAnim.fillMode = .backwards
+
+        let opacityAnim = CABasicAnimation(keyPath: "opacity")
+        opacityAnim.fromValue = 0.0
+        opacityAnim.toValue = 1.0
+        opacityAnim.duration = animDuration
+        opacityAnim.fillMode = .backwards
+
+        let group = CAAnimationGroup()
+        group.animations = [pathAnim, widthAnim, opacityAnim]
+        group.duration = animDuration
+        group.timingFunction = CAMediaTimingFunction(controlPoints: 0.20, 0.90, 0.25, 1.0)
+        group.fillMode = .backwards
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        ringLayer.frame = bounds
+        ringLayer.path = tightPath
+        ringLayer.lineWidth = lineWidth
+        ringLayer.opacity = 1.0
+        if delay > 0.001 {
+            let layerNow = ringLayer.convertTime(hostNow, from: nil)
+            group.beginTime = layerNow + delay
+        }
+        ringLayer.add(group, forKey: "safariFocusRing")
+        CATransaction.commit()
+    }
+
     var modelOpacityForTesting: Float { ringLayer.opacity }
+    var hasActiveAnimationForTesting: Bool { ringLayer.animation(forKey: "safariFocusRing") != nil }
 
     var scheduledAnimationDelayForTesting: CFTimeInterval? {
         guard let anim = ringLayer.animation(forKey: "safariFocusRing") else { return nil }

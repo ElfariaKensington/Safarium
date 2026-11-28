@@ -85,6 +85,16 @@ class SXBrowserClient;
                        errorText:(NSString *)errorText
                        failedURL:(NSURL *)failedURL;
 - (void)handleSpaceScrollDirection:(int)direction isRepeat:(BOOL)isRepeat;
+- (void)handleDragImageInfoNaturalWidth:(double)naturalWidth
+                          naturalHeight:(double)naturalHeight
+                               boxWidth:(double)boxWidth
+                              boxHeight:(double)boxHeight
+                              objectFit:(NSString *)objectFit;
+- (BOOL)consumeRecentDragImageNaturalWidth:(double *)natW
+                             naturalHeight:(double *)natH
+                                  boxWidth:(double *)boxW
+                                 boxHeight:(double *)boxH
+                                 objectFit:(NSString * _Nullable * _Nonnull)objectFit;
 - (void)handleKeyboardNavigateBack;
 - (void)handleKeyboardNavigateForward;
 - (void)handleTelemetryScrollY:(CGFloat)scrollY

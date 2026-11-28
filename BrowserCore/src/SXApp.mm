@@ -742,6 +742,10 @@ void SXBrowserApp::OnBeforeCommandLineProcessing(
 
   // Ensure smooth scrolling & hardware acceleration are active on Apple Silicon.
   command_line->AppendSwitch("enable-smooth-scrolling");
+  if (getenv("SAFARIUM_SCROLL_DEBUG")) {
+    command_line->AppendSwitch("disable-backgrounding-occluded-windows");
+    command_line->AppendSwitch("disable-renderer-backgrounding");
+  }
   // Allow native AppKit NSGlassEffectView video HUD buttons to call HTMLMediaElement.play() reliably.
   command_line->AppendSwitchWithValue("autoplay-policy", "no-user-gesture-required");
 

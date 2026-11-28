@@ -816,4 +816,31 @@ final class CompactTabAddressBarTests: HermeticTestCase {
         XCTAssertEqual(bar.focusRingModelOpacityForTesting, 1.0, accuracy: 0.001)
         XCTAssertNotNil(bar.focusRingScheduledDelayForTesting)
     }
+
+    func testLayoutAndTitlePassesDoNotClobberDelayedFocusRingContractionAfterTabAnimation() {
+        load([item("a", active: true)])
+        bar.beginExternalAnimation()
+        // Simulate width change during animation hold (e.g. sidebar slide / tab strip resize)
+        container.frame = NSRect(x: 0, y: 0, width: 940, height: 52)
+        bar.frame = container.bounds
+        bar.focusAddressBar()
+
+        // Completion of tab animation runs layoutSubtreeIfNeeded() inside endFocusRingDeferral(),
+        // followed by flushDeferredFocusRingIfReady() AND subsequent non-animated update/layout passes.
+        bar.endExternalAnimation()
+        XCTAssertTrue(bar.hasActiveFocusRingAnimationForTesting, "catch-up layout inside endFocusRingDeferral must not skip the delayed focus ring animation")
+        guard let delayAfterEnd = bar.focusRingScheduledDelayForTesting else {
+            return XCTFail("Expected delayed safariFocusRing animation")
+        }
+        XCTAssertGreaterThan(delayAfterEnd, 0.06)
+
+        // Subsequent non-animated layout and title/loading item updates during the 0.12s delay + 0.22s contraction
+        // must preserve the in-flight animation rather than calling removeAnimation and snapping solid!
+        bar.needsLayout = true
+        bar.layoutSubtreeIfNeeded()
+        bar.update(items: [TabPresentationItem(id: "a", title: "New Tab", url: nil, favicon: nil, isLoading: false, progress: 0.0, isActive: true)], animated: false)
+
+        XCTAssertTrue(bar.hasActiveFocusRingAnimationForTesting, "routine layout/update passes must never cancel an in-flight focus halo contraction")
+        XCTAssertNotNil(bar.focusRingScheduledDelayForTesting)
+    }
 }

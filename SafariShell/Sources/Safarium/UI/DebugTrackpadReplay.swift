@@ -49,8 +49,8 @@ enum DebugTrackpadReplay {
                                   wheel1: Int32(dy.rounded()), wheel2: 0, wheel3: 0) else { return }
             e.location = pt
             e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-            e.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: dy)
             e.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: dy / 10.0)
+            e.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(dy.rounded()))
             e.setIntegerValueField(.scrollWheelEventScrollPhase, value: ph)
             e.setIntegerValueField(.scrollWheelEventMomentumPhase, value: mo)
             e.timestamp = CGEventTimestamp(ProcessInfo.processInfo.systemUptime * 1e9)

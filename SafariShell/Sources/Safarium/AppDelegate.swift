@@ -182,6 +182,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let window = self?.activeWindowController?.window else { return }
                 if (note.object as? String) == "back" { window.orderBack(nil) } else { window.orderFrontRegardless() }
             }
+            DistributedNotificationCenter.default().addObserver(
+                forName: Notification.Name("SafariumDebugNewTab"), object: nil, queue: .main
+            ) { [weak self] _ in
+                _ = self?.activeWindowController?.createNewTab(url: nil, activate: true)
+            }
         }
         NotificationCenter.default.addObserver(
             forName: Notification.Name("SXEngineRuntimeRequestNewWindowNotification"),

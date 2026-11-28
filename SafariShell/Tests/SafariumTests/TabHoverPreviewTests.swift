@@ -310,4 +310,80 @@ final class TabHoverPreviewTests: HermeticTestCase {
         XCTAssertNotNil(ink)
         XCTAssertLessThan(ink?.whiteComponent ?? 1, 0.2)
     }
+
+    // MARK: - stuck-preview prevention
+
+    private func makeKeyAndPointerInsideAnchor() {
+        hostWindow.makeKeyAndOrderFront(nil)
+        let r = screenRect(of: anchor)
+        controller.pointerLocationProvider = { NSPoint(x: r.midX, y: r.midY) }
+    }
+
+    func testDelayedHoverDoesNotPresentWhenPointerLeftAnchor() {
+        hostWindow.makeKeyAndOrderFront(nil)
+        let r = screenRect(of: anchor)
+        var pointer = NSPoint(x: r.midX, y: r.midY)
+        controller.pointerLocationProvider = { pointer }
+
+        controller.hoverEntered(item: item("A"), placement: .below(anchorView: anchor), in: hostWindow, isDark: false)
+        XCTAssertEqual(controller.pendingTabID, "A")
+
+        // Pointer leaves anchor without triggering mouseExited (e.g. fast move onto Chromium WebView)
+        pointer = NSPoint(x: r.midX, y: r.minY - 200)
+        spinRunLoop(0.50)
+
+        XCTAssertNil(controller.currentTabID)
+        XCTAssertNil(controller.pendingTabID)
+        XCTAssertFalse(controller.panel?.isVisible ?? false)
+    }
+
+    func testPresentingClearsPendingTabIDAndDismissesWhenAnchorDetaches() {
+        makeKeyAndPointerInsideAnchor()
+
+        controller.hoverEntered(item: item("A"), placement: .below(anchorView: anchor), in: hostWindow, isDark: false)
+        spinRunLoop(0.50)
+
+        XCTAssertEqual(controller.currentTabID, "A")
+        XCTAssertNil(controller.pendingTabID, "pendingTabID must be cleared once presented so card exit can dismiss")
+        XCTAssertTrue(controller.panel?.isVisible ?? false)
+
+        // Detaching the hovered tab view (e.g. promoted to active or closed) must dismiss the preview
+        anchor.removeFromSuperview()
+        controller.validateHoverState()
+
+        XCTAssertNil(controller.currentTabID)
+        XCTAssertFalse(controller.panel?.isVisible ?? false)
+    }
+
+    func testValidateHoverStateDismissesWhenPointerLeavesWithoutMouseExited() {
+        hostWindow.makeKeyAndOrderFront(nil)
+        let r = screenRect(of: anchor)
+        var pointer = NSPoint(x: r.midX, y: r.midY)
+        controller.pointerLocationProvider = { pointer }
+
+        controller.hoverEntered(item: item("A"), placement: .below(anchorView: anchor), in: hostWindow, isDark: false)
+        spinRunLoop(0.50)
+        XCTAssertEqual(controller.currentTabID, "A")
+
+        // Move pointer far away from both anchor and card without sending mouseExited
+        pointer = NSPoint(x: r.maxX + 400, y: r.maxY + 400)
+        spinRunLoop(0.45)
+
+        XCTAssertNil(controller.currentTabID)
+        XCTAssertFalse(controller.panel?.isVisible ?? false)
+    }
+
+    func testValidateHoverStateDismissesWhenHostWindowResignsKey() {
+        makeKeyAndPointerInsideAnchor()
+
+        controller.hoverEntered(item: item("A"), placement: .below(anchorView: anchor), in: hostWindow, isDark: false)
+        spinRunLoop(0.50)
+        XCTAssertEqual(controller.currentTabID, "A")
+
+        hostWindow.orderOut(nil)
+        controller.validateHoverState()
+
+        XCTAssertNil(controller.currentTabID)
+        XCTAssertFalse(controller.panel?.isVisible ?? false)
+    }
 }

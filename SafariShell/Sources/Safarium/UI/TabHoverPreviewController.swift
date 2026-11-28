@@ -39,6 +39,13 @@ final class TabHoverPreviewController {
         case below(anchorView: NSView)
         /// Placed beside the hovered tab in the Vertical tab rail.
         case belowVerticalPill(anchorView: NSView, railRightXInWindow: CGFloat)
+
+        var anchorView: NSView {
+            switch self {
+            case .below(let anchorView), .belowVerticalPill(let anchorView, _):
+                return anchorView
+            }
+        }
     }
 
     var onCloseTab: ((String) -> Void)?
@@ -68,14 +75,21 @@ final class TabHoverPreviewController {
     var domainLabel: NSTextField?
 
     private weak var hostWindow: NSWindow?
+    private weak var anchorView: NSView?
+    private var requireKeyWindow: Bool = false
     var currentTabID: String?
     var pendingTabID: String?
     private var isPointerInCard: Bool = false
     private var showWorkItem: DispatchWorkItem?
     private var hideWorkItem: DispatchWorkItem?
+    private var watchdogTimer: Timer?
+    private var localEventMonitor: Any?
+    private var presentationGeneration: UInt64 = 0
     private var isDark: Bool = false
+    var pointerLocationProvider: () -> NSPoint = { NSEvent.mouseLocation }
 
     deinit {
+        stopDismissMonitors()
         dismiss(animated: false)
     }
 
@@ -91,6 +105,8 @@ final class TabHoverPreviewController {
         showWorkItem = nil
 
         self.hostWindow = window
+        self.anchorView = placement.anchorView
+        self.requireKeyWindow = window.isKeyWindow
         self.isDark = isDark
         self.pendingTabID = item.tabID
 
@@ -100,10 +116,22 @@ final class TabHoverPreviewController {
         let delay = alreadyVisible ? Self.switchHoverDelay : (isVertical ? Self.verticalHoverDelay : Self.initialHoverDelay)
 
         let work = DispatchWorkItem { [weak self, weak window] in
-            guard let self, let window, self.pendingTabID == item.tabID else { return }
+            guard let self, let window, self.pendingTabID == item.tabID,
+                  window.isVisible, !window.isMiniaturized,
+                  (!self.requireKeyWindow || window.isKeyWindow),
+                  let anchor = self.anchorView,
+                  self.isPointerInside(view: anchor, in: window, slop: 2.0) else {
+                self?.pendingTabID = nil
+                self?.showWorkItem = nil
+                if self?.currentTabID == nil {
+                    self?.stopDismissMonitors()
+                }
+                return
+            }
             self.present(item: item, placement: placement, in: window, isDark: isDark, glide: alreadyVisible)
         }
         showWorkItem = work
+        startDismissMonitors()
         if delay <= 0.001 {
             work.perform()
         } else {
@@ -116,6 +144,9 @@ final class TabHoverPreviewController {
             pendingTabID = nil
             showWorkItem?.cancel()
             showWorkItem = nil
+            if currentTabID == nil {
+                stopDismissMonitors()
+            }
         }
         guard currentTabID == tabID else { return }
         scheduleDismissIfPointerOutside()
@@ -125,6 +156,13 @@ final class TabHoverPreviewController {
         hideWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.pendingTabID == nil, !self.isPointerInCard else { return }
+            if let window = self.hostWindow,
+               let anchor = self.anchorView,
+               let currentID = self.currentTabID,
+               !currentID.isEmpty,
+               self.isPointerInside(view: anchor, in: window, slop: 1.0) {
+                return
+            }
             self.dismiss(animated: true)
         }
         hideWorkItem = work
@@ -132,12 +170,17 @@ final class TabHoverPreviewController {
     }
 
     func dismiss(animated: Bool = false) {
+        presentationGeneration &+= 1
+        let gen = presentationGeneration
         showWorkItem?.cancel()
         showWorkItem = nil
         hideWorkItem?.cancel()
         hideWorkItem = nil
+        stopDismissMonitors()
         pendingTabID = nil
         currentTabID = nil
+        anchorView = nil
+        requireKeyWindow = false
         isPointerInCard = false
 
         guard let p = panel else { return }
@@ -148,7 +191,7 @@ final class TabHoverPreviewController {
                 p.animator().alphaValue = 0.0
             }, completionHandler: { [weak self, weak p] in
                 guard let self, let p else { return }
-                if self.currentTabID == nil {
+                if self.currentTabID == nil && self.presentationGeneration == gen {
                     p.parent?.removeChildWindow(p)
                     p.orderOut(nil)
                 }
@@ -157,6 +200,105 @@ final class TabHoverPreviewController {
             p.parent?.removeChildWindow(p)
             p.orderOut(nil)
             p.alphaValue = 0.0
+        }
+    }
+
+    func validateHoverState() {
+        if currentTabID == nil {
+            guard pendingTabID != nil else {
+                stopDismissMonitors()
+                return
+            }
+            guard let window = hostWindow,
+                  window.isVisible,
+                  !window.isMiniaturized,
+                  (!requireKeyWindow || window.isKeyWindow),
+                  let anchor = anchorView,
+                  isPointerInside(view: anchor, in: window, slop: 2.0) else {
+                pendingTabID = nil
+                showWorkItem?.cancel()
+                showWorkItem = nil
+                anchorView = nil
+                stopDismissMonitors()
+                return
+            }
+            return
+        }
+
+        guard let window = hostWindow,
+              window.isVisible,
+              !window.isMiniaturized,
+              (!requireKeyWindow || window.isKeyWindow),
+              let anchor = anchorView,
+              anchor.window === window,
+              !anchor.isHiddenOrHasHiddenAncestor else {
+            dismiss(animated: false)
+            return
+        }
+
+        let inAnchor = isPointerInside(view: anchor, in: window, slop: 2.0)
+        let inCard = isPointerInsidePanel(slop: 2.0)
+        isPointerInCard = inCard
+
+        if inCard {
+            hideWorkItem?.cancel()
+            hideWorkItem = nil
+        } else if !inAnchor && hideWorkItem == nil && pendingTabID == nil {
+            scheduleDismissIfPointerOutside()
+        }
+    }
+
+    private func isPointerInside(view: NSView, in window: NSWindow, slop: CGFloat) -> Bool {
+        guard view.window === window, !view.isHiddenOrHasHiddenAncestor,
+              window.isVisible, !window.isMiniaturized else { return false }
+        let inWin = view.convert(view.bounds, to: nil)
+        let onScreen = window.convertToScreen(inWin)
+        return onScreen.insetBy(dx: -slop, dy: -slop).contains(pointerLocationProvider())
+    }
+
+    private func isPointerInsidePanel(slop: CGFloat) -> Bool {
+        guard let p = panel, p.isVisible, p.alphaValue > 0.05 else { return false }
+        return p.frame.insetBy(dx: -slop, dy: -slop).contains(pointerLocationProvider())
+    }
+
+    private func startDismissMonitors() {
+        if watchdogTimer == nil {
+            let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
+                self?.validateHoverState()
+            }
+            timer.tolerance = 0.04
+            RunLoop.main.add(timer, forMode: .common)
+            watchdogTimer = timer
+        }
+        if localEventMonitor == nil {
+            localEventMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: [.mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel, .keyDown]
+            ) { [weak self] event in
+                guard let self else { return event }
+                switch event.type {
+                case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+                    if self.currentTabID != nil && self.isPointerInsidePanel(slop: 1.0) {
+                        return event
+                    }
+                    self.dismiss(animated: false)
+                case .scrollWheel, .keyDown:
+                    self.dismiss(animated: false)
+                case .mouseMoved:
+                    self.validateHoverState()
+                default:
+                    break
+                }
+                return event
+            }
+        }
+    }
+
+    private func stopDismissMonitors() {
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+        if let monitor = localEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            localEventMonitor = nil
         }
     }
 
@@ -173,8 +315,13 @@ final class TabHoverPreviewController {
         ensurePanel(size: cardSize)
         guard let panel else { return }
 
+        presentationGeneration &+= 1
+        pendingTabID = nil
+        showWorkItem = nil
+        anchorView = placement.anchorView
         currentTabID = item.tabID
         populate(item: item, isDark: isDark)
+        startDismissMonitors()
 
         let targetFrame = computePanelFrame(cardSize: cardSize, placement: placement, parentWindow: window)
 

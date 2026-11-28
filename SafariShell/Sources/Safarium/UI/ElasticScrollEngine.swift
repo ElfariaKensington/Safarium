@@ -163,9 +163,9 @@ final class ElasticScrollEngine: NSObject {
         /// WebKit `Scrollbar::pageStep` (`max(visibleH * 0.875, visibleH - 40)`).
         static let pageStepFraction: CGFloat = 0.875
         static let pageStepOverlap: CGFloat = 40.0
-        /// Touchpad-style underdamped spring-momentum Space scroll (`zeta = 0.68`, `omega = 15.0` -> ~5.5% overshoot + settle).
+        /// Critically damped spring-momentum Space scroll (`zeta = 1.0`, `omega = 15.0` -> smooth ease-out with zero bounce when stopping).
         static let keyboardSpringOmega: CGFloat = 15.0
-        static let keyboardSpringZeta: CGFloat = 0.68
+        static let keyboardSpringZeta: CGFloat = 1.0
         static let keyboardLaunchVelocityFactor: CGFloat = 3.2
         static let keyboardMomentumChainWindow: TimeInterval = 0.55
         static let keyboardMaxMomentumChain: CGFloat = 5.0
@@ -200,6 +200,7 @@ final class ElasticScrollEngine: NSObject {
         var peakForwardSpeed: CGFloat
         var isStartPage: Bool
         var emittedBegan: Bool
+        var hasLiveTelemetry: Bool = false
     }
 
     private struct VelocitySample {
@@ -353,8 +354,67 @@ final class ElasticScrollEngine: NSObject {
             isPageLoading: isPageLoading
         )
 
-        if resyncEstimate && keyboardGlide == nil {
-            estimatedScrollY = clampedScrollY
+        if resyncEstimate {
+            if var glide = keyboardGlide, !glide.isStartPage {
+                glide.hasLiveTelemetry = true
+                let hitRealTop = glide.scrollSign < 0 && !canInnerScrollUp && clampedScrollY <= 0.5
+                let hitRealBottom = glide.scrollSign > 0 && !canInnerScrollDown && maxScroll > 0.5 && clampedScrollY >= maxScroll - 0.5
+                if hitRealTop || hitRealBottom {
+                    if glide.emittedBegan {
+                        onSyntheticScroll?(0, .ended)
+                    }
+                    keyboardGlide = nil
+                    estimatedScrollY = hitRealTop ? 0 : maxScroll
+                    spaceRepeatLatchedEdgeSign = glide.scrollSign
+                    spaceMomentumChain = 0
+                    let minEdgeImpact = min(2_200.0, glide.peakForwardSpeed * 0.34)
+                    let impactSpeed = max(abs(glide.currentScrollVelocityY), minEdgeImpact)
+                    if ScrollDebugLog.isEnabled {
+                        ScrollDebugLog.write(String(
+                            format: "spaceEdge telemetry sign=%.0f v=%.0f sy=%.1f",
+                            glide.scrollSign, impactSpeed, clampedScrollY
+                        ))
+                    }
+                    if impactSpeed >= Parameters.minBounceImpactVelocity {
+                        startRubberBandAnimation(
+                            initialScrollVelocityY: glide.scrollSign * impactSpeed,
+                            initialStretchY: 0,
+                            targetStretchY: 0
+                        )
+                    }
+                    updateDisplayLinkRunningState()
+                    updateInteractionState()
+                } else {
+                    let maxLead = max(48.0, abs(glide.currentScrollVelocityY) * 0.018)
+                    if glide.scrollSign < 0 {
+                        estimatedScrollY = min(clampedScrollY, max(clampedScrollY - maxLead, estimatedScrollY))
+                    } else {
+                        estimatedScrollY = max(clampedScrollY, min(clampedScrollY + maxLead, estimatedScrollY))
+                    }
+                    estimatedScrollY = min(max(0, estimatedScrollY), maxScroll)
+                    keyboardGlide = glide
+                }
+            } else if keyboardGlide == nil {
+                let bouncingTop = stretchY < -0.01 || (rubberBandAnimation?.initialScrollVelocityY ?? 0) < 0 || (rubberBandAnimation?.initialStretchY ?? 0) < -0.01
+                let bouncingBottom = stretchY > 0.01 || (rubberBandAnimation?.initialScrollVelocityY ?? 0) > 0 || (rubberBandAnimation?.initialStretchY ?? 0) > 0.01
+                if bouncingTop && clampedScrollY <= 120.0 {
+                    if clampedScrollY > 0.5 {
+                        onSyntheticScroll?(clampedScrollY, .began)
+                        onSyntheticScroll?(0, .ended)
+                    }
+                    estimatedScrollY = 0
+                } else if bouncingBottom && clampedScrollY >= maxScroll - 120.0 {
+                    if maxScroll - clampedScrollY > 0.5 {
+                        onSyntheticScroll?(-(maxScroll - clampedScrollY), .began)
+                        onSyntheticScroll?(0, .ended)
+                    }
+                    estimatedScrollY = maxScroll
+                } else {
+                    estimatedScrollY = clampedScrollY
+                }
+            } else {
+                estimatedScrollY = min(max(0, estimatedScrollY), maxScroll)
+            }
         } else {
             estimatedScrollY = min(max(0, estimatedScrollY), maxScroll)
         }
@@ -413,7 +473,10 @@ final class ElasticScrollEngine: NSObject {
             )
         }
 
-        estimatedScrollY = clampScrollY(estimatedScrollY - event.scrollingDeltaY)
+        let discreteScrollDY = -event.scrollingDeltaY
+        if canStretchInScrollDirection(discreteScrollDY) {
+            estimatedScrollY = clampScrollY(estimatedScrollY + discreteScrollDY)
+        }
         return false
     }
 
@@ -430,7 +493,9 @@ final class ElasticScrollEngine: NSObject {
             if isOverscrolling || isAnimatingRubberBand {
                 resetImmediately()
             }
-            estimatedScrollY = clampScrollY(estimatedScrollY - deltaY)
+            if canStretchInScrollDirection(-deltaY) {
+                estimatedScrollY = clampScrollY(estimatedScrollY - deltaY)
+            }
             return false
         }
 
@@ -443,6 +508,9 @@ final class ElasticScrollEngine: NSObject {
         }
 
         if phase == .mayBegin {
+            if !isOverscrolling && !isAnimatingRubberBand && !momentumScrollInProgress {
+                estimatedScrollY = metrics.scrollY
+            }
             momentumScrollInProgress = false
             ignoreMomentumScrolls = false
             velocitySamples.removeAll(keepingCapacity: true)
@@ -467,6 +535,9 @@ final class ElasticScrollEngine: NSObject {
         }
 
         if phase == .began {
+            if !isOverscrolling && !isAnimatingRubberBand && !momentumScrollInProgress {
+                estimatedScrollY = metrics.scrollY
+            }
             inScrollGesture = true
             momentumScrollInProgress = false
             ignoreMomentumScrolls = false
@@ -567,7 +638,9 @@ final class ElasticScrollEngine: NSObject {
         _ = deltaX
 
         if MotionPreference.reduced {
-            estimatedScrollY = clampScrollY(estimatedScrollY - deltaY)
+            if canStretchInScrollDirection(-deltaY) {
+                estimatedScrollY = clampScrollY(estimatedScrollY - deltaY)
+            }
             return false
         }
 
@@ -659,15 +732,36 @@ final class ElasticScrollEngine: NSObject {
             } else {
                 ignoreMomentumScrolls = true
                 momentumScrollInProgress = false
-                if stretchY < 0 && metrics.isReloadableWebPage, case .hidden = refreshState {
-                    refreshState = .pullingMomentum
+                let targetStretch = activeRefreshTargetStretchY
+                let keepExisting: Bool = {
+                    guard let existing = rubberBandAnimation else { return false }
+                    let sameDirection = (existing.initialScrollVelocityY < 0 && scrollVelY < 0)
+                        || (existing.initialScrollVelocityY > 0 && scrollVelY > 0)
+                    guard sameDirection else { return false }
+                    let elapsed = max(0, ts - existing.startTime)
+                    let existingFuture = abs(AppKitElasticity.elasticDelta(
+                        initialPosition: existing.initialStretchY - existing.targetStretchY,
+                        initialVelocity: -existing.initialScrollVelocityY,
+                        elapsedTime: elapsed + 0.050
+                    ))
+                    let candidateFuture = abs(AppKitElasticity.elasticDelta(
+                        initialPosition: stretchY - targetStretch,
+                        initialVelocity: -scrollVelY,
+                        elapsedTime: 0.050
+                    ))
+                    return existingFuture >= candidateFuture
+                }()
+                if !keepExisting {
+                    if stretchY < 0 && metrics.isReloadableWebPage, case .hidden = refreshState {
+                        refreshState = .pullingMomentum
+                    }
+                    startRubberBandAnimation(
+                        initialScrollVelocityY: scrollVelY,
+                        initialStretchY: stretchY,
+                        targetStretchY: targetStretch,
+                        now: ts
+                    )
                 }
-                startRubberBandAnimation(
-                    initialScrollVelocityY: scrollVelY,
-                    initialStretchY: stretchY,
-                    targetStretchY: activeRefreshTargetStretchY,
-                    now: ts
-                )
                 updateSpinnerPresentation(now: ts)
                 updateDisplayLinkRunningState()
                 updateInteractionState()
@@ -677,7 +771,6 @@ final class ElasticScrollEngine: NSObject {
 
         // 2. In-bounds momentum scrolling toward top or bottom edge.
         if !canStretchInScrollDirection(scrollDY) {
-            estimatedScrollY = clampScrollY(estimatedScrollY + scrollDY)
             return false
         }
 
@@ -687,15 +780,19 @@ final class ElasticScrollEngine: NSObject {
                 ignoreMomentumScrolls = true
                 momentumScrollInProgress = false
                 if abs(scrollVelY) >= Parameters.minBounceImpactVelocity {
-                    if metrics.isReloadableWebPage, case .hidden = refreshState {
-                        refreshState = .pullingMomentum
+                    let keepExisting = (rubberBandAnimation?.initialScrollVelocityY ?? 0) < 0
+                        && abs(rubberBandAnimation?.initialScrollVelocityY ?? 0) >= abs(scrollVelY)
+                    if !keepExisting {
+                        if metrics.isReloadableWebPage, case .hidden = refreshState {
+                            refreshState = .pullingMomentum
+                        }
+                        startRubberBandAnimation(
+                            initialScrollVelocityY: scrollVelY,
+                            initialStretchY: 0,
+                            targetStretchY: activeRefreshTargetStretchY,
+                            now: ts
+                        )
                     }
-                    startRubberBandAnimation(
-                        initialScrollVelocityY: scrollVelY,
-                        initialStretchY: 0,
-                        targetStretchY: activeRefreshTargetStretchY,
-                        now: ts
-                    )
                 }
                 logWheelStepIfEnabled(phase: 0, momentumPhase: momentumPhase.rawValue, wheelDY: deltaY)
                 updateSpinnerPresentation(now: ts)
@@ -710,15 +807,19 @@ final class ElasticScrollEngine: NSObject {
                 ignoreMomentumScrolls = true
                 momentumScrollInProgress = false
                 if abs(scrollVelY) >= Parameters.minBounceImpactVelocity {
-                    if metrics.isReloadableWebPage, case .hidden = refreshState {
-                        refreshState = .pullingMomentum
+                    let keepExisting = (rubberBandAnimation?.initialScrollVelocityY ?? 0) < 0
+                        && abs(rubberBandAnimation?.initialScrollVelocityY ?? 0) >= abs(scrollVelY)
+                    if !keepExisting {
+                        if metrics.isReloadableWebPage, case .hidden = refreshState {
+                            refreshState = .pullingMomentum
+                        }
+                        startRubberBandAnimation(
+                            initialScrollVelocityY: scrollVelY,
+                            initialStretchY: 0,
+                            targetStretchY: activeRefreshTargetStretchY,
+                            now: ts
+                        )
                     }
-                    startRubberBandAnimation(
-                        initialScrollVelocityY: scrollVelY,
-                        initialStretchY: 0,
-                        targetStretchY: activeRefreshTargetStretchY,
-                        now: ts
-                    )
                 }
                 logWheelStepIfEnabled(phase: 0, momentumPhase: momentumPhase.rawValue, wheelDY: deltaY)
                 updateSpinnerPresentation(now: ts)
@@ -736,12 +837,16 @@ final class ElasticScrollEngine: NSObject {
                 ignoreMomentumScrolls = true
                 momentumScrollInProgress = false
                 if abs(scrollVelY) >= Parameters.minBounceImpactVelocity {
-                    startRubberBandAnimation(
-                        initialScrollVelocityY: scrollVelY,
-                        initialStretchY: 0,
-                        targetStretchY: 0,
-                        now: ts
-                    )
+                    let keepExisting = (rubberBandAnimation?.initialScrollVelocityY ?? 0) > 0
+                        && abs(rubberBandAnimation?.initialScrollVelocityY ?? 0) >= abs(scrollVelY)
+                    if !keepExisting {
+                        startRubberBandAnimation(
+                            initialScrollVelocityY: scrollVelY,
+                            initialStretchY: 0,
+                            targetStretchY: 0,
+                            now: ts
+                        )
+                    }
                 }
                 logWheelStepIfEnabled(phase: 0, momentumPhase: momentumPhase.rawValue, wheelDY: deltaY)
                 updateDisplayLinkRunningState()
@@ -755,12 +860,16 @@ final class ElasticScrollEngine: NSObject {
                 ignoreMomentumScrolls = true
                 momentumScrollInProgress = false
                 if abs(scrollVelY) >= Parameters.minBounceImpactVelocity {
-                    startRubberBandAnimation(
-                        initialScrollVelocityY: scrollVelY,
-                        initialStretchY: 0,
-                        targetStretchY: 0,
-                        now: ts
-                    )
+                    let keepExisting = (rubberBandAnimation?.initialScrollVelocityY ?? 0) > 0
+                        && abs(rubberBandAnimation?.initialScrollVelocityY ?? 0) >= abs(scrollVelY)
+                    if !keepExisting {
+                        startRubberBandAnimation(
+                            initialScrollVelocityY: scrollVelY,
+                            initialStretchY: 0,
+                            targetStretchY: 0,
+                            now: ts
+                        )
+                    }
                 }
                 logWheelStepIfEnabled(phase: 0, momentumPhase: momentumPhase.rawValue, wheelDY: deltaY)
                 updateDisplayLinkRunningState()
@@ -888,6 +997,8 @@ final class ElasticScrollEngine: NSObject {
                     if scrollSign * active.currentScrollVelocityY < targetCruiseSpeed {
                         active.currentScrollVelocityY = scrollSign * targetCruiseSpeed
                     }
+                    let maxNoBounceSpeed = min(Parameters.maxMomentumVelocity, Parameters.keyboardSpringOmega * abs(active.remainingScrollDeltaY))
+                    active.currentScrollVelocityY = scrollSign * min(abs(active.currentScrollVelocityY), maxNoBounceSpeed)
                 } else {
                     let tapGain = 1.0 + 0.45 * spaceMomentumChain + 0.10 * spaceMomentumChain * spaceMomentumChain
                     let maxQueued = step * Parameters.keyboardMaxQueuedPages
@@ -895,17 +1006,19 @@ final class ElasticScrollEngine: NSObject {
                     active.remainingScrollDeltaY = scrollSign * min(abs(combined), maxQueued)
 
                     let velKick = signedStep * (2.6 + 0.90 * spaceMomentumChain)
+                    let maxNoBounceSpeed = min(Parameters.maxMomentumVelocity, Parameters.keyboardSpringOmega * abs(active.remainingScrollDeltaY))
                     let boostedVel = active.currentScrollVelocityY + velKick
                     active.currentScrollVelocityY = min(
-                        max(boostedVel, -Parameters.maxMomentumVelocity),
-                        Parameters.maxMomentumVelocity
+                        max(boostedVel, -maxNoBounceSpeed),
+                        maxNoBounceSpeed
                     )
                 }
             } else {
                 // Reversing direction mid-glide resets momentum and smoothly redirects in one continuous stream.
                 active.scrollSign = scrollSign
                 active.remainingScrollDeltaY = signedStep
-                active.currentScrollVelocityY = signedStep * Parameters.keyboardLaunchVelocityFactor
+                let maxNoBounceSpeed = min(Parameters.maxMomentumVelocity, Parameters.keyboardSpringOmega * abs(signedStep))
+                active.currentScrollVelocityY = scrollSign * min(abs(signedStep) * Parameters.keyboardLaunchVelocityFactor, maxNoBounceSpeed)
                 active.peakForwardSpeed = abs(active.currentScrollVelocityY)
             }
             active.isStartPage = isStartPage
@@ -916,12 +1029,13 @@ final class ElasticScrollEngine: NSObject {
                 ? (1.0 + 0.45 * spaceMomentumChain + 0.10 * spaceMomentumChain * spaceMomentumChain)
                 : 1.0
             let launchDelta = signedStep * tapGain
+            let maxNoBounceSpeed = min(Parameters.maxMomentumVelocity, Parameters.keyboardSpringOmega * abs(launchDelta))
             let launchVel = min(
                 max(
                     signedStep * (Parameters.keyboardLaunchVelocityFactor + 0.90 * spaceMomentumChain),
-                    -Parameters.maxMomentumVelocity
+                    -maxNoBounceSpeed
                 ),
-                Parameters.maxMomentumVelocity
+                maxNoBounceSpeed
             )
             keyboardGlide = KeyboardGlideState(
                 lastFrameTime: now,
@@ -1002,23 +1116,30 @@ final class ElasticScrollEngine: NSObject {
             let dt = min(max(rawDt > 0 ? rawDt : (1.0 / 120.0), 1.0 / 240.0), 0.050)
             glide.lastFrameTime = timestamp
 
-            // Exact closed-form underdamped spring-damper step (`e = -remainingScrollDeltaY`, `v = currentScrollVelocityY`):
-            // accelerates smoothly like a touchpad flick, overshoots target slightly (~5.5%), and cushions back to 0.
+            // Exact closed-form critically damped spring-damper step (`e = -remainingScrollDeltaY`, `v = currentScrollVelocityY`):
+            // accelerates smoothly like a touchpad flick and settles cleanly to 0 with zero overshoot/bounce.
             let omega = Double(Parameters.keyboardSpringOmega)
             let zeta = Double(Parameters.keyboardSpringZeta)
-            let zetaOmega = zeta * omega
-            let omegaD = omega * Foundation.sqrt(max(1e-6, 1.0 - zeta * zeta))
-
             let e0 = -Double(glide.remainingScrollDeltaY)
             let v0 = Double(glide.currentScrollVelocityY)
-            let a = e0
-            let b = (v0 + zetaOmega * e0) / omegaD
-            let env = Foundation.exp(-zetaOmega * dt)
-            let c = Foundation.cos(omegaD * dt)
-            let s = Foundation.sin(omegaD * dt)
-
-            let e1 = env * (a * c + b * s)
-            let v1 = env * ((b * omegaD - zetaOmega * a) * c - (a * omegaD + zetaOmega * b) * s)
+            let e1: Double
+            let v1: Double
+            if zeta >= 1.0 - 1e-4 {
+                let env = Foundation.exp(-omega * dt)
+                let c1 = v0 + omega * e0
+                e1 = (e0 + c1 * dt) * env
+                v1 = (v0 - omega * c1 * dt) * env
+            } else {
+                let zetaOmega = zeta * omega
+                let omegaD = omega * Foundation.sqrt(max(1e-6, 1.0 - zeta * zeta))
+                let a = e0
+                let b = (v0 + zetaOmega * e0) / omegaD
+                let env = Foundation.exp(-zetaOmega * dt)
+                let c = Foundation.cos(omegaD * dt)
+                let s = Foundation.sin(omegaD * dt)
+                e1 = env * (a * c + b * s)
+                v1 = env * ((b * omegaD - zetaOmega * a) * c - (a * omegaD + zetaOmega * b) * s)
+            }
 
             var stepScrollDY = CGFloat(e1 - e0)
             let newRemaining = CGFloat(-e1)
@@ -1034,14 +1155,27 @@ final class ElasticScrollEngine: NSObject {
 
             var hitPinnedEdge = false
             if !glide.isStartPage {
+                let liveTelemetryMargin = max(48.0, abs(instantVelY) * 0.020)
                 if stepScrollDY < 0 && !metrics.canInnerScrollUp && estimatedScrollY + stepScrollDY <= 0 {
-                    stepScrollDY = -estimatedScrollY
-                    estimatedScrollY = 0
-                    hitPinnedEdge = (glide.scrollSign < 0)
+                    if glide.hasLiveTelemetry && metrics.scrollY > liveTelemetryMargin {
+                        // Virtualized content above expanded or renderer scrollY hasn't caught up yet; keep gliding to real y = 0.
+                        estimatedScrollY = max(1.0, metrics.scrollY - max(48.0, abs(instantVelY) * 0.018))
+                    } else {
+                        stepScrollDY = glide.hasLiveTelemetry ? -max(estimatedScrollY, metrics.scrollY) : -estimatedScrollY
+                        estimatedScrollY = 0
+                        hitPinnedEdge = (glide.scrollSign < 0)
+                    }
                 } else if stepScrollDY > 0 && !metrics.canInnerScrollDown && estimatedScrollY + stepScrollDY >= metrics.maxScrollY {
-                    stepScrollDY = metrics.maxScrollY - estimatedScrollY
-                    estimatedScrollY = metrics.maxScrollY
-                    hitPinnedEdge = (glide.scrollSign > 0)
+                    if glide.hasLiveTelemetry && (metrics.maxScrollY - metrics.scrollY) > liveTelemetryMargin {
+                        estimatedScrollY = min(max(0, metrics.maxScrollY - 1.0), metrics.scrollY + max(48.0, abs(instantVelY) * 0.018))
+                    } else {
+                        let remainingToMax = glide.hasLiveTelemetry
+                            ? max(metrics.maxScrollY - estimatedScrollY, metrics.maxScrollY - metrics.scrollY)
+                            : (metrics.maxScrollY - estimatedScrollY)
+                        stepScrollDY = remainingToMax
+                        estimatedScrollY = metrics.maxScrollY
+                        hitPinnedEdge = (glide.scrollSign > 0)
+                    }
                 } else {
                     estimatedScrollY = clampScrollY(estimatedScrollY + stepScrollDY)
                 }
@@ -1060,6 +1194,12 @@ final class ElasticScrollEngine: NSObject {
                 spaceMomentumChain = 0
                 let minEdgeImpact = min(2_200.0, glide.peakForwardSpeed * 0.34)
                 let impactSpeed = max(abs(instantVelY), minEdgeImpact)
+                if ScrollDebugLog.isEnabled {
+                    ScrollDebugLog.write(String(
+                        format: "spaceEdge step sign=%.0f v=%.0f sy=%.1f",
+                        glide.scrollSign, impactSpeed, metrics.scrollY
+                    ))
+                }
                 if impactSpeed >= Parameters.minBounceImpactVelocity {
                     startRubberBandAnimation(
                         initialScrollVelocityY: glide.scrollSign * impactSpeed,
@@ -1194,7 +1334,6 @@ final class ElasticScrollEngine: NSObject {
 
         // 2. Not currently stretched: check inner-scroller latch and top/bottom edge boundaries.
         guard canStretchInScrollDirection(scrollDY) else {
-            estimatedScrollY = clampScrollY(estimatedScrollY + scrollDY)
             return false
         }
 
@@ -1514,7 +1653,8 @@ final class ElasticScrollEngine: NSObject {
             return
         }
         if displayLink == nil, let view = targetView {
-            let link = view.displayLink(target: self, selector: #selector(handleDisplayLinkTick(_:)))
+            let link: CADisplayLink = (ScrollDebugLog.isEnabled ? NSScreen.main?.displayLink(target: self, selector: #selector(handleDisplayLinkTick(_:))) : nil)
+                ?? view.displayLink(target: self, selector: #selector(handleDisplayLinkTick(_:)))
             if #available(macOS 14.0, *) {
                 link.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
             }

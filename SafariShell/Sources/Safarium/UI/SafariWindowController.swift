@@ -2158,7 +2158,10 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
                   !self.addressBarPopover.isShown else { return }
             let dir = (note.userInfo?["direction"] as? NSNumber)?.intValue ?? -1
             let isRepeat = (note.userInfo?["isRepeat"] as? NSNumber)?.boolValue ?? false
-            self.syncElasticMetrics(for: tab, isFreshTelemetry: false)
+            let syncFresh = !self.elasticScrollEngine.isAnimatingKeyboardScroll
+                && !self.elasticScrollEngine.isAnimatingRubberBand
+                && !self.elasticScrollEngine.isOverscrolling
+            self.syncElasticMetrics(for: tab, isFreshTelemetry: syncFresh)
             self.elasticScrollEngine.triggerSpaceScroll(direction: dir, isRepeat: isRepeat, isStartPage: false)
         }
     }
@@ -2227,9 +2230,12 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
             return
         }
         guard let window else { return }
-        if phase == .began || phase == .ended { syntheticScrollRemainder = 0.0 }
+        if phase == .began { syntheticScrollRemainder = 0.0 }
+        let runningTotal = syntheticScrollRemainder + deltaY
+        let wholePoints = runningTotal.rounded()
+        syntheticScrollRemainder = (phase == .ended) ? 0.0 : (runningTotal - wholePoints)
         // Nothing to move this frame: keep the stream quiet (no zero-delta "changed" events).
-        if phase == .changed && abs(deltaY) < 0.001 { return }
+        if phase == .changed && abs(wholePoints) < 0.5 { return }
 
         let targetView = findRenderWidgetHostView(in: tab.contentView) ?? tab.contentView
         // Chromium ignores a momentum stream that no gesture opened, so open it like a real trackpad flick:
@@ -2244,27 +2250,25 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         case .changed: momentum = 2    // kCGMomentumScrollPhaseContinue
         case .ended: momentum = 3      // kCGMomentumScrollPhaseEnd
         }
-        sendSyntheticScrollEvent(points: deltaY, scrollPhase: 0, momentumPhase: momentum, to: targetView, in: window)
+        sendSyntheticScrollEvent(points: wholePoints, scrollPhase: 0, momentumPhase: momentum, to: targetView, in: window)
     }
 
     private func sendSyntheticScrollEvent(points: CGFloat, scrollPhase: Int64, momentumPhase: Int64,
                                           to targetView: NSView, in window: NSWindow) {
+        let intPoints = Int64(points.rounded())
         guard let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
-                               wheel1: Int32(points.rounded()), wheel2: 0, wheel3: 0) else { return }
-        // Aim at the pointer when it is over the page (a hovered inner scroller scrolls, like a trackpad), else at
-        // the middle of the page.
-        let mouseScreen = NSEvent.mouseLocation
-        let mouseInStage = contentStageView.convert(window.convertPoint(fromScreen: mouseScreen), from: nil)
-        let pointInWindow: NSPoint = contentStageView.bounds.contains(mouseInStage)
-            ? window.convertPoint(fromScreen: mouseScreen)
-            : webContentHost.convert(NSPoint(x: webContentHost.bounds.midX, y: webContentHost.bounds.midY), to: nil)
+                               wheel1: Int32(clamping: intPoints), wheel2: 0, wheel3: 0) else { return }
+        // Keyboard Space / Shift+Space scrolls the page itself (never an unrelated sidebar under an idle cursor).
+        let pointInWindow = webContentHost.convert(
+            NSPoint(x: webContentHost.bounds.midX, y: webContentHost.bounds.midY),
+            to: nil
+        )
         let screenPoint = window.convertPoint(toScreen: pointInWindow)
         let primaryH = NSScreen.screens.first?.frame.height ?? 900.0
         cg.location = CGPoint(x: screenPoint.x, y: primaryH - screenPoint.y)
         cg.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-        // Set line/fixed fields BEFORE point delta so CoreGraphics preserves exact floating-point sub-pixel scrollingDeltaY.
-        cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Double(points) / 10.0)
-        cg.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: Double(points))
+        cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Double(intPoints) / 10.0)
+        cg.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: intPoints)
         cg.setIntegerValueField(.scrollWheelEventScrollPhase, value: scrollPhase)
         cg.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentumPhase)
         cg.timestamp = CGEventTimestamp(ProcessInfo.processInfo.systemUptime * 1e9)
@@ -2882,6 +2886,8 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
 
     func selectTab(at index: Int, animatedTabBar: Bool? = nil, skipOverviewClose: Bool = false) {
         guard index >= 0 && index < tabs.count else { return }
+        tabHoverPreviewController.dismiss(animated: false)
+        verticalTabRailView.dismissHoverPill()
         extensionPopoverController.close()
         if !skipOverviewClose && (tabOverviewView.isPresented || overviewOpenTarget) {
             overviewOpenTarget = false
@@ -3034,6 +3040,8 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
 
     func closeTab(at index: Int, keepOverviewOpen: Bool = false) {
         guard index >= 0 && index < tabs.count else { return }
+        tabHoverPreviewController.dismiss(animated: false)
+        verticalTabRailView.dismissHoverPill()
         let wasActive = (index == activeTabIndex)
         let removed = tabs.remove(at: index)
         if navigationTransitionCoordinator.activeTabID == removed.tabID {
@@ -5065,6 +5073,9 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         if layout == "vertical" {
             verticalTabRailView.update(items: items)
         }
+        if tabOverviewView.isPresented || addressBarPopover.isShown || (tabs.count <= 1 && layout != "vertical") {
+            tabHoverPreviewController.dismiss(animated: false)
+        }
         if let active = activeTab {
             tabLastActiveAt[active.tabID] = Date()
             let cleanTitle = active.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5573,6 +5584,7 @@ final class SafariWindowController: NSWindowController, NSWindowDelegate, NSTool
         }
         guard let window,
               window.isVisible,
+              window.isKeyWindow,
               !tabOverviewView.isPresented,
               !addressBarPopover.isShown,
               let tab = tabs.first(where: { $0.tabID == tabID }),
@@ -7055,6 +7067,30 @@ private final class SeparateTabSlotView: NSView {
         updateHoverVisuals(animated: true)
     }
 
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        if superview == nil {
+            clearHoverOnDetach()
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            clearHoverOnDetach()
+        }
+    }
+
+    private func clearHoverOnDetach() {
+        let wasHovered = isHovered || isCloseHovered
+        isHovered = false
+        isCloseHovered = false
+        if wasHovered {
+            onHoverChanged?(tabID, false)
+            updateHoverVisuals(animated: false)
+        }
+    }
+
     private func updateCloseHover(_ event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
         isCloseHovered = isHovered && closeHitRect.insetBy(dx: -2, dy: -2).contains(pt)
@@ -7063,18 +7099,21 @@ private final class SeparateTabSlotView: NSView {
     override func mouseDown(with event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
         if isHovered && closeHitRect.insetBy(dx: -2, dy: -2).contains(pt) {
+            clearHoverOnDetach()
             onClose?(tabID)
             return
         }
         if let onMouseDownTrack {
             onMouseDownTrack(event)
         } else {
+            clearHoverOnDetach()
             onSelect?(tabID)
         }
     }
 
     override func otherMouseDown(with event: NSEvent) {
         if event.buttonNumber == 2 {
+            clearHoverOnDetach()
             onClose?(tabID)
         } else {
             super.otherMouseDown(with: event)
@@ -8038,16 +8077,41 @@ private final class VerticalTabIconRowView: NSView {
         onHover?(false)
     }
 
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        if superview == nil {
+            clearHoverOnDetach()
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            clearHoverOnDetach()
+        }
+    }
+
+    private func clearHoverOnDetach() {
+        let wasHovered = isHovered
+        isHovered = false
+        if wasHovered {
+            apply(isDark: isDark)
+            onHover?(false)
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
         if let onMouseDownTrack {
             onMouseDownTrack(event)
         } else {
+            clearHoverOnDetach()
             onSelect?(item.id)
         }
     }
 
     override func otherMouseDown(with event: NSEvent) {
         if event.buttonNumber == 2 {
+            clearHoverOnDetach()
             onClose?(item.id)
         } else {
             super.otherMouseDown(with: event)

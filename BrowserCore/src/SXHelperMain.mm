@@ -45,6 +45,7 @@ struct SXLaunchServicesBridge {
   bool is_extension_process = false;
   std::string default_name = "Safarium Web Content";
   std::string current_name;
+  std::string pending_user_data_dir;
   std::unordered_map<std::string, std::string> extension_names;
 
   CheckInFn check_in = nullptr;
@@ -203,7 +204,7 @@ void SXInitLaunchServicesForSubprocess(int argc, char* argv[]) {
   ls.is_extension_process = isExtProcess;
   ls.default_name = initialName;
 
-  // Load extension display names before Seatbelt sandbox locks down filesystem reads.
+  // Load extension display names (safe now that SXInitLaunchServicesForSubprocess runs after cef_load_library).
   if (procType == "renderer" && !userDataDir.empty()) {
     SXLoadExtensionNameMapFromUserDataDir(userDataDir);
   }
@@ -232,18 +233,15 @@ void SXInitLaunchServicesForSubprocess(int argc, char* argv[]) {
   CFDictionarySetValue(dict, CFSTR("ApplicationType"), CFSTR("UIElement"));
   if (cfBundleId) {
     CFDictionarySetValue(dict, CFSTR("CFBundleIdentifier"), cfBundleId);
-    CFRelease(cfBundleId);
   }
   if (cfName) {
     CFDictionarySetValue(dict, CFSTR("CFBundleName"), cfName);
     CFDictionarySetValue(dict, CFSTR("CFBundleDisplayName"), cfName);
   }
 
-  CFTypeRef checkInResult = ls.check_in(-2, dict);
-  if (checkInResult) {
-    CFRelease(checkInResult);
-  }
-  CFRelease(dict);
+  // Intentionally retain pre-CEF CF objects (~200B once per subprocess) rather than calling CFRelease before
+  // PartitionAlloc installs its malloc zone during cef_load_library, avoiding cross-zone free traps on GCD threads.
+  (void)ls.check_in(-2, dict);
 
   ls.current_asn = ls.get_asn();
   if (ls.current_asn) {
@@ -254,9 +252,6 @@ void SXInitLaunchServicesForSubprocess(int argc, char* argv[]) {
         ls.current_name = initialName;
       }
     }
-  }
-  if (cfName) {
-    CFRelease(cfName);
   }
 }
 
@@ -575,6 +570,17 @@ class SXTelemetryV8Handler : public CefV8Handler {
       CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("sx_privacy_fp_event");
       CefRefPtr<CefListValue> args = msg->GetArgumentList();
       args->SetString(0, arguments[0]->GetStringValue());
+      frame_->SendProcessMessage(PID_BROWSER, msg);
+      return true;
+    }
+    if (name == "reportDragImageInfo" && arguments.size() >= 5) {
+      CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("sx.drag_img_info");
+      CefRefPtr<CefListValue> args = msg->GetArgumentList();
+      args->SetDouble(0, arguments[0]->GetDoubleValue());
+      args->SetDouble(1, arguments[1]->GetDoubleValue());
+      args->SetDouble(2, arguments[2]->GetDoubleValue());
+      args->SetDouble(3, arguments[3]->GetDoubleValue());
+      args->SetString(4, arguments[4]->GetStringValue());
       frame_->SendProcessMessage(PID_BROWSER, msg);
       return true;
     }
@@ -1640,20 +1646,64 @@ class SXHelperApp : public CefApp,
     CefRefPtr<CefV8Value> installer;
     CefRefPtr<CefV8Exception> exception;
     const char* kInstallerJS = R"JS(
-      (function(reportMetrics, _unusedOverscroll, _unusedPullRefresh, cwsAction, spaceScroll, reportFixedHeader, reportPageBg, reportNativeVideo, reportAuthEvent, mediaProxyPort, mediaProxyToken, reportNavReady, initialTopInset, reportNavTraverse) {
+      (function(reportMetrics, _unusedOverscroll, _unusedPullRefresh, cwsAction, spaceScroll, reportFixedHeader, reportPageBg, reportNativeVideo, reportAuthEvent, mediaProxyPort, mediaProxyToken, reportNavReady, initialTopInset, reportNavTraverse, reportDragImageInfo) {
+        if (typeof reportDragImageInfo === 'function') {
+          window.addEventListener('dragstart', function(ev) {
+            try {
+              let img = null;
+              if (ev && typeof ev.composedPath === 'function') {
+                const path = ev.composedPath();
+                for (let i = 0; i < path.length; i++) {
+                  const node = path[i];
+                  if (node && node.tagName === 'IMG') {
+                    img = node;
+                    break;
+                  }
+                }
+              }
+              const t = ev && ev.target;
+              if (!img) {
+                if (t && t.tagName === 'IMG') {
+                  img = t;
+                } else if (t && t.querySelector) {
+                  img = t.querySelector('img') || (t.shadowRoot ? t.shadowRoot.querySelector('img') : null);
+                }
+              }
+              if (img && img.naturalWidth > 0 && img.naturalHeight > 0) {
+                const r = img.getBoundingClientRect();
+                const cs = window.getComputedStyle ? window.getComputedStyle(img) : null;
+                const fit = (cs && cs.objectFit) ? String(cs.objectFit) : 'fill';
+                if (r.width > 0 && r.height > 0) {
+                  reportDragImageInfo(img.naturalWidth, img.naturalHeight, r.width, r.height, fit);
+                  return;
+                }
+              }
+              reportDragImageInfo(0, 0, 0, 0, '');
+            } catch (_) {}
+          }, { capture: true, passive: true });
+        }
         const onScrollPhase = function() {};
         const settle = function() {};
 
-        // Keep root overscroll owned by Safarium's 120Hz AppKit WebKit engine (so top-pinned fixed bars shift
-        // with overscroll and reveal PullToRefreshView), while inner overflow scrollers rubber-band natively on
-        // Chromium's 120Hz compositor via OverscrollEffectOnNonRootScrollers.
-        function disableRootBlinkOverscroll() {
+        // Chromium's PropagateOverscrollBehaviorFromRoot disables macOS compositor ElasticOverscrollController on ALL
+        // scrollers whenever documentElement has overscroll-behavior-y: none. Keep root overscroll-behavior-y: none
+        // while over the main document (so Safarium's AppKit engine owns root rubber-band & Pull-to-Refresh), and
+        // switch documentElement to auto whenever the pointer is over an inner scroller so non-root scrollers get
+        // full 120Hz native elastic rubber-banding.
+        let rootAllowInnerElasticity = null;
+        function syncRootBlinkOverscroll(allowInner) {
+          const want = !!allowInner;
+          if (rootAllowInnerElasticity === want) return;
           try {
             const root = document.documentElement;
-            if (root && !root.style.overscrollBehaviorY) {
-              root.style.overscrollBehaviorY = 'none';
-            }
+            if (!root) return;
+            rootAllowInnerElasticity = want;
+            root.style.setProperty('overscroll-behavior-y', want ? 'auto' : 'none', 'important');
           } catch (_) {}
+        }
+        function disableRootBlinkOverscroll() {
+          rootAllowInnerElasticity = null;
+          syncRootBlinkOverscroll(false);
         }
         disableRootBlinkOverscroll();
         if (document.readyState === 'loading') {
@@ -1668,7 +1718,10 @@ class SXHelperApp : public CefApp,
         // The inset comes from native per tab (0 for sign-in popups); __sxSetTopInset(px) updates it.
         const sxTopInset = {
           px: Math.max(0, Math.round(Number(initialTopInset) || 0)),
-          setFixedEdgeColor: null, onInsetChanged: null, syncOverscroll: null, fixedBars: new Set()
+          lastScrollAt: -1e9,
+          noteScroll: function() { this.lastScrollAt = performance.now(); },
+          isScrolling: function() { return (performance.now() - this.lastScrollAt) < 260; },
+          setFixedEdgeColor: null, onInsetChanged: null, fixedBars: new Set()
         };
         (function installUnderToolbarInset() {
           const MAX_SHIFTED_TOP = 160;          // bars pinned lower than this (dialogs, toasts) are left alone
@@ -1985,37 +2038,52 @@ class SXHelperApp : public CefApp,
               }
             }
             if ((window.scrollY || 0) < h + 2) updateEdgeColor();
-            if (!compactTopOnly && typeof sxTopInset.syncOverscroll === 'function') {
-              try { sxTopInset.syncOverscroll(); } catch (_) {}
-            }
             if (observer) observer.takeRecords();  // drop records of our own writes
           }
 
           // Probe in a frame callback (before paint) so a bar never shows under the toolbar first.
-          // Scroll-driven probes use a compact 3x3 top-band check throttled to 180 ms (with a full settle probe once
-          // scrolling stops) so heavy Shadow-DOM pages never stall 120 Hz flings.
+          // Never run elementsFromPoint sweeps while actively scrolling: defer any scroll or mutation probe until
+          // scrolling has settled so 120 Hz flings and virtualized-feed re-mounts keep full main-thread budget.
           let queued = false;
           let pendingFullProbe = false;
           let lastProbe = 0;
           let scrollSettleId = 0;
           function schedule(fromScroll) {
-            if (!fromScroll) pendingFullProbe = true;
             if (fromScroll) {
+              sxTopInset.noteScroll();
+            } else {
+              pendingFullProbe = true;
+            }
+            if (fromScroll || sxTopInset.isScrolling()) {
               if (scrollSettleId) clearTimeout(scrollSettleId);
               scrollSettleId = setTimeout(function() {
                 scrollSettleId = 0;
-                schedule(false);
-              }, 180);
+                if (sxTopInset.isScrolling()) {
+                  schedule(true);
+                  return;
+                }
+                const compact = !pendingFullProbe;
+                pendingFullProbe = false;
+                requestAnimationFrame(function() {
+                  lastProbe = performance.now();
+                  probe(compact);
+                });
+              }, 300);
+              return;
             }
             if (queued) return;
             queued = true;
             const now = performance.now();
             const settled = document.readyState !== 'loading' && (now > 1500);
-            const minInterval = fromScroll ? 180 : (settled ? 120 : 0);
+            const minInterval = settled ? 140 : 0;
             const wait = minInterval > 0 ? Math.max(0, minInterval - (now - lastProbe)) : 0;
             const run = function() {
               requestAnimationFrame(function() {
                 queued = false;
+                if (sxTopInset.isScrolling()) {
+                  schedule(true);
+                  return;
+                }
                 const compact = !pendingFullProbe;
                 pendingFullProbe = false;
                 lastProbe = performance.now();
@@ -2040,14 +2108,37 @@ class SXHelperApp : public CefApp,
             observer = new MutationObserver(function(records) {
               let dirty = false;
               for (const rec of records) {
+                const t = rec.target;
+                if (!t) continue;
                 if (rec.type === 'attributes') {
-                  for (const el of shifted.keys()) {
-                    if (rec.target === el || (rec.attributeName === 'class' && rec.target.contains && rec.target.contains(el))) {
-                      dirtyShifted.add(el);
+                  if (t === styleEl || t === shelfEl) continue;
+                  let affectsShifted = false;
+                  if (shifted.has(t)) {
+                    dirtyShifted.add(t);
+                    affectsShifted = true;
+                  } else if (rec.attributeName === 'class' && shifted.size > 0 && t.contains) {
+                    for (const el of shifted.keys()) {
+                      if (t.contains(el)) {
+                        dirtyShifted.add(el);
+                        affectsShifted = true;
+                      }
+                    }
+                  }
+                  if (affectsShifted || t === document.documentElement || t === document.body || t.tagName === 'DIALOG') {
+                    dirty = true;
+                  } else if (rec.attributeName === 'style' && t.style) {
+                    const inlinePos = t.style.position;
+                    if (inlinePos === 'fixed' || inlinePos === 'sticky') dirty = true;
+                  }
+                } else if (rec.type === 'childList' && rec.addedNodes && rec.addedNodes.length > 0) {
+                  for (let i = 0; i < rec.addedNodes.length; i++) {
+                    const n = rec.addedNodes[i];
+                    if (n && n.nodeType === 1 && n !== styleEl && n !== shelfEl) {
+                      dirty = true;
+                      break;
                     }
                   }
                 }
-                dirty = true;
               }
               if (observer) observer.takeRecords();
               if (dirty) schedule(false);
@@ -2527,42 +2618,41 @@ class SXHelperApp : public CefApp,
           let scrollSettleTimer = 0;
           let mutDebounceTimer = 0;
           function scheduleProbe() {
+            if (sxTopInset.isScrolling()) {
+              scheduleScrollProbe();
+              return;
+            }
             if (rafPending) return;
             rafPending = true;
             requestAnimationFrame(function() {
               rafPending = false;
+              if (sxTopInset.isScrolling()) {
+                scheduleScrollProbe();
+                return;
+              }
               probeFixedHeader();
             });
           }
-          // Hit-testing 10 points (plus every shadow root under them) costs milliseconds on big pages; doing it every
-          // scroll frame starved the main thread. While scrolling, probe at most every 100 ms (trailing call kept).
-          let lastScrollProbeAt = -1e9;
-          let scrollThrottleTimer = 0;
+          // Toolbar adaptive tint updates are held by SafariWindowController while trackpad scrolling is active,
+          // so defer multi-point Shadow-DOM header hit-testing until scrolling settles.
           function scheduleScrollProbe() {
-            const sinceLast = performance.now() - lastScrollProbeAt;
-            if (sinceLast >= 200) {
-              lastScrollProbeAt = performance.now();
-              scheduleProbe();
-            } else if (!scrollThrottleTimer) {
-              scrollThrottleTimer = setTimeout(function() {
-                scrollThrottleTimer = 0;
-                lastScrollProbeAt = performance.now();
-                scheduleProbe();
-              }, 200 - sinceLast);
-            }
+            sxTopInset.noteScroll();
             if (scrollSettleTimer) clearTimeout(scrollSettleTimer);
-            // Catch CSS-transitioned auto-hiding headers after scroll settles.
             scrollSettleTimer = setTimeout(function() {
               scrollSettleTimer = 0;
               scheduleProbe();
-            }, 240);
+            }, 280);
           }
           function scheduleMutationProbe() {
+            if (sxTopInset.isScrolling()) {
+              scheduleScrollProbe();
+              return;
+            }
             if (mutDebounceTimer) return;
             mutDebounceTimer = setTimeout(function() {
               mutDebounceTimer = 0;
               scheduleProbe();
-            }, 160);
+            }, 180);
           }
 
           sxTopInset.onInsetChanged = scheduleProbe;
@@ -2590,7 +2680,27 @@ class SXHelperApp : public CefApp,
           const attachHeaderObserver = function() {
             if (!document.body || typeof MutationObserver === 'undefined') return;
             try {
-              const mo = new MutationObserver(scheduleMutationProbe);
+              const mo = new MutationObserver(function(records) {
+                for (let i = 0; i < records.length; i++) {
+                  const rec = records[i];
+                  const t = rec.target;
+                  if (!t) continue;
+                  if (rec.type === 'childList') {
+                    if (rec.addedNodes && rec.addedNodes.length > 0) {
+                      scheduleMutationProbe();
+                      return;
+                    }
+                  } else if (rec.type === 'attributes') {
+                    if (rec.attributeName === 'style' &&
+                        t !== document.body && t !== document.documentElement &&
+                        t.tagName !== 'HEADER' && t.tagName !== 'NAV') {
+                      continue;
+                    }
+                    scheduleMutationProbe();
+                    return;
+                  }
+                }
+              });
               mo.observe(document.body, {
                 childList: true,
                 subtree: true,
@@ -4087,6 +4197,8 @@ class SXHelperApp : public CefApp,
 
         let sxShadowObSheet = null;
         const sxStyledShadowRoots = new WeakSet();
+        const managedObElements = new Set();
+
         function ensureShadowOverscrollSheet(node) {
           try {
             const rn = node && node.getRootNode ? node.getRootNode() : null;
@@ -4106,11 +4218,45 @@ class SXHelperApp : public CefApp,
           } catch (_) {}
         }
 
-        // Ensures inner overflow scrollers rubber-band natively on Chromium's 120Hz compositor
-        // whenever no scrollable ancestor can accept scroll chaining in their pinned direction(s)
-        // (SPAs, fixed sidebars, <dialog> modals, Shadow-DOM panes, horizontal code blocks, and resting edges).
+        function setManagedObAttr(node, attr, enabled) {
+          if (enabled) {
+            if (!node.hasAttribute(attr)) {
+              ensureShadowOverscrollSheet(node);
+              node.setAttribute(attr, '');
+            }
+            managedObElements.add(node);
+          } else if (node.hasAttribute(attr)) {
+            node.removeAttribute(attr);
+            if (!node.hasAttribute('data-sx-oby') && !node.hasAttribute('data-sx-obx')) {
+              managedObElements.delete(node);
+            }
+          }
+        }
+
+        // Gives inner overflow scrollers native 120Hz compositor rubber-band elasticity whenever they have scroll room
+        // in both directions or no scrollable ancestor can accept chaining in their pinned direction(s), while
+        // immediately releasing containment at rest on a boundary that can chain to an ancestor (and whenever an
+        // element shrinks to non-scrollable dimensions).
         function syncInnerScrollerOverscroll(targetEl) {
           try {
+            if (managedObElements.size > 0) {
+              managedObElements.forEach(function(m) {
+                if (!m || !m.isConnected) {
+                  managedObElements.delete(m);
+                  return;
+                }
+                if ((m.scrollHeight || 0) <= (m.clientHeight || 0) + 2 && m.hasAttribute('data-sx-oby')) {
+                  m.removeAttribute('data-sx-oby');
+                }
+                if ((m.scrollWidth || 0) <= (m.clientWidth || 0) + 2 && m.hasAttribute('data-sx-obx')) {
+                  m.removeAttribute('data-sx-obx');
+                }
+                if (!m.hasAttribute('data-sx-oby') && !m.hasAttribute('data-sx-obx')) {
+                  managedObElements.delete(m);
+                }
+              });
+            }
+
             let el = targetEl;
             if (!el && lastPtrX >= 0 && lastPtrY >= 0 && document.elementFromPoint) {
               el = deepElementFromPoint(lastPtrX, lastPtrY);
@@ -4121,11 +4267,12 @@ class SXHelperApp : public CefApp,
             if (!el) return;
 
             const root = document.scrollingElement || document.documentElement;
+            const sc = (pageScroller && pageScroller.isConnected) ? pageScroller : root;
             const body = document.body;
             const chain = [];
             let cur = el;
             let hops = 0;
-            while (cur && cur !== root && cur !== body && cur !== document.documentElement && hops++ < 48) {
+            while (cur && cur !== root && cur !== sc && cur !== body && cur !== document.documentElement && hops++ < 48) {
               if (cur.nodeType === 1) chain.push(cur);
               cur = parentOrShadowHost(cur);
             }
@@ -4138,17 +4285,21 @@ class SXHelperApp : public CefApp,
             const rootOX = rootCS ? rootCS.overflowX : 'auto';
             const bodyOX = bodyCS ? bodyCS.overflowX : 'auto';
 
-            const vh = window.innerHeight || (root ? root.clientHeight : 0) || 1;
+            const vh = (sc && sc === pageScroller)
+              ? (sc.clientHeight || window.innerHeight || 1)
+              : (window.innerHeight || (root ? root.clientHeight : 0) || 1);
             const vw = window.innerWidth || (root ? root.clientWidth : 0) || 1;
-            const rootAllowsY = !!(root && rootOY !== 'hidden' && rootOY !== 'clip' &&
-                                   bodyOY !== 'hidden' && bodyOY !== 'clip' &&
-                                   (root.scrollHeight || 0) > vh + 2);
+            const rootAllowsY = (sc && sc === pageScroller)
+              ? ((sc.scrollHeight || 0) > vh + 2)
+              : !!(root && rootOY !== 'hidden' && rootOY !== 'clip' &&
+                   bodyOY !== 'hidden' && bodyOY !== 'clip' &&
+                   (root.scrollHeight || 0) > vh + 2);
             const rootAllowsX = !!(root && rootOX !== 'hidden' && rootOX !== 'clip' &&
                                    bodyOX !== 'hidden' && bodyOX !== 'clip' &&
                                    (root.scrollWidth || 0) > vw + 2);
 
-            const rootScrollY = Math.max(0, window.scrollY || (root ? root.scrollTop : 0) || 0);
-            const rootMaxY = rootAllowsY ? Math.max(0, (root.scrollHeight || 0) - vh) : 0;
+            const rootScrollY = Math.max(0, window.scrollY || (sc ? sc.scrollTop : 0) || 0);
+            const rootMaxY = rootAllowsY ? Math.max(0, (sc ? sc.scrollHeight : 0) - vh) : 0;
             let ancCanUp = rootAllowsY && rootScrollY > 0.5;
             let ancCanDown = rootAllowsY && rootScrollY < rootMaxY - 0.5;
 
@@ -4162,8 +4313,10 @@ class SXHelperApp : public CefApp,
               const cs = window.getComputedStyle ? window.getComputedStyle(node) : null;
               if (!cs) continue;
 
-              if (cs.position === 'fixed' || node.tagName === 'DIALOG' ||
-                  node.getAttribute('aria-modal') === 'true') {
+              const role = node.getAttribute ? (node.getAttribute('role') || '') : '';
+              if (node.tagName === 'DIALOG' ||
+                  (node.getAttribute && node.getAttribute('aria-modal') === 'true') ||
+                  role === 'dialog' || role === 'alertdialog') {
                 ancCanUp = false;
                 ancCanDown = false;
                 ancCanLeft = false;
@@ -4188,12 +4341,7 @@ class SXHelperApp : public CefApp,
                   const chainsUp = !nodeUp && ancCanUp;
                   const chainsDown = !nodeDown && ancCanDown;
                   const wantContainY = !chainsUp && !chainsDown;
-                  if (wantContainY && !managedY) {
-                    ensureShadowOverscrollSheet(node);
-                    node.setAttribute('data-sx-oby', '');
-                  } else if (!wantContainY && managedY) {
-                    node.removeAttribute('data-sx-oby');
-                  }
+                  setManagedObAttr(node, 'data-sx-oby', wantContainY);
                   if (wantContainY) {
                     ancCanUp = nodeUp;
                     ancCanDown = nodeDown;
@@ -4205,6 +4353,8 @@ class SXHelperApp : public CefApp,
                   ancCanUp = nodeUp;
                   ancCanDown = nodeDown;
                 }
+              } else if (node.hasAttribute('data-sx-oby')) {
+                setManagedObAttr(node, 'data-sx-oby', false);
               }
 
               if (isScrollX) {
@@ -4216,12 +4366,7 @@ class SXHelperApp : public CefApp,
                   const chainsLeft = !nodeLeft && ancCanLeft;
                   const chainsRight = !nodeRight && ancCanRight;
                   const wantContainX = !chainsLeft && !chainsRight;
-                  if (wantContainX && !managedX) {
-                    ensureShadowOverscrollSheet(node);
-                    node.setAttribute('data-sx-obx', '');
-                  } else if (!wantContainX && managedX) {
-                    node.removeAttribute('data-sx-obx');
-                  }
+                  setManagedObAttr(node, 'data-sx-obx', wantContainX);
                   if (wantContainX) {
                     ancCanLeft = nodeLeft;
                     ancCanRight = nodeRight;
@@ -4233,92 +4378,149 @@ class SXHelperApp : public CefApp,
                   ancCanLeft = nodeLeft;
                   ancCanRight = nodeRight;
                 }
+              } else if (node.hasAttribute('data-sx-obx')) {
+                setManagedObAttr(node, 'data-sx-obx', false);
               }
             }
           } catch (_) {}
         }
 
-        function syncVisibleInnerScrollers() {
-          try {
-            if (!document.body || !document.elementFromPoint) return;
-            const vw = window.innerWidth || 0;
-            const vh = window.innerHeight || 0;
-            if (vw < 4 || vh < 4) return;
-            if (lastPtrX >= 0 && lastPtrY >= 0) {
-              syncInnerScrollerOverscroll(deepElementFromPoint(lastPtrX, lastPtrY));
-            }
-            const xs = [0.12, 0.5, 0.88];
-            const ys = [0.35, 0.65];
-            for (let i = 0; i < xs.length; i++) {
-              for (let j = 0; j < ys.length; j++) {
-                const hit = deepElementFromPoint(vw * xs[i], vh * ys[j]);
-                if (hit) syncInnerScrollerOverscroll(hit);
-              }
-            }
-          } catch (_) {}
-        }
-        sxTopInset.syncOverscroll = syncVisibleInnerScrollers;
+        let activeInnerScrollers = [];
 
-        function computeInnerScrollState(targetEl) {
-          let el = targetEl;
-          if (!el && lastPtrX >= 0 && lastPtrY >= 0 && document.elementFromPoint) {
-            el = deepElementFromPoint(lastPtrX, lastPtrY);
-          } else if (el && el.shadowRoot && lastPtrX >= 0 && lastPtrY >= 0 && el.shadowRoot.elementFromPoint) {
-            // If event target was retargeted or closed-shadow-bounded, pierce any open shadow roots under pointer.
-            let inner = deepElementFromPoint(lastPtrX, lastPtrY);
-            if (inner) el = inner;
+        function refreshCachedInnerScrollState() {
+          if (activeInnerScrollers.length === 0) {
+            lastCanUp = false;
+            lastCanDown = false;
+            lastCanInnerLeft = false;
+            lastCanInnerRight = false;
+            syncRootBlinkOverscroll(managedObElements.size > 0);
+            return;
           }
-          if (el) syncInnerScrollerOverscroll(el);
+          let canUp = false, canDown = false, canLeft = false, canRight = false;
+          for (let i = 0; i < activeInnerScrollers.length; i++) {
+            const rec = activeInnerScrollers[i];
+            const el = rec.el;
+            if (!el || !el.isConnected) continue;
+            if (rec.scrollY) {
+              const ch = el.clientHeight || 0;
+              const sh = el.scrollHeight || 0;
+              if (rec.containY || (sh > ch + 2 && el.hasAttribute('data-sx-oby'))) {
+                canUp = true;
+                canDown = true;
+              } else if (sh > ch + 2) {
+                if (el.scrollTop > 0.5) canUp = true;
+                if (el.scrollTop + ch < sh - 0.5) canDown = true;
+              }
+            }
+            if (rec.scrollX) {
+              const cw = el.clientWidth || 0;
+              const sw = el.scrollWidth || 0;
+              if (rec.containX || (sw > cw + 2 && el.hasAttribute('data-sx-obx'))) {
+                canLeft = true;
+                canRight = true;
+              } else if (sw > cw + 2) {
+                if (el.scrollLeft > 0.5) canLeft = true;
+                if (el.scrollLeft + cw < sw - 0.5) canRight = true;
+              }
+            }
+            if (canUp && canDown && canLeft && canRight) break;
+          }
+          lastCanUp = canUp;
+          lastCanDown = canDown;
+          lastCanInnerLeft = canLeft;
+          lastCanInnerRight = canRight;
+          syncRootBlinkOverscroll(true);
+        }
+
+        function computeInnerScrollState(targetEl, allowHitTest) {
+          let el = targetEl;
+          if (allowHitTest !== false) {
+            if (!el && lastPtrX >= 0 && lastPtrY >= 0 && document.elementFromPoint) {
+              el = deepElementFromPoint(lastPtrX, lastPtrY);
+            } else if (el && el.shadowRoot && lastPtrX >= 0 && lastPtrY >= 0 && el.shadowRoot.elementFromPoint) {
+              // If event target was retargeted or closed-shadow-bounded, pierce any open shadow roots under pointer.
+              let inner = deepElementFromPoint(lastPtrX, lastPtrY);
+              if (inner) el = inner;
+            }
+          }
+          const nextScrollers = [];
           let canUp = false;
           let canDown = false;
           let canLeft = false;
           let canRight = false;
           const root = document.scrollingElement || document.documentElement;
           let hops = 0;
-          while (el && el !== root && el !== document.body && el !== document.documentElement && hops++ < 64) {
+          while (el && el !== root && el !== document.body && el !== document.documentElement && hops++ < 48) {
             if (el.nodeType === 1) {
-              const sh = el.scrollHeight || 0;
-              const ch = el.clientHeight || 0;
-              const sw = el.scrollWidth || 0;
-              const cw = el.clientWidth || 0;
-              if (sh > ch + 2 || sw > cw + 2) {
-                const cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
-                if (sh > ch + 2 && cs) {
-                  const oy = cs.overflowY || '';
-                  if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') {
+              const cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
+              if (cs) {
+                const oy = cs.overflowY || '';
+                const ox = cs.overflowX || '';
+                const isScrollBoxY = (oy === 'auto' || oy === 'scroll' || oy === 'overlay');
+                const isScrollBoxX = (ox === 'auto' || ox === 'scroll' || ox === 'overlay');
+                if (isScrollBoxY || isScrollBoxX) {
+                  const sh = el.scrollHeight || 0;
+                  const ch = el.clientHeight || 0;
+                  const sw = el.scrollWidth || 0;
+                  const cw = el.clientWidth || 0;
+                  let hasY = false, hasX = false, containY = false, containX = false, authorAutoY = false, authorAutoX = false;
+                  if (isScrollBoxY) {
+                    const managedY = el.hasAttribute('data-sx-oby');
                     const obY = cs.overscrollBehaviorY || 'auto';
-                    if (el.hasAttribute('data-sx-oby') || obY === 'contain' || obY === 'none') {
-                      // Contained inner scroller owns both scrolling and 120Hz compositor rubber-banding!
+                    authorAutoY = managedY || obY === 'auto';
+                    const authorContainY = !managedY && (obY === 'contain' || obY === 'none');
+                    if (authorContainY) {
+                      hasY = true;
+                      containY = true;
                       canUp = true;
                       canDown = true;
-                    } else {
-                      if (el.scrollTop > 0.5) canUp = true;
-                      if (el.scrollTop + ch < sh - 0.5) canDown = true;
+                    } else if (sh > ch + 2) {
+                      hasY = true;
+                      if (managedY) {
+                        canUp = true;
+                        canDown = true;
+                      } else {
+                        if (el.scrollTop > 0.5) canUp = true;
+                        if (el.scrollTop + ch < sh - 0.5) canDown = true;
+                      }
                     }
                   }
-                }
-                if (sw > cw + 2 && cs) {
-                  const ox = cs.overflowX || '';
-                  if (ox === 'auto' || ox === 'scroll' || ox === 'overlay') {
+                  if (isScrollBoxX) {
+                    const managedX = el.hasAttribute('data-sx-obx');
                     const obX = cs.overscrollBehaviorX || 'auto';
-                    if (el.hasAttribute('data-sx-obx') || obX === 'contain' || obX === 'none') {
+                    authorAutoX = managedX || obX === 'auto';
+                    const authorContainX = !managedX && (obX === 'contain' || obX === 'none');
+                    if (authorContainX) {
+                      hasX = true;
+                      containX = true;
                       canLeft = true;
                       canRight = true;
-                    } else {
-                      if (el.scrollLeft > 0.5) canLeft = true;
-                      if (el.scrollLeft + cw < sw - 0.5) canRight = true;
+                    } else if (sw > cw + 2) {
+                      hasX = true;
+                      if (managedX) {
+                        canLeft = true;
+                        canRight = true;
+                      } else {
+                        if (el.scrollLeft > 0.5) canLeft = true;
+                        if (el.scrollLeft + cw < sw - 0.5) canRight = true;
+                      }
                     }
                   }
+                  if (hasY || hasX) {
+                    nextScrollers.push({ el: el, scrollY: hasY, scrollX: hasX, containY: containY, containX: containX, authorAutoY: authorAutoY, authorAutoX: authorAutoX });
+                  }
+                  if (canUp && canDown && canLeft && canRight) break;
                 }
-                if (canUp && canDown && canLeft && canRight) break;
               }
             }
             el = parentOrShadowHost(el);
           }
+          activeInnerScrollers = nextScrollers;
           lastCanUp = canUp;
           lastCanDown = canDown;
           lastCanInnerLeft = canLeft;
           lastCanInnerRight = canRight;
+          syncRootBlinkOverscroll(nextScrollers.length > 0 || managedObElements.size > 0);
         }
 
         let lastY = -1, lastH = -1, lastVH = -1, lastS = -1, lastPinch = false;
@@ -4338,6 +4540,22 @@ class SXHelperApp : public CefApp,
         }
         let lastSentCanUp = false, lastSentCanDown = false, lastSentCanLeft = false, lastSentCanRight = false;
         let pinchEndTimer = null;
+        let cachedDocScrollH = 0, cachedDocScrollW = 0, docDimensionsDirty = true;
+        if (typeof ResizeObserver !== 'undefined') {
+          try {
+            const ro = new ResizeObserver(function() { docDimensionsDirty = true; });
+            const attachRO = function() {
+              try {
+                if (document.documentElement) ro.observe(document.documentElement);
+                if (document.body) ro.observe(document.body);
+              } catch (_) {}
+            };
+            attachRO();
+            if (document.readyState === 'loading') {
+              document.addEventListener('DOMContentLoaded', attachRO, { once: true, passive: true });
+            }
+          } catch (_) {}
+        }
 
         function emitMetrics(isPinching, force) {
           const se = document.scrollingElement || document.documentElement || document.body;
@@ -4357,13 +4575,19 @@ class SXHelperApp : public CefApp,
           }
           const y = Math.max(0, Math.max(window.scrollY || (se ? se.scrollTop : 0) || 0, pageScrollerTop) + vvPan);
           const vh = Math.max(1, window.innerHeight || (se ? se.clientHeight : 0) || 1);
-          const h = Math.max(vh, (se ? se.scrollHeight : 0) || (document.body ? document.body.scrollHeight : 0) || vh);
-          const s = Math.round(vvScale * 1000) / 1000;
-
-          // Horizontal scroll & pinch-zoom visualViewport X-bounds (prevents Back/Forward swipe while panning).
           const layoutW = Math.max(1, window.innerWidth || (se ? se.clientWidth : 0) || 1);
           const docScrollLeft = Math.max(0, window.scrollX || (se ? se.scrollLeft : 0) || 0);
-          const docScrollWidth = Math.max(layoutW, (se ? se.scrollWidth : 0) || (document.body ? document.body.scrollWidth : 0) || layoutW);
+
+          // Avoid forcing synchronous Blink style/layout inside rAF during active flings when ResizeObserver
+          // has not reported a root/body geometry change.
+          if (force || docDimensionsDirty || !sxTopInset.isScrolling() || cachedDocScrollH <= 0) {
+            cachedDocScrollH = Math.max(vh, (se ? se.scrollHeight : 0) || (document.body ? document.body.scrollHeight : 0) || vh);
+            cachedDocScrollW = Math.max(layoutW, (se ? se.scrollWidth : 0) || (document.body ? document.body.scrollWidth : 0) || layoutW);
+            docDimensionsDirty = false;
+          }
+          const h = Math.max(vh, cachedDocScrollH);
+          const docScrollWidth = Math.max(layoutW, cachedDocScrollW);
+          const s = Math.round(vvScale * 1000) / 1000;
           const docMaxLeft = Math.max(0, docScrollWidth - layoutW);
           const vvOffsetLeft = (vv && vvScale > 1.001) ? Math.max(0, vv.offsetLeft || 0) : 0;
           const vvWidth = (vv && vv.width) ? vv.width : layoutW;
@@ -4426,27 +4650,59 @@ class SXHelperApp : public CefApp,
           });
         }
 
-        let scrollOverscrollSettleTimer = null;
         let lastOverscrollTarget = null;
+        let innerOverscrollSettleTimer = 0;
+
+        function scheduleInnerOverscrollSettle() {
+          if (innerOverscrollSettleTimer) clearTimeout(innerOverscrollSettleTimer);
+          innerOverscrollSettleTimer = setTimeout(function() {
+            innerOverscrollSettleTimer = 0;
+            if (managedObElements.size > 0) {
+              const snapshot = Array.from(managedObElements);
+              for (let i = 0; i < snapshot.length; i++) {
+                if (snapshot[i] && snapshot[i].isConnected) {
+                  syncInnerScrollerOverscroll(snapshot[i]);
+                } else {
+                  managedObElements.delete(snapshot[i]);
+                }
+              }
+            }
+            const target = (lastOverscrollTarget && lastOverscrollTarget.isConnected)
+              ? lastOverscrollTarget
+              : ((lastPtrX >= 0 && lastPtrY >= 0 && document.elementFromPoint) ? deepElementFromPoint(lastPtrX, lastPtrY) : null);
+            lastOverscrollTarget = target;
+            if (target) {
+              syncInnerScrollerOverscroll(target);
+              computeInnerScrollState(target, false);
+            } else {
+              refreshCachedInnerScrollState();
+            }
+            emitMetrics(false, false);
+          }, 120);
+        }
 
         function onProbePoint(x, y) {
           lastPtrX = Number(x) || 0;
           lastPtrY = Number(y) || 0;
           const hit = deepElementFromPoint(lastPtrX, lastPtrY);
           lastOverscrollTarget = hit;
+          // Always sync before computing state at gesture start (never skip due to recent scrolling),
+          // so an inner scroller that just reached its boundary immediately releases containment to chain.
           syncInnerScrollerOverscroll(hit);
-          computeInnerScrollState(hit);
+          computeInnerScrollState(hit, false);
           updatePinchSurface(hit);
           emitMetrics(false, false);
         }
 
         window.addEventListener('pointerover', function(e) {
+          if (sxTopInset.isScrolling()) return;
           lastPtrX = e.clientX;
           lastPtrY = e.clientY;
           const t = deepEventTarget(e);
           if (t !== lastOverscrollTarget) {
             lastOverscrollTarget = t;
-            computeInnerScrollState(t);
+            syncInnerScrollerOverscroll(t);
+            computeInnerScrollState(t, false);
             scheduleMetrics();
           }
         }, { passive: true, capture: true });
@@ -4454,13 +4710,14 @@ class SXHelperApp : public CefApp,
         window.addEventListener('pointermove', function(e) {
           lastPtrX = e.clientX;
           lastPtrY = e.clientY;
+          if (sxTopInset.isScrolling()) return;
           const now = performance.now();
-          if (now - lastInnerCheck > 120) {
+          if (now - lastInnerCheck > 150) {
             lastInnerCheck = now;
             const t = deepEventTarget(e);
             lastOverscrollTarget = t;
             syncInnerScrollerOverscroll(t);
-            computeInnerScrollState(t);
+            computeInnerScrollState(t, true);
             updatePinchSurface(t);
             scheduleMetrics();
           }
@@ -4469,15 +4726,19 @@ class SXHelperApp : public CefApp,
         window.addEventListener('wheel', function(e) {
           lastPtrX = e.clientX;
           lastPtrY = e.clientY;
-          const t = deepEventTarget(e);
           if (e.ctrlKey) {
+            const t = deepEventTarget(e);
             updatePinchSurface(t);
             emitMetrics(false, false);
             return;
           }
-          // Inner-scroll state decides whether the shell may rubber-band / fling-overshoot this event, so it must
-          // be fresh for every event (a stale "inner scroller can still scroll up" swallowed the top overshoot).
-          computeInnerScrollState(t);
+          sxTopInset.noteScroll();
+          // Fast O(1) check against the cached inner scroller chain probed at gesture start (`sx.probe_point`),
+          // avoiding 120 Hz Shadow-DOM elementFromPoint / getComputedStyle walks during flings.
+          refreshCachedInnerScrollState();
+          if (activeInnerScrollers.length > 0 || managedObElements.size > 0) {
+            scheduleInnerOverscrollSettle();
+          }
           scheduleMetrics();
         }, { passive: true, capture: true });
 
@@ -4493,20 +4754,39 @@ class SXHelperApp : public CefApp,
         }
 
         window.addEventListener('scroll', function(e) {
-          if (e.target && e.target !== document && e.target !== window) {
+          sxTopInset.noteScroll();
+          if (e.target && e.target !== document && e.target !== window && e.target.nodeType === 1) {
             maybeAdoptPageScroller(e.target);
-            computeInnerScrollState(e.target);
+            let matchedRec = null;
+            for (let i = 0; i < activeInnerScrollers.length; i++) {
+              if (activeInnerScrollers[i].el === e.target) { matchedRec = activeInnerScrollers[i]; break; }
+            }
+            if (matchedRec) {
+              const el = matchedRec.el;
+              if (matchedRec.scrollY && matchedRec.authorAutoY) {
+                const ch = el.clientHeight || 0;
+                const sh = el.scrollHeight || 0;
+                if (sh > ch + 2 && el.scrollTop > 0.5 && el.scrollTop + ch < sh - 0.5) {
+                  setManagedObAttr(el, 'data-sx-oby', true);
+                }
+              }
+              if (matchedRec.scrollX && matchedRec.authorAutoX) {
+                const cw = el.clientWidth || 0;
+                const sw = el.scrollWidth || 0;
+                if (sw > cw + 2 && el.scrollLeft > 0.5 && el.scrollLeft + cw < sw - 0.5) {
+                  setManagedObAttr(el, 'data-sx-obx', true);
+                }
+              }
+              refreshCachedInnerScrollState();
+              scheduleInnerOverscrollSettle();
+            } else {
+              syncInnerScrollerOverscroll(e.target);
+              computeInnerScrollState(e.target, false);
+              scheduleInnerOverscrollSettle();
+            }
+          } else if (managedObElements.size > 0 || activeInnerScrollers.length > 0) {
+            scheduleInnerOverscrollSettle();
           }
-          if (scrollOverscrollSettleTimer) clearTimeout(scrollOverscrollSettleTimer);
-          const scrolledNode = (e.target && e.target.nodeType === 1) ? e.target : null;
-          scrollOverscrollSettleTimer = setTimeout(function() {
-            scrollOverscrollSettleTimer = null;
-            const refEl = lastOverscrollTarget || scrolledNode;
-            syncInnerScrollerOverscroll(refEl);
-            syncVisibleInnerScrollers();
-            computeInnerScrollState(refEl);
-            scheduleMetrics();
-          }, 120);
           scheduleMetrics();
         }, { passive: true, capture: true });
 
@@ -4695,10 +4975,10 @@ class SXHelperApp : public CefApp,
         (function installSpaceTouchpadScroll() {
           if (typeof spaceScroll !== 'function') return;
           const INTERACTIVE_TAGS = new Set([
-            'INPUT', 'TEXTAREA', 'SELECT', 'OPTION', 'BUTTON', 'SUMMARY', 'A', 'VIDEO', 'AUDIO'
+            'INPUT', 'TEXTAREA', 'SELECT', 'OPTION', 'BUTTON', 'SUMMARY', 'VIDEO', 'AUDIO'
           ]);
           const INTERACTIVE_ROLES = new Set([
-            'textbox', 'searchbox', 'combobox', 'listbox', 'option', 'button', 'link',
+            'textbox', 'searchbox', 'combobox', 'listbox', 'option', 'button',
             'checkbox', 'radio', 'switch', 'menuitem', 'menuitemcheckbox', 'menuitemradio',
             'slider', 'spinbutton', 'tab', 'treeitem'
           ]);
@@ -4728,12 +5008,10 @@ class SXHelperApp : public CefApp,
             return false;
           }
           function canRepeatSpaceInDirection(dir) {
-            let el = (lastPtrX >= 0 && lastPtrY >= 0 && document.elementFromPoint)
-              ? deepElementFromPoint(lastPtrX, lastPtrY)
-              : deepActiveElement();
+            let el = deepActiveElement();
             const root = document.scrollingElement || document.documentElement;
             let hops = 0;
-            while (el && el !== root && el !== document.body && el !== document.documentElement && hops++ < 64) {
+            while (el && el !== root && el !== document.body && el !== document.documentElement && hops++ < 48) {
               if (el.nodeType === 1) {
                 const sh = el.scrollHeight || 0;
                 const ch = el.clientHeight || 0;
@@ -4744,7 +5022,7 @@ class SXHelperApp : public CefApp,
                     const hasRoom = dir > 0 ? (el.scrollTop > 0.5) : (el.scrollTop + ch < sh - 0.5);
                     if (hasRoom) return true;
                     const obY = (cs && cs.overscrollBehaviorY) || 'auto';
-                    if (el.hasAttribute('data-sx-oby') || obY === 'contain' || obY === 'none') {
+                    if (obY === 'contain' || obY === 'none') {
                       return false;
                     }
                   }
@@ -4909,6 +5187,7 @@ class SXHelperApp : public CefApp,
         args.push_back(CefV8Value::CreateInt(topInset));
       }
       args.push_back(CefV8Value::CreateFunction("reportNavTraverse", handler));
+      args.push_back(CefV8Value::CreateFunction("reportDragImageInfo", handler));
       CefRefPtr<CefV8Value> ret = installer->ExecuteFunction(nullptr, args);
       if (ret && ret->IsArray() && ret->GetArrayLength() >= 3) {
         SXFrameHooks hooks;
@@ -6175,7 +6454,7 @@ int main(int argc, char* argv[]) {
   // before V8 contexts can ever initialize.
   SXInitLaunchPrivacyConfig(argc, argv);
 
-  // Initialize macOS Chromium sandbox BEFORE loading CEF framework (required by CEF macOS sandbox).
+  // 1. Initialize macOS Chromium Seatbelt sandbox FIRST while single-threaded (required by CEF macOS sandbox).
   bool noSandbox = false;
   for (int i = 1; i < argc; ++i) {
     if (argv[i] && strcmp(argv[i], "--no-sandbox") == 0) {
@@ -6190,10 +6469,8 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // Load Chromium Embedded Framework dynamically while the process is still single-threaded.
-  // Calling LaunchServices/CoreFoundation BEFORE cef_load_library spawns a background GCD
-  // utility thread (`com.apple.root.utility-qos.overcommit`) that races with Chromium's
-  // PartitionAlloc malloc-zone installation during dlopen and triggers SIGTRAP in _CFRelease.
+  // 2. Load Chromium Embedded Framework dynamically while still single-threaded so PartitionAlloc
+  //    installs its malloc zone cleanly before any CoreFoundation/GCD threads exist.
   CefScopedLibraryLoader library_loader;
   if (!library_loader.LoadInHelper()) {
     const char* overridePath = std::getenv("SAFARIUM_CEF_FRAMEWORK_BINARY");
@@ -6212,8 +6489,8 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // Check in with LaunchServices AFTER CEF (and PartitionAlloc) is fully loaded, and BEFORE
-  // CefExecuteProcess engages Chromium's Seatbelt sandbox profile.
+  // 3. Check in with LaunchServices after PartitionAlloc is installed (works for GPU/Network/Storage
+  //    and whenever --no-sandbox / SAFARIUM_DISABLE_SANDBOX=1 is active).
   SXInitLaunchServicesForSubprocess(argc, argv);
 
   CefMainArgs main_args(argc, argv);

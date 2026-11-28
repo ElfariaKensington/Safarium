@@ -287,8 +287,8 @@ final class ElasticScrollEngineTests: HermeticTestCase {
         XCTAssertFalse(engine.isAnimatingKeyboardScroll)
         XCTAssertEqual(phases.first, .began)
         XCTAssertEqual(phases.last, .ended)
-        // Must genuinely overshoot past 712 pt like a touchpad flick + spring and settle back to exact 712 pt!
-        XCTAssertGreaterThan(peakScrollY, 725.0)
+        // Must settle monotonically to exact 712 pt without overshooting or bouncing back when stopped!
+        XCTAssertLessThanOrEqual(peakScrollY, 712.0 + 0.5)
         XCTAssertEqual(totalWheelDY, -712, accuracy: 0.5)
         XCTAssertEqual(engine.estimatedScrollY, 712, accuracy: 0.5)
     }
@@ -330,7 +330,7 @@ final class ElasticScrollEngineTests: HermeticTestCase {
         XCTAssertGreaterThan(engine.estimatedScrollY, 712.0 * 4.5)
     }
 
-    func testHoldingSpaceKeyRepeatAcceleratesMomentumAndCoastsWithOvershootOnRelease() {
+    func testHoldingSpaceKeyRepeatAcceleratesMomentumAndSettlesWithoutBounceOnRelease() {
         let engine = makeEngine(scrollY: 0, contentHeight: 20_000, viewportHeight: 800)
         engine.obscuredTopInset = 48
 
@@ -367,7 +367,7 @@ final class ElasticScrollEngineTests: HermeticTestCase {
         }
         let settledScroll = engine.estimatedScrollY
         XCTAssertGreaterThan(settledScroll - scrollAtRelease, 600.0, "releasing Space must coast forward with touchpad inertia")
-        XCTAssertGreaterThan(peakAfterRelease, settledScroll + 15.0, "coast must overshoot slightly and cushion back")
+        XCTAssertLessThanOrEqual(peakAfterRelease, settledScroll + 0.5, "coast must settle smoothly without bouncing back")
     }
 
     func testSpaceAtPinnedBottomAndTopEdgesProducesRubberBandOvershoot() {
@@ -397,7 +397,7 @@ final class ElasticScrollEngineTests: HermeticTestCase {
 
         var bouncedOnce = false
         // Keep holding Space (`isRepeat: true` every 4 frames = 30 Hz) for a full 1.5 seconds well past hitting bottom!
-        for rep in 0..<45 {
+        for _ in 0..<45 {
             for _ in 0..<4 {
                 t += 1.0 / 120.0
                 engine.stepAnimation(at: t)
@@ -478,5 +478,145 @@ final class ElasticScrollEngineTests: HermeticTestCase {
         wc.tabEngine(initialTab, didRequestOpenURL: URL(string: "https://apple.com")!, disposition: .newTabDefault)
         XCTAssertEqual(t8Tabs(wc).count, 4)
         XCTAssertEqual(t8ActiveIndex(wc), 3)
+    }
+
+    func testStrongTopFlingBounceIsNotClobberedByWeakTrailingMomentumEvent() {
+        let engine = makeEngine(scrollY: 120, contentHeight: 5000, viewportHeight: 800)
+        var t: TimeInterval = 100.0
+
+        // High-velocity upward momentum crosses y = 0 and launches a strong top bounce (~90+ pt peak).
+        _ = engine.handleMomentumEvent(momentumPhase: .began, deltaY: 90, timestamp: t)
+        t += 1.0 / 120.0
+        _ = engine.handleMomentumEvent(momentumPhase: .changed, deltaY: 90, timestamp: t)
+        XCTAssertTrue(engine.isAnimatingRubberBand)
+
+        // End first stream and advance 1 frame so stretchY > 0.01, then deliver a weak trailing momentum event.
+        t += 1.0 / 120.0
+        _ = engine.handleMomentumEvent(momentumPhase: .ended, deltaY: 0, timestamp: t)
+        t += 1.0 / 120.0
+        engine.stepAnimation(at: t)
+        XCTAssertGreaterThan(engine.currentOverscrollY, 5.0)
+
+        let weakStart = t + 0.11
+        _ = engine.handleMomentumEvent(momentumPhase: .began, deltaY: 1.5, timestamp: weakStart)
+        engine.stepAnimation(at: weakStart + 0.010)
+        XCTAssertGreaterThan(engine.currentOverscrollY, 35.0, "weak trailing momentum must not flatten an active high-velocity top bounce")
+    }
+
+    func testInnerScrollerWheelDoesNotCorruptMainPageEstimatedScrollYOrBlockSubsequentMainScroll() {
+        let engine = makeEngine(scrollY: 2000, contentHeight: 12000, viewportHeight: 900)
+        engine.updateMetrics(
+            scrollY: 2000,
+            contentHeight: 12000,
+            viewportHeight: 900,
+            canInnerScrollUp: true,
+            canInnerScrollDown: true,
+            isReloadableWebPage: true,
+            isPageLoading: false,
+            resyncEstimate: true
+        )
+
+        var t: TimeInterval = 50.0
+        // Scroll up 2500 pt inside an inner scroller while main page stays at scrollY = 2000.
+        _ = engine.handleDirectTouchEvent(phase: .began, deltaX: 0, deltaY: 80, timestamp: t)
+        for _ in 0..<10 {
+            t += 1.0 / 120.0
+            let consumed = engine.handleDirectTouchEvent(phase: .changed, deltaX: 0, deltaY: 80, timestamp: t)
+            XCTAssertFalse(consumed)
+        }
+        t += 1.0 / 120.0
+        _ = engine.handleDirectTouchEvent(phase: .ended, deltaX: 0, deltaY: 0, timestamp: t)
+        for _ in 0..<20 {
+            t += 1.0 / 120.0
+            let consumed = engine.handleMomentumEvent(momentumPhase: .changed, deltaY: 90, timestamp: t)
+            XCTAssertFalse(consumed)
+        }
+        t += 1.0 / 120.0
+        _ = engine.handleMomentumEvent(momentumPhase: .ended, deltaY: 0, timestamp: t)
+
+        XCTAssertEqual(engine.estimatedScrollY, 2000, accuracy: 0.5, "inner scroller deltas must never corrupt main-page estimatedScrollY")
+
+        // Now move to main feed (or inner scroller has no more scroll up -> canInnerScrollUp = false) with cached sync (`resyncEstimate: false`).
+        engine.updateMetrics(
+            scrollY: 2000,
+            contentHeight: 12000,
+            viewportHeight: 900,
+            canInnerScrollUp: false,
+            canInnerScrollDown: true,
+            isReloadableWebPage: true,
+            isPageLoading: false,
+            resyncEstimate: false
+        )
+        t += 0.05
+        XCTAssertFalse(engine.handleDirectTouchEvent(phase: .began, deltaX: 0, deltaY: 60, timestamp: t))
+        t += 1.0 / 120.0
+        let consumedMain = engine.handleDirectTouchEvent(phase: .changed, deltaX: 0, deltaY: 60, timestamp: t)
+        XCTAssertFalse(consumedMain, "upward scroll on main page at scrollY=2000 must pass through to Chromium, never get swallowed as top overscroll")
+        XCTAssertEqual(engine.currentOverscrollY, 0, accuracy: 0.01)
+    }
+
+    func testVeryLongShiftSpaceScrollUpTriggersTopOvershootAcrossVirtualizedHeightChanges() {
+        let engine = makeEngine(scrollY: 20_000, contentHeight: 35_000, viewportHeight: 900)
+        engine.obscuredTopInset = 52
+
+        var realScrollY: CGFloat = 20_000
+        var contentH: CGFloat = 35_000
+        engine.onSyntheticScroll = { deltaY, phase in
+            guard phase != .ended else { return }
+            realScrollY = max(0, min(contentH - 900, realScrollY - deltaY))
+        }
+
+        var t: CFTimeInterval = 200.0
+        engine.triggerSpaceScroll(direction: 1, isRepeat: false, timestamp: t)
+
+        var bouncedMidPage = false
+        var bouncedAtTop = false
+        var peakTopOverscroll: CGFloat = 0
+
+        for step in 0..<420 {
+            t += 1.0 / 120.0
+            engine.stepAnimation(at: t)
+
+            // Simulate virtualized feed height expansion (+900 pt) on the way up, then collapse (-700 pt) near top.
+            if step == 90 && realScrollY > 2_000 {
+                realScrollY += 900
+                contentH += 900
+            } else if step == 180 && realScrollY > 900 {
+                realScrollY = max(0, realScrollY - 700)
+            }
+
+            // Renderer scroll telemetry every 2 frames (~60 Hz)
+            if step % 2 == 0 {
+                engine.updateMetrics(
+                    scrollY: realScrollY,
+                    contentHeight: contentH,
+                    viewportHeight: 900,
+                    canInnerScrollUp: false,
+                    canInnerScrollDown: true,
+                    isReloadableWebPage: true,
+                    isPageLoading: false,
+                    resyncEstimate: true
+                )
+            }
+
+            if engine.isAnimatingRubberBand {
+                if realScrollY > 5.0 {
+                    bouncedMidPage = true
+                } else {
+                    bouncedAtTop = true
+                }
+            }
+            peakTopOverscroll = max(peakTopOverscroll, engine.currentOverscrollY)
+
+            // Held Shift+Space repeat every 4 frames (30 Hz) while realScrollY > 0.5 (matching SXHelperMain.mm)
+            if step % 4 == 3 && realScrollY > 0.5 {
+                engine.triggerSpaceScroll(direction: 1, isRepeat: true, timestamp: t)
+            }
+        }
+
+        XCTAssertFalse(bouncedMidPage, "long Shift+Space scroll-up must never bounce prematurely before real scrollY reaches 0")
+        XCTAssertEqual(realScrollY, 0, accuracy: 1.0)
+        XCTAssertTrue(bouncedAtTop, "very long Shift+Space scroll-up must trigger top rubber-band overshoot on reaching 0")
+        XCTAssertGreaterThan(peakTopOverscroll, 15.0, "long Shift+Space scroll-up must produce visible top overshoot")
     }
 }
